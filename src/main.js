@@ -51,7 +51,10 @@ let sync = null;
 if(params.get('terrainWorker') === 'sync') voxelize(world, new Level()); // no worker at all: edits on the main thread
 else await (sync = new TerrainSync(world, { worker: params.get('terrainWorker') !== '0' })).init();
 // the edit log (src/net): every terrain edit is sequenced and applied in order (single player: synchronously)
-const net = sync ? await createNet(params, sync) : null;
+if(params.get('room')) status(`Joining room "${params.get('room')}"...`);
+let net = null;
+try { net = sync ? await createNet(params, sync) : null; }
+catch(e) { status(`Could not reach the room server (${e.message}). Reload to try again, or play offline without ?room= in the address.`); throw e; }
 console.log(`world ready in ${(performance.now() - t0).toFixed(0)} ms`);
 prof.loadMark('world');
 const terrain = new TerrainRenderer(world, scene, camera);

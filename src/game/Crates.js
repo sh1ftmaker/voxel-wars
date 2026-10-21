@@ -2,6 +2,11 @@
  * Supply crates: physics boxes scattered over the level and buried in sealed caches (WorldParty's gen-fortwar game
  * config). Walk into one to pick it up (it rides over your head), walk into your vault to bank it. A vault's crates
  * can be stolen by the other team. A carrier who dies drops the crate. Score = crates in your vault.
+ *
+ * Online (src/game/NetGame.js) the host decides: it sees everyone walk into crates and vaults, picks up, drops,
+ * deposits and returns home, and sends each change as a 'crate' message (net.bcast); other clients apply them
+ * (applyNet) and carry crates over their carriers' heads. The free crates' bodies belong to the host, which streams
+ * their motion.
  */
 import * as THREE from 'three/webgpu';
 import { GAME, NUDGE } from '../level/fortwar.js';
@@ -53,10 +58,39 @@ export class Crates {
         const beam = new THREE.Mesh(this.beamGeo, this.beamMat); beam.renderOrder = 5;
         this.ctx.scene.add(beam);
         const c = { prop, mesh, home: pos, buried, carrier: null, vault: null, idle: 0, beam, id: this.list.length };
+        prop.userData.netId = `crate:${c.id}`; // its body belongs to the host (no owner): streamed online
         this.list.push(c);
         return c;
     }
     pos(c) { const t = c.prop.body.translation(); return t; }
+    /** Does this client decide about crates? Always offline; online only the host. */
+    get authority() { const ng = this.game.netGame; return !ng || ng.isHost; }
+    _send(c, ev) {
+        const ng = this.game.netGame;
+        if(!ng || !this.authority) return;
+        const t = this.pos(c), v = c.prop.body.linvel();
+        ng.send({ t: 'crate', id: c.id, ev, c: c.carrier?.netId ?? null, vault: c.vault, p: [t.x, t.y, t.z], v: [v.x, v.y, v.z] });
+    }
+    /** The host's crate change, on another client. */
+    applyNet(m) {
+        const c = this.list[m.id]; if(!c) return;
+        const actor = m.c ? this.game.netGame.actor(m.c) : null;
+        if(m.ev === 'pickup' && actor) {
+            if(c.carrier && c.carrier !== actor) { c.carrier.carrying = null; c.carrier = null; }
+            if(!c.carrier) { if(actor.carrying && actor.carrying !== c) actor.carrying = null; this.pickUp(c, actor); }
+            return;
+        }
+        if(c.carrier) this.drop(c, m.ev === 'deposit', m.p, m.v);
+        else this._place(c, m.p, m.v);
+        c.vault = m.vault;
+        if(m.ev === 'home') this._place(c, m.p, [0, 0, 0]);
+    }
+    _place(c, p, v) {
+        const b = c.prop.body;
+        b.setTranslation({ x: p[0], y: p[1], z: p[2] }, true);
+        b.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
+        b.setLinvel({ x: v[0], y: v[1], z: v[2] }, true);
+    }
     /** Which team's vault holds it (null if none). */
     vaultOf(t) { for(const team of ['red', 'blue']) if(inBox(this.vaults[team], t)) return team; return null; }
     count(team) { let n = 0; for(const c of this.list) if(!c.carrier && c.vault === team) n++; return n; }
@@ -67,13 +101,16 @@ export class Crates {
         c.prop.collider.setEnabled(false);
         c.vaultBefore = c.vault; c.vault = null;
         this.game.emit('pickup', { crate: c, actor, from: c.vaultBefore });
+        this._send(c, 'pickup');
     }
-    drop(c, deposit = false) {
+    /** Put the crate down: in the carrier's vault (deposit), or where the carrier is. Online, other clients get the
+     *  host's position and velocity (at, vel). */
+    drop(c, deposit = false, at = null, vel = null) {
         const a = c.carrier; if(!a) return;
         c.carrier = null; a.carrying = null;
         const b = c.prop.body;
-        let at;
-        if(deposit) {
+        if(at) { /* the host's spot */ }
+        else if(deposit) {
             // the first free slot of the vault
             const used = this.list.filter(o => o !== c && !o.carrier && o.vault === a.team).map(o => this.pos(o));
             at = this.slots[a.team].find(s => used.every(u => Math.hypot(u.x - s[0], u.z - s[2]) > 1.0)) || this.slots[a.team][0];
@@ -83,11 +120,13 @@ export class Crates {
         b.setTranslation({ x: at[0], y: at[1], z: at[2] }, true);
         b.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
         const v = deposit ? { x: 0, y: 0, z: 0 } : a.body.vel;
-        b.setLinvel({ x: v.x * 0.6, y: Math.max(0, v.y * 0.6) + 2, z: v.z * 0.6 }, true);
+        if(vel) b.setLinvel({ x: vel[0], y: vel[1], z: vel[2] }, true);
+        else b.setLinvel({ x: v.x * 0.6, y: Math.max(0, v.y * 0.6) + 2, z: v.z * 0.6 }, true);
         c.prop.collider.setEnabled(true);
         a.ignoreTemp(c.prop.collider.handle, 1.0);
         c.idle = 0;
         if(deposit) { c.vault = a.team; this.game.emit('deposit', { crate: c, actor: a }); }
+        this._send(c, deposit ? 'deposit' : 'drop');
     }
     returnHome(c) {
         const b = c.prop.body;
@@ -95,6 +134,7 @@ export class Crates {
         b.setTranslation({ x: c.home[0], y: c.home[1] + 0.5, z: c.home[2] }, true);
         b.setLinvel({ x: 0, y: 0, z: 0 }, true);
         b.setAngvel({ x: 0, y: 0, z: 0 }, true);
+        this._send(c, 'home');
     }
 
     update(dt) {
@@ -103,18 +143,20 @@ export class Crates {
             const b = c.prop.body;
             if(c.carrier) {
                 const a = c.carrier;
-                if(!a.alive) { this.drop(c); continue; }
+                if(!a.alive && this.authority) { this.drop(c); continue; }
                 const p = a.viewCenter, yaw = a.yaw ?? 0;
                 _pos.x = p.x; _pos.y = p.y + a.body.halfHeight + a.body.radius + HALF + 0.15 + Math.sin(t0 * 6) * 0.04; _pos.z = p.z;
                 b.setNextKinematicTranslation(_pos);
                 _rot.y = Math.sin(yaw / 2); _rot.w = Math.cos(yaw / 2);
                 b.setNextKinematicRotation(_rot);
                 // banked in our vault?
-                if(inBox(this.vaults[a.team], p)) this.drop(c, true);
+                if(this.authority && inBox(this.vaults[a.team], p)) this.drop(c, true);
                 c.beam.visible = false;
                 continue;
             }
             const t = b.translation();
+            // the beacon: free crates show a light beam (not the buried ones: those are for diggers)
+            if(!this.authority) { c.beam.visible = !c.vault && !c.buried; c.beam.position.set(t.x, t.y + HALF, t.z); continue; }
             if(t.y < -30) { this.returnHome(c); continue; }
             c.vault = this.vaultOf(t);
             // the beacon: free crates show a light beam (not the buried ones: those are for diggers)

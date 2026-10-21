@@ -1,0 +1,13 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // Voxel Wars rooms: one Durable Object per room, addressed as wss://<worker>/parties/room/<name> (the binding name
+  // `Room` is the party name). Deploy: `npm install && npx wrangler deploy` in this directory.
+  "name": "voxel-wars",
+  "main": "src/index.js",
+  "compatibility_date": "2025-10-01",
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "Room", "class_name": "Room" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Room"] }]
+}

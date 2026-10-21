@@ -20,6 +20,12 @@
  *   no animation frames but still serves the room
  *   net.hashNow() -> Promise<Map key -> hash>     this client's chunk hashes in its current applied state
  *
+ * Game messages (not sequenced; src/game/NetGame.js): net.bcast(m) to everyone else, net.direct(to, m) to one client;
+ * net.onMsg(type, fn(from, m)) receives them by m.t, and also the room's own events: 'peer' (from, { id, on }),
+ * 'host' (from, { id }), 'reset', 'rejoined', 'status' ({ status } of a PartyTransport's socket).
+ * net.peers: the other clients' ids; net.hostId; net.ping (ms, PartyTransport only); net.gameState (the host's last
+ * 'game' message, from the welcome). A dropped connection re-joins with `since` = the last edit seen and catches up.
+ *
  * Built-in edit kinds (transient): 'mark' { what: 'hash' | 'snap' } (everyone hashes / the host snapshots at that
  * point of the order), 'resync' { to, keys } (the host sends `to` those chunks as they are at that point; `to` waits
  * for them before applying anything later). Direct messages: 'hashes' (host -> all), 'resyncReq', 'resyncData'.
@@ -29,12 +35,13 @@
 import { encode, decode } from './codec.js';
 
 const HASH_EVERY = 3;      // s between hash checks (host, when something changed)
-const SNAP_EVERY = 10;     // s between snapshots (host, when the log grew)
-const SNAP_EDITS = 48;     // or after this many logged edits
+const SNAP_EVERY = 30;     // s between snapshots (host, when the log grew; a snapshot is ~100-200 kB up to the server)
+const SNAP_EDITS = 200;    // or after this many logged edits (late joiners replay the rest)
 
 export class Net {
-    constructor({ transport, terrain }) {
+    constructor({ transport, terrain, snapEvery = SNAP_EVERY }) {
         this.transport = transport;
+        this.snapEvery = snapEvery;
         this.terrain = terrain;
         this.handlers = new Map();
         this.pending = new Map();     // req -> { resolve, reject }
@@ -49,6 +56,10 @@ export class Net {
         this.hostHashes = new Map();  // seq -> [[key, h]]
         this.resyncData = new Map();  // seq -> { data, resolve }
         this.stats = { applied: 0, submitted: 0, hashChecks: 0, mismatches: 0, resyncs: 0, snapshots: 0, snapBytes: 0, lastSnapMs: 0 };
+        this.msgHandlers = new Map();
+        this.peers = new Set();
+        this.lastSeen = 0;
+        this.ping = 0;
         this.on('mark', (e, m) => this._mark(e, m), { blocking: false });
         this.on('resync', (e, m) => this._resync(e, m), { blocking: true });
     }
@@ -58,6 +69,8 @@ export class Net {
 
     async connect() {
         await this.transport.connect((m) => this._message(m));
+        this.transport.onReopen = () => { this.rejoining = true; this.transport.send({ t: 'join', since: this.lastSeen }); };
+        this.transport.onStatus = (status) => this._emit('status', null, { status });
         this.transport.send({ t: 'join' });
         // a host tab that is still loading may miss the first join: ask again until welcomed
         if(!this.next) {
@@ -69,10 +82,21 @@ export class Net {
         }
     }
     on(kind, fn, { blocking = false } = {}) { this.handlers.set(kind, { fn, blocking }); }
+    onMsg(type, fn) { if(!this.msgHandlers.has(type)) this.msgHandlers.set(type, []); this.msgHandlers.get(type).push(fn); }
+    _emit(type, from, m) {
+        const fns = this.msgHandlers.get(type);
+        if(fns) for(const fn of fns) { try { fn(from, m); } catch(e) { console.error(`net: ${type} handler`, e); } }
+    }
+    bcast(m) { if(!this.single) this.transport.send({ t: 'bcast', m }); }
+    direct(to, m) { if(!this.single) this.transport.send({ t: 'direct', to, m }); }
     ready() {
         this.isReady = true;
         this._pump();
         if(!this.single && !this.timer) this.timer = setInterval(() => this._duties(1), 1000);
+        if(this.transport.server && !this.pingTimer) {
+            const ping = () => { if(this.transport.status === 'open') this.transport.send({ t: 'ping', c: performance.now() }); };
+            this.pingTimer = setInterval(ping, 2000); ping();
+        }
     }
 
     submit(e, { log = true } = {}) {
@@ -88,10 +112,16 @@ export class Net {
     _message(m) {
         switch(m.t) {
             case 'welcome': {
+                this.hostId = m.host;
+                this.transport.isHost = m.host === this.id;
+                this.peers = new Set(m.peers || []);
+                if(this.rejoining && this.next) { this._rejoin(m); return; }
+                this.rejoining = false;
+                this.lastSeen = Math.max(this.lastSeen, m.next - 1);
                 if(this.next) return; // a repeated join
                 this.welcome = m;
-                this.hostId = m.host;
-                const base = m.snap ? m.snap.seq + 1 : 1;
+                this.gameState = m.game || null;
+                const base = m.from ?? (m.snap ? m.snap.seq + 1 : 1);
                 this.next = base;
                 this.liveFrom = m.next; // edits before this are history (a late joiner catching up)
                 for(const e of m.log) if(e.seq >= base) this.queue.set(e.seq, e);
@@ -102,13 +132,33 @@ export class Net {
                 break;
             }
             case 'seq':
+                if(m.seq > this.lastSeen) this.lastSeen = m.seq;
                 if(this.next && m.seq < this.next) return; // already in the welcome's log
                 this.queue.set(m.seq, m);
                 this._pump();
                 break;
             case 'bcast': case 'direct': this._direct(m.from, m.m); break;
-            case 'host': this.hostId = m.id; this.transport.isHost = m.id === this.id; break;
+            case 'host': this.hostId = m.id; this.transport.isHost = m.id === this.id; this._emit('host', null, m); break;
+            case 'peer': if(m.on) this.peers.add(m.id); else this.peers.delete(m.id); this._emit('peer', null, m); break;
+            case 'reset': this._emit('reset', null, m); break;
+            case 'pong': this.ping = this.ping ? this.ping * 0.7 + (performance.now() - m.c) * 0.3 : performance.now() - m.c; this.roomSize = m.n; break;
         }
+    }
+
+    /** A reconnect's welcome: the edits missed while away (or the snapshot, if the log no longer reaches back). */
+    _rejoin(m) {
+        this.rejoining = false;
+        this.lastSeen = Math.max(this.lastSeen, m.next - 1);
+        if(m.snap && m.snap.seq >= this.next) {
+            this.welcome = m; this.snapApplied = false;
+            this.queue.clear();
+            this.next = m.snap.seq + 1;
+            this.liveFrom = m.next;
+        }
+        for(const e of m.log) if(e.seq >= this.next) this.queue.set(e.seq, e);
+        console.log(`net: re-joined at seq ${this.applied}, ${m.log.length} edits to catch up${m.snap ? ' (from a snapshot)' : ''}`);
+        this._emit('rejoined', null, m);
+        this._pump();
     }
 
     async _pump() {
@@ -150,7 +200,7 @@ export class Net {
         if(!this.isHost || this.single || !this.isReady) return;
         this.hashT += dt; this.snapT += dt;
         if(this.hashT > HASH_EVERY && this.editsSinceHash > 0) { this.hashT = 0; this.editsSinceHash = 0; this.submit({ k: 'mark', what: 'hash' }, { log: false }); }
-        if((this.snapT > SNAP_EVERY && this.editsSinceSnap > 0) || this.editsSinceSnap >= SNAP_EDITS) { this.snapT = 0; this.editsSinceSnap = 0; this.submit({ k: 'mark', what: 'snap' }, { log: false }); }
+        if((this.snapT > this.snapEvery && this.editsSinceSnap > 0) || this.editsSinceSnap >= SNAP_EDITS) { this.snapT = 0; this.editsSinceSnap = 0; this.submit({ k: 'mark', what: 'snap' }, { log: false }); }
     }
 
     /** This client's hashes as of now (in its applied order). */
@@ -200,6 +250,7 @@ export class Net {
                 if(w?.resolve) w.resolve(m.data); else this.resyncData.set(m.seq, { data: m.data });
                 break;
             }
+            default: this._emit(m.t, from, m);
         }
     }
     /** 'resync' at this point of the order: the host reads the chunks and sends them; the target overwrites its own. */

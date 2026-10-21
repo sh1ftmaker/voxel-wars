@@ -49,8 +49,24 @@ export class Hud {
         this.markerLayer = el('div', 'bz-markers', root);
         // screens
         this.playEl = el('div', 'bz-screen bz-play', root, `<div class="card"><h1>VOXEL WARS</h1><p>Steal supply crates and bank them in your vault, under your fort. Blue's bots tunnel through everything to do the same.</p>
-            <div class="keys"><b>WASD</b> move · <b>Space</b> jump · <b>Shift</b> sprint<br><b>Click</b> use tool · <b>1-7 / wheel</b> tools<br><b>F</b> punch · hold <b>E / right click</b> rip & throw · <b>M</b> mute</div><button>Click to play</button><div><button class="bz-bots small"></button></div><div class="bz-softinfo"></div></div>`);
+            <div class="keys"><b>WASD</b> move · <b>Space</b> jump · <b>Shift</b> sprint<br><b>Click</b> use tool · <b>1-7 / wheel</b> tools<br><b>F</b> punch · hold <b>E / right click</b> rip & throw · <b>M</b> mute</div><button>Click to play</button><div><button class="bz-bots small"></button> <button class="bz-online small"></button></div><div class="bz-roominfo"></div><div class="bz-softinfo"></div></div>`);
         this.softInfo = this.playEl.querySelector('.bz-softinfo');
+        this.roomInfo = this.playEl.querySelector('.bz-roominfo');
+        // online: a new room (and its invite link on the clipboard), or the room's link
+        const onlineBtn = this.playEl.querySelector('.bz-online');
+        const room = game.ctx.net?.room;
+        onlineBtn.textContent = room ? '🔗 Copy invite link' : '🌐 Play online';
+        onlineBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const u = new URL(location.href);
+            if(!room) u.searchParams.set('room', Math.random().toString(36).slice(2, 8));
+            for(const k of ['local', 'loopback']) u.searchParams.delete(k);
+            const link = u.toString();
+            navigator.clipboard?.writeText(link).catch(() => {});
+            if(room) { this.hint('Invite link copied: send it to a friend', 3); return; }
+            location.href = link;
+        });
+        this.netEl = el('div', 'bz-net', root);
         this.botsCorner = el('button', 'bz-bots corner', root);
         this.botButtons = [...root.querySelectorAll('.bz-bots')];
         for(const b of this.botButtons) b.addEventListener('click', (e) => { e.stopPropagation(); game.setBots(!game.botsOn); });
@@ -74,10 +90,14 @@ export class Hud {
             this.feedMsg(by && by !== actor ? `${who(by)} ⟶ ${who(actor)}` : `${who(actor)} ${how}`);
         });
         game.on('pickup', ({ actor, from }) => {
-            if(actor === game.player) this.hint(from === 'blue' ? 'Stolen! Run it home to your vault' : 'Got a crate! Run it home to your vault', 3);
-            else if(from === 'red') this.feedMsg(`<span class="blue">${actor.name}</span> is stealing from your vault!`, true);
+            const mine = game.player.team;
+            if(actor === game.player) this.hint(from && from !== mine ? 'Stolen! Run it home to your vault' : 'Got a crate! Run it home to your vault', 3);
+            else if(from === mine && actor.team !== mine) this.feedMsg(`<span class="${actor.team}">${actor.name}</span> is stealing from your vault!`, true);
         });
-        game.on('deposit', ({ actor }) => this.feedMsg(actor.team === 'red' ? `<span class="red">${actor.name}</span> banked a crate +1` : `<span class="blue">${actor.name}</span> banked a crate for Blue`, actor.team !== 'red'));
+        game.on('deposit', ({ actor }) => {
+            const ours = actor.team === game.player.team, T = actor.team === 'red' ? 'Red' : 'Blue';
+            this.feedMsg(`<span class="${actor.team}">${actor.name}</span> banked a crate ${ours ? '+1' : `for ${T}`}`, !ours);
+        });
         game.on('matchOver', ({ result, score }) => {
             this.overEl.classList.add('on');
             this.overEl.querySelector('h1').textContent = result === 'win' ? 'VICTORY' : result === 'loss' ? 'DEFEAT' : 'DRAW';
@@ -91,6 +111,20 @@ export class Hud {
         const g = this.game, pad = el('div', 'bz-touch', this.root);
         const b = (cls, label, name) => { const e = el('div', 'tbtn ' + cls, pad, label); g.input.bindButton(e, name); return e; };
         b('fire', '🔥', 'fire'); b('jump', '⤒', 'jump'); b('grab', '✊', 'grab'); b('punch', '👊', 'punch');
+    }
+    /** The online panel (top right) and the room line on the title card. */
+    onlineInfo(ng) {
+        const net = ng.net, n = 1 + net.peers.size, st = net.transport.status;
+        const humans = [ng.game.player, ...ng.remotes.values()].filter(a => !a.isBot);
+        const red = humans.filter(a => a.team === 'red').length;
+        const txt = `🌐 ${net.room} · ${n} player${n === 1 ? '' : 's'} (${red} red, ${humans.length - red} blue)` +
+            (net.ping ? ` · ${Math.round(net.ping)} ms` : '') + (ng.isHost ? ' · host' : '') + (st && st !== 'open' ? ` · ${st === 'closed' ? 'reconnecting…' : st}` : '');
+        if(this.changed('net', txt + ng.name + ng.game.player.team)) {
+            this.netEl.textContent = txt;
+            this.netEl.classList.toggle('bad', !!st && st !== 'open');
+            this.roomInfo.innerHTML = `Online room <b>${net.room}</b> as <b class="${ng.game.player.team}">${ng.name}</b> · <a href="#" class="bz-rename">rename</a><br>${n} player${n === 1 ? '' : 's'} here${ng.isHost ? ' · you host (bots run on your machine)' : ''}`;
+            this.roomInfo.querySelector('.bz-rename').onclick = (e) => { e.preventDefault(); e.stopPropagation(); const v = prompt('Your name', ng.name); if(v) ng.rename(v); };
+        }
     }
     hint(text, t = 2.5) { this.hintEl.textContent = text; this.hintEl.classList.add('on'); this.hintT = t; }
     feedMsg(html, bad = false) {
@@ -143,6 +177,7 @@ export class Hud {
         if(this.changed('dead', dead)) this.deadEl.classList.toggle('on', dead);
         if(dead) { const r = Math.ceil(p.respawnIn); if(this.changed('respawn', r)) this.deadSub.textContent = `Respawning in ${r}…`; }
         if(this.changed('bots', g.botsOn)) for(const b of this.botButtons) b.textContent = g.botsOn ? '🤖 Bots: ON' : '🤖 Bots: OFF';
+        if(g.netGame && (this.netT = (this.netT ?? 0) - dt) <= 0) { this.netT = 0.5; this.onlineInfo(g.netGame); }
         this.pickT -= dt;
         if(this.pickT <= 0) { this.pickT = 0.15; this.pickMarkers(); }
         this.drawMarkers();
@@ -159,7 +194,7 @@ export class Hud {
             // the 4 nearest takeable crates, by insertion into a small sorted buffer (no array churn)
             const best = this.bestCrates, bd = this.bestD; let k = 0;
             for(const c of g.crates.list) {
-                if(c.vault === 'red' || c.carrier === p) continue;
+                if(c.vault === p.team || c.carrier === p) continue;
                 const t = c.carrier ? c.carrier.body.center : c.prop.body.translation();
                 const d = Math.hypot(t.x - me.x, t.y - me.y, t.z - me.z);
                 let j = Math.min(k, 4);
@@ -171,12 +206,12 @@ export class Hud {
             for(let i = 0; i < k; i++) {
                 const c = best[i], s = add();
                 s.src = c; s.kind = 'crate'; s.d = bd[i]; s.hp = -1; s.noClamp = false;
-                s.cls = c.carrier ? 'stolen' : c.vault === 'blue' ? 'enemy' : c.buried ? 'buried' : 'crate';
+                s.cls = c.carrier ? 'stolen' : c.vault ? 'enemy' : c.buried ? 'buried' : 'crate';
                 s.label = c.carrier ? '⚠' : c.buried ? '⛏' : '📦';
             }
         }
-        for(const b of g.bots) {
-            if(!b.alive) continue;
+        for(const b of g.actors) {
+            if(b === p || !b.alive || b.team === p.team) continue;
             const c = b.body.center, d = Math.hypot(c.x - me.x, c.y - me.y, c.z - me.z);
             if(d < 32 && (b.health < 100 || b.seesPlayer)) { const s = add(); s.src = b; s.kind = 'bot'; s.cls = 'bot'; s.label = ''; s.d = d; s.hp = b.health; s.noClamp = true; }
         }
@@ -190,7 +225,7 @@ export class Hud {
             const m = this.markers[i], o = i < this.nSpecs ? this.specs[i] : null;
             let show = !!o;
             if(o) {
-                if(o.kind === 'vault') { const v = g.crates.vaults.red; _v.set((v.min[0] + v.max[0]) / 2, (v.min[1] + v.max[1]) / 2, (v.min[2] + v.max[2]) / 2); }
+                if(o.kind === 'vault') { const v = g.crates.vaults[g.player.team]; _v.set((v.min[0] + v.max[0]) / 2, (v.min[1] + v.max[1]) / 2, (v.min[2] + v.max[2]) / 2); }
                 else if(o.kind === 'crate') { const c = o.src; if(c.carrier) _v.copy(c.carrier.body.center).y += 1.4; else { const t = c.prop.body.translation(); _v.set(t.x, t.y + 0.6, t.z); } }
                 else { const c = o.src.body.center; _v.set(c.x, c.y + 1.3, c.z); if(!o.src.alive) show = false; }
                 _v.project(cam);

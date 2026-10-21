@@ -7,6 +7,10 @@
  * 'punch' { point, kind: 'terrain'|'prop'|'actor'|'air', mat }, 'dig' { point, volume }, 'build' { center, size },
  * 'rip' { prop }, 'throw' { kind, owner }, 'slam' { point, mat, volume, speed } (a thrown rock lands its hit),
  * 'bounce' { kind, point, impact }.
+ *
+ * Online (src/game/NetGame.js): only a local actor's (this client's player, the host's bots) weapons have effects.
+ * Their rockets and bombs are sent as actions; other clients fly visual copies ({ visual: true }) that vanish where
+ * they hit: the owner's explosion arrives as its own event and terrain edit, its damage through the host.
  */
 import * as THREE from 'three/webgpu';
 import { rock, capsule, box } from '../../voxel/brushes.js';
@@ -62,7 +66,7 @@ export class Combat {
             const impulse = [dir[0] * k * self, Math.max(dir[1], 0.35) * k * 1.15 * self, dir[2] * k * self];
             let dmg = def.damage * f;
             if(a === owner) dmg *= SELF_DAMAGE_SCALE;
-            else if(owner && !owner.isPlayer && a.isPlayer) dmg *= BOT_DAMAGE_SCALE;
+            else if(owner && !owner.isHuman && a.isHuman) dmg *= BOT_DAMAGE_SCALE;
             if(owner && a !== owner && owner.team === a.team) dmg = 0; // no friendly fire (knockback still applies)
             this.game.damage(a, dmg, owner, impulse, kind);
         }
@@ -70,20 +74,22 @@ export class Combat {
     }
 
     // ---- rockets ----
-    fireRocket(owner, origin, dir) {
+    fireRocket(owner, origin, dir, { visual = false } = {}) {
         const def = WEAPONS.rocket;
+        if(!visual) this.game.netGame?.act({ k: 'rocket', a: owner?.netId, o: [...origin], d: [...dir] }, owner);
         // point blank: born inside the wall ahead it would fly through it
         const pre = this.raycast(origin, dir, 1.2, owner);
         this.game.emit('rocket', { origin, owner });
+        if(pre && visual) return;
         if(pre) {
-            if(pre.actor) this.game.damage(pre.actor, def.direct * (owner.isPlayer ? 1 : BOT_DAMAGE_SCALE), owner, [dir[0] * 4, 2, dir[2] * 4], 'rocket');
+            if(pre.actor) this.game.damage(pre.actor, def.direct * (owner.isHuman ? 1 : BOT_DAMAGE_SCALE), owner, [dir[0] * 4, 2, dir[2] * 4], 'rocket');
             this.explode([pre.point[0] - dir[0] * 0.15, pre.point[1] - dir[1] * 0.15, pre.point[2] - dir[2] * 0.15], 'rocket', owner);
             return;
         }
         const mesh = new THREE.Mesh(this.rocketGeo, this.rocketMat);
         mesh.position.set(origin[0] + dir[0] * 1.2, origin[1] + dir[1] * 1.2, origin[2] + dir[2] * 1.2);
         this.ctx.scene.add(mesh);
-        this.rockets.push({ pos: mesh.position, vel: new THREE.Vector3(dir[0] * def.speed, dir[1] * def.speed, dir[2] * def.speed), owner, age: 0, mesh, trail: 0 });
+        this.rockets.push({ pos: mesh.position, vel: new THREE.Vector3(dir[0] * def.speed, dir[1] * def.speed, dir[2] * def.speed), owner, age: 0, mesh, trail: 0, visual });
     }
 
     updateRockets(dt) {
@@ -99,8 +105,9 @@ export class Combat {
             o[0] = r.pos.x; o[1] = r.pos.y; o[2] = r.pos.z;
             const hit = this.raycast(o, dir, len + 0.2, r.age < 0.25 ? r.owner : null);
             let at = null;
+            if(hit && r.visual) { this.removeRocket(i); continue; }
             if(hit) {
-                if(hit.actor && hit.actor !== r.owner && hit.actor.team !== r.owner?.team) this.game.damage(hit.actor, def.direct * (r.owner?.isPlayer ? 1 : BOT_DAMAGE_SCALE), r.owner, [dir[0] * 4, 2, dir[2] * 4], 'rocket');
+                if(hit.actor && hit.actor !== r.owner && hit.actor.team !== r.owner?.team) this.game.damage(hit.actor, def.direct * (r.owner?.isHuman ? 1 : BOT_DAMAGE_SCALE), r.owner, [dir[0] * 4, 2, dir[2] * 4], 'rocket');
                 at = [hit.point[0] - dir[0] * 0.15, hit.point[1] - dir[1] * 0.15, hit.point[2] - dir[2] * 0.15];
             } else if(r.age > def.life || r.pos.y < -30) { this.removeRocket(i); continue; }
             if(at) { this.removeRocket(i); this.explode(at, 'rocket', r.owner); continue; }
@@ -113,8 +120,15 @@ export class Combat {
     removeRocket(i) { const r = this.rockets[i]; r.mesh.removeFromParent(); this.rockets.splice(i, 1); }
 
     // ---- fused bodies ----
-    throwFused(owner, kind, origin, dir, speed) {
+    throwFused(owner, kind, origin, dir, speed, { visual = false, id = null, spin = null } = {}) {
         const def = WEAPONS[kind];
+        const ng = this.game.netGame;
+        if(!visual && ng) {
+            id = ng.newId('f');
+            spin = [Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4];
+            const ov = owner?.body?.vel ?? { x: 0, y: 0, z: 0 };
+            ng.act({ k: 'fused', a: owner?.netId, kind, o: [...origin], d: [...dir], s: speed, id, spin, ov: [ov.x, ov.y, ov.z] }, owner);
+        }
         const r = kind === 'buster' ? 0.42 : 0.2;
         const mesh = new THREE.Mesh(new THREE.SphereGeometry(r, 14, 10), kind === 'buster' ? this.busterMat.clone() : this.grenadeMat.clone());
         mesh.castShadow = true;
@@ -123,10 +137,11 @@ export class Combat {
         const ov = owner?.body?.vel ?? { x: 0, y: 0, z: 0 };
         const prop = this.ctx.physics.addBody({ shape: 'sphere', size: r, position: start, mesh,
             velocity: [dir[0] * speed + ov.x * 0.5, dir[1] * speed + 2.5, dir[2] * speed + ov.z * 0.5],
-            angularVelocity: [Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4],
+            angularVelocity: spin || [Math.random() * 8 - 4, Math.random() * 8 - 4, Math.random() * 8 - 4],
             density: kind === 'buster' ? 3000 : 2500, restitution: kind === 'buster' ? 0.15 : 0.45, friction: 0.6, userData: { kind } });
+        if(id) { prop.userData.netId = id; prop.userData.owner = visual ? owner?.client ?? null : ng?.id ?? null; }
         owner?.ignoreTemp?.(prop.collider.handle, 0.3);
-        this.fused.push({ prop, kind, owner, at: def.fuse, age: 0, prevV: [0, 0, 0], tick: 0 });
+        this.fused.push({ prop, kind, owner, at: def.fuse, age: 0, prevV: [0, 0, 0], tick: 0, visual });
         this.game.emit('throw', { kind, owner });
         return prop;
     }
@@ -144,13 +159,22 @@ export class Combat {
             f.tick -= dt;
             if(f.tick <= 0) { f.tick = Math.max(0.08, 0.5 * (1 - prog)); f.prop.mesh.material.emissiveIntensity = 2.5; this.game.emit('fuse', { kind: f.kind, progress: prog, point: [t.x, t.y, t.z] }); }
             else f.prop.mesh.material.emissiveIntensity *= 0.85;
-            if(f.age >= f.at || t.y < -30) {
-                this.fused.splice(i, 1);
-                this.ctx.physics.removeBody(f.prop);
-                f.prop.mesh.geometry.dispose();
-                if(t.y > -30) this.explode([t.x, t.y, t.z], f.kind, f.owner);
-            }
+            // a visual copy waits a little for the owner's explosion (it is removed by NetGame on 'gone')
+            if(f.age >= f.at + (f.visual ? 1.5 : 0) || t.y < -30) this.removeFused(i, !f.visual && t.y > -30);
         }
+    }
+    /** Remove fused body i (exploding it there if `boom`); a visual copy also goes when its owner's one went. */
+    removeFused(i, boom = false) {
+        const f = this.fused[i], t = f.prop.body.translation();
+        this.fused.splice(i, 1);
+        this.ctx.physics.removeBody(f.prop);
+        f.prop.mesh.geometry.dispose();
+        if(!f.visual && f.prop.userData.netId) this.game.netGame?.gone(f.prop.userData.netId);
+        if(boom) this.explode([t.x, t.y, t.z], f.kind, f.owner);
+    }
+    removeFusedById(id) {
+        const i = this.fused.findIndex(f => f.prop.userData.netId === id);
+        if(i >= 0) this.removeFused(i, false);
     }
 
     // ---- melee ----
@@ -160,7 +184,7 @@ export class Combat {
         if(!hit) { this.game.emit('punch', { point: [origin[0] + dir[0] * 2, origin[1] + dir[1] * 2, origin[2] + dir[2] * 2], kind: 'air', owner }); return 'air'; }
         if(hit.actor) {
             const a = hit.actor;
-            if(a.team !== owner.team) this.game.damage(a, def.damage * (owner.isPlayer ? 1 : BOT_DAMAGE_SCALE), owner, [dir[0] * def.knock, 6, dir[2] * def.knock], 'punch');
+            if(a.team !== owner.team) this.game.damage(a, def.damage * (owner.isHuman ? 1 : BOT_DAMAGE_SCALE), owner, [dir[0] * def.knock, 6, dir[2] * def.knock], 'punch');
             else a.body.knock([dir[0] * def.knock * 0.5, 4, dir[2] * def.knock * 0.5]);
             this.game.emit('punch', { point: hit.point, kind: 'actor', owner });
             return 'actor';
@@ -169,8 +193,10 @@ export class Combat {
             const b = hit.prop.body;
             if(b.isDynamic()) {
                 const m = b.mass(), s = def.propSpeed * Math.min(1, 60 / Math.max(m, 1)) + 4;
-                b.applyImpulse({ x: dir[0] * s * m, y: (dir[1] + 0.35) * s * m, z: dir[2] * s * m }, true);
-                b.applyTorqueImpulse({ x: (Math.random() - 0.5) * m, y: (Math.random() - 0.5) * m, z: (Math.random() - 0.5) * m }, true);
+                const j = { x: dir[0] * s * m, y: (dir[1] + 0.35) * s * m, z: dir[2] * s * m }, tq = { x: (Math.random() - 0.5) * m, y: (Math.random() - 0.5) * m, z: (Math.random() - 0.5) * m };
+                b.applyImpulse(j, true);
+                b.applyTorqueImpulse(tq, true);
+                this.game.netGame?.push(hit.prop, j, tq); // the body's owner pushes its copy too
                 // a voxel body's soft layer: the far side lags behind the fist (a jiggle at least as big as a 6 m/s hit)
                 const vb = hit.prop.userData?.voxelBody, k = Math.max(s, 6);
                 if(vb) this.ctx.destruction.bodies?.soft?.impact(vb, hit.point, [dir[0] * k, (dir[1] + 0.35) * k, dir[2] * k], 1);
@@ -292,6 +318,7 @@ export class Combat {
     /** Hold: a kinematic body following `target`. */
     hold(prop, on) {
         const b = prop.body;
+        if(on) this.game.netGame?.claim(prop); // online: whoever holds a body simulates it (and streams it)
         b.setBodyType(on ? BodyType.Kinematic : BodyType.Dynamic, true);
         prop.userData ||= {};
         prop.userData.held = on; // VoxelBodies: a held body never settles or fractures
@@ -337,7 +364,7 @@ export class Combat {
                 }
                 if(hit) { t.slammed = true; this.slam(t, hit, Math.max(speed, def.shatterSpeed)); }
             }
-            if(t.age > 6 || (t.age > 0.5 && speed < 1.5)) this.thrown.splice(i, 1); // came to rest: plain rubble now
+            if(t.age > 6 || (t.age > 0.5 && speed < 1.5)) { this.thrown.splice(i, 1); this.game.netGame?.unclaim(t.prop); } // came to rest: plain rubble now (the host's again)
         }
     }
     /** A thrown lump lands its hit: whoever it strikes takes damage and knockback (no blast: the rock stays a body
@@ -353,7 +380,7 @@ export class Combat {
             const f = f0 * Math.min(1, 1.2 - d / (reach + 0.6) * 0.6);
             const dir = d > 1e-3 ? [(c.x - point[0]) / d, (c.y - point[1]) / d, (c.z - point[2]) / d] : [0, 1, 0];
             let dmg = def.damage * f;
-            if(t.owner && !t.owner.isPlayer && a.isPlayer) dmg *= BOT_DAMAGE_SCALE;
+            if(t.owner && !t.owner.isHuman && a.isHuman) dmg *= BOT_DAMAGE_SCALE;
             if(t.owner && t.owner.team === a.team) dmg = 0;
             this.game.damage(a, dmg, t.owner, [dir[0] * def.knock * f, Math.max(dir[1], 0.4) * def.knock * f, dir[2] * def.knock * f], 'rock');
         }

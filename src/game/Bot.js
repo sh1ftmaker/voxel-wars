@@ -7,11 +7,14 @@
 import * as THREE from 'three/webgpu';
 import { Actor } from './Actor.js';
 import { WEAPONS } from './weapons/defs.js';
+import { makeAvatar } from './avatar.js';
 
 const BOT_STEP = 1 / 30;
 const SPEED = 7.2, JUMP = 19, CARRY_SLOW = 0.8, START_DELAY = 5;
 const RAMP = 0.5; // rad: how steep a bot digs up toward something above it
 const _e = new THREE.Vector3(), _t = new THREE.Vector3();
+/** Stands in for "no enemy at all" (a room where every human is on one team and bots are off). */
+const NOBODY = { alive: false, carrying: null, body: { center: new THREE.Vector3(), vel: new THREE.Vector3(), grounded: true, eye: (o) => o.set(0, -999, 0) } };
 
 export class Bot extends Actor {
     constructor(game, opts) {
@@ -42,27 +45,30 @@ export class Bot extends Actor {
         this.view = new THREE.Vector3().copy(this.body.center);
     }
     makeMesh(color) {
-        const g = new THREE.Group();
-        const team = new THREE.MeshStandardNodeMaterial({ color, roughness: 0.6 });
-        const dark = new THREE.MeshStandardNodeMaterial({ color: 0x2a2f3a, roughness: 0.7 });
-        const body = new THREE.Mesh(new THREE.CapsuleGeometry(0.38, 0.75, 4, 10), team); body.position.y = 0.9; g.add(body);
-        const head = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.42, 0.46), team); head.position.y = 1.62; g.add(head);
-        const visor = new THREE.Mesh(new THREE.BoxGeometry(0.42, 0.13, 0.05), new THREE.MeshStandardNodeMaterial({ color: 0x111111, emissive: 0x40c0ff, emissiveIntensity: 1.2 }));
-        visor.position.set(0, 1.66, -0.24); g.add(visor);
-        const gun = new THREE.Mesh(new THREE.CylinderGeometry(0.08, 0.08, 0.8, 8), dark); gun.rotation.x = Math.PI / 2; gun.position.set(0.36, 1.25, -0.25); g.add(gun);
-        this.gun = gun;
-        const legL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.5, 0.2), dark); legL.position.set(-0.15, 0.25, 0); g.add(legL);
-        const legR = legL.clone(); legR.position.x = 0.15; g.add(legR);
-        this.legs = [legL, legR];
-        g.traverse(o => { if(o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
-        return g;
+        const av = makeAvatar(color);
+        this.gun = av.gun; this.legs = av.legs;
+        return av.group;
     }
     eye(out = this._eye) { this.body.eye(_e); out[0] = _e.x; out[1] = _e.y; out[2] = _e.z; return out; }
     aimDir(out = this._aim) { const cp = Math.cos(this.aimPitch); out[0] = -Math.sin(this.yaw) * cp; out[1] = Math.sin(this.aimPitch); out[2] = -Math.cos(this.yaw) * cp; return out; }
 
+    /** The enemy this bot cares about: in single player the player; online the nearest living enemy (a crate
+     *  carrier within 30 m first). */
+    foe() {
+        const game = this.game;
+        if(!game.netGame) return game.player.team !== this.team ? game.player : NOBODY;
+        const me = this.body.center;
+        let best = null, bd = Infinity;
+        for(const a of game.actors) {
+            if(!a.alive || a.team === this.team) continue;
+            const d = a.body.center.distanceTo(me) - (a.carrying ? 30 : 0);
+            if(d < bd) { bd = d; best = a; }
+        }
+        return best || NOBODY;
+    }
     chooseGoal() {
         const game = this.game, me = this.body.center;
-        const pl = game.player;
+        const pl = this.foe();
         const prevCrate = this.goalCrate;
         this.goalCrate = null;
         if(this.role === 'defender' && !this.carrying) {
@@ -123,9 +129,10 @@ export class Bot extends Actor {
         const game = this.game, body = this.body, me = body.center;
         if(game.over) { body.step(dt, 0, 0); this.pose(dt, 0); return; }
         this.think -= dt;
-        const pl = game.player;
+        const pl = this.target && this.target.alive ? this.target : (this.target = this.foe());
         if(this.think <= 0) {
             this.think = 0.35 + Math.random() * 0.2;
+            this.target = this.foe();
             if(!this.goal || this.goalKind !== 'crate' || !this.goalCrate || this.goalCrate.carrier || Math.random() < 0.3) this.chooseGoal();
             else { const t = this.goalCrate.prop.body.translation(); this.goal = [t.x, t.y, t.z]; }
             // no progress toward a crate for a long while (it sits somewhere we cannot dig up to): try another
@@ -143,7 +150,8 @@ export class Bot extends Actor {
         const g = this.goal || [me.x, me.y, me.z];
         const dx = g[0] - me.x, dy = g[1] - (me.y - 0.9), dz = g[2] - me.z, hd = Math.hypot(dx, dz);
         let moveYaw = Math.atan2(-dx, -dz);
-        let wish = hd > 0.6 ? SPEED * (this.carrying ? CARRY_SLOW : 1) : 0;
+        // right over (or under) the goal: keep moving, so it digs a ramp down (or up) to it instead of waiting there
+        let wish = hd > 0.6 || Math.abs(dy) > 1.6 ? SPEED * (this.carrying ? CARRY_SLOW : 1) : 0;
         if(this.goalKind === 'guard' && hd < 3) wish = 0;
         if(game.elapsed < START_DELAY) wish = 0;
         // progress check: stuck against something for a while -> dig through it
