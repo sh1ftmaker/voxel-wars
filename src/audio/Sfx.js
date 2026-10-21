@@ -4,7 +4,12 @@
  *  Donkey Kong sounds (punch, rip, shatter) and material-coloured impacts.
  *
  *  The context starts on the first user gesture, as browsers require; every call is a no-op until then. M mutes.
+ *
+ *  Materials break by family (MATERIALS[id].sound, else the id map FAMILY): wood cracks, creaks and splinters, stone
+ *  cracks and rumbles, metal clangs and groans while it bends, earth thuds and pours, sand and snow hiss, glass
+ *  shatters and tinkles ('fracture', 'groan', 'crumble').
  */
+import { MATERIALS } from '../voxel/materials.js';
 
 export const SCALE = [62, 64, 66, 67, 69, 71, 72]; // D Mixolydian in octave 4, as midi notes
 export const midiHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
@@ -344,7 +349,10 @@ export function createBus(ctx) {
 
 
 /** Material families for impacts and blasts: what a material sounds like when it breaks. */
-const FAMILY = { 0: 'stone', 1: 'earth', 2: 'earth', 3: 'sand', 4: 'sand', 5: 'stone', 6: 'metal', 7: 'earth', 8: 'stone', 9: 'stone', 10: 'wood', 11: 'stone', 12: 'stone', 13: 'stone' };
+const FAMILY = { 0: 'stone', 1: 'earth', 2: 'earth', 3: 'sand', 4: 'sand', 5: 'stone', 6: 'metal', 7: 'earth', 8: 'stone', 9: 'stone', 10: 'wood', 11: 'stone', 12: 'stone', 13: 'stone', 14: 'wood', 15: 'wood', 16: 'glass' };
+/** MATERIALS[id].sound names -> the families here. */
+const SOUND_FAMILY = { wood: 'wood', stone: 'stone', metal: 'metal', dirt: 'earth', glass: 'glass', snow: 'sand' };
+const familyOf = (m) => SOUND_FAMILY[MATERIALS[m]?.sound] || FAMILY[m] || 'earth';
 
 Object.assign(SOUNDS, {
     /** Donkey Kong's punch: a meaty thump and the crack of whatever it hit. */
@@ -372,10 +380,54 @@ Object.assign(SOUNDS, {
             s.metal(at, 520 * r, { dur: 0.35, gain: 0.25 * a, ratio: 2.76, index: 3, out });
         } else if(family === 'sand') {
             s.noise(at, { dur: 0.25 * k, gain: 0.25 * a, type: 'highpass', freq: 1800, attack: 0.01, out });
+        } else if(family === 'glass') {
+            s.noise(at, { dur: 0.05, gain: 0.3 * a, type: 'highpass', freq: 4500 * r, attack: 0.001, out });
+            SOUNDS.tinkle(s, { at: at + 0.04, count: 2 + Math.round(k * 2), distance, pan });
         } else {
             s.noise(at, { dur: 0.18 * k, gain: 0.3 * a, type: 'lowpass', freq: 500 * r, freqEnd: 120, attack: 0.003, out });
             s.noise(at + 0.04, { dur: 0.3 * k, gain: 0.12 * a, type: 'bandpass', freq: 1400, q: 0.8, attack: 0.05, out }); // dirt pouring
         }
+    },
+    /**
+     * A material breaking by its family: wood snaps, creaks and splinters; stone cracks and rumbles; metal clangs;
+     * earth thuds and pours; sand and snow hiss; glass shatters and tinkles. `energy` ~0.3..3 scales it.
+     */
+    fracture(s, { at = s.now, family = 'stone', energy = 1, distance = 0, pan = 0 } = {}) {
+        const a = atten(distance), e = clamp(energy, 0.3, 3), out = s.bus({ pan, lowpass: muffle(distance), send: 0.25 }), r = rnd(0.9, 1.1);
+        if(family === 'wood') {
+            s.noise(at, { dur: 0.025, gain: 0.5 * a, type: 'bandpass', freq: 1900 * r, q: 2, attack: 0.001, out });            // snap
+            s.tone(at, 260 * r, { dur: 0.12, gain: 0.22 * a, type: 'triangle', freqEnd: 140, out });                            // knock
+            s.tone(at + 0.03, 95 * r, { dur: 0.35, gain: 0.12 * a * e, type: 'sawtooth', freqEnd: 70, lowpass: 600, attack: 0.04, out }); // creak
+            for(let i = 0; i < 3 + e * 3; i++) s.noise(at + 0.02 + Math.random() * 0.25, { dur: rnd(0.01, 0.03), gain: rnd(0.08, 0.16) * a, type: 'bandpass', freq: rnd(1800, 4200), q: 5, attack: 0.001, out }); // splinters
+        } else if(family === 'stone') {
+            s.noise(at, { dur: 0.04, gain: 0.5 * a, type: 'bandpass', freq: 2600 * r, q: 1, attack: 0.001, out });              // crack
+            s.noise(at + 0.01, { dur: 0.5 + 0.4 * e, gain: 0.22 * a * e, type: 'lowpass', freq: 220, freqEnd: 70, q: 1, attack: 0.03, out }); // rumble
+            s.tone(at, 70 * r, { dur: 0.3, gain: 0.2 * a, freqEnd: 38, out });
+            for(let i = 0; i < 4 + e * 4; i++) s.noise(at + 0.04 + Math.random() * 0.5 * e, { dur: rnd(0.015, 0.05), gain: rnd(0.06, 0.15) * a, type: 'bandpass', freq: rnd(900, 3800), q: 3, attack: 0.001, out }); // rattle
+        } else if(family === 'metal') {
+            s.metal(at, 330 * r, { dur: 0.6, gain: 0.3 * a, ratio: 2.76, index: 4, out });                                     // clang
+            s.metal(at + 0.01, 870 * r, { dur: 0.25, gain: 0.12 * a, ratio: 3.4, index: 2, out });
+        } else if(family === 'glass') {
+            s.noise(at, { dur: 0.12, gain: 0.45 * a, type: 'highpass', freq: 3500 * r, attack: 0.001, out });                    // shatter
+            s.noise(at, { dur: 0.05, gain: 0.25 * a, type: 'bandpass', freq: 1500, q: 1, attack: 0.001, out });
+            SOUNDS.tinkle(s, { at: at + 0.08, count: 4 + Math.round(e * 4), distance, pan });
+        } else SOUNDS.crumble(s, { at, family, size: e, distance, pan });
+    },
+    /** Glass slivers landing: scattered high pings. */
+    tinkle(s, { at = s.now, count = 5, distance = 0, pan = 0 } = {}) {
+        const a = atten(distance), out = s.bus({ pan, lowpass: muffle(distance), send: 0.3 });
+        for(let i = 0; i < count; i++) {
+            const t = at + Math.pow(Math.random(), 1.5) * 0.9, f = rnd(2600, 5200);
+            s.tone(t, f, { dur: rnd(0.05, 0.14), gain: rnd(0.03, 0.08) * a, attack: 0.001, out });
+            s.tone(t, f * 2.71, { dur: 0.04, gain: 0.02 * a, attack: 0.001, out });
+        }
+    },
+    /** Metal bending: a low inharmonic groan that slides down. `amount` 0..1. */
+    groan(s, { at = s.now, amount = 0.5, distance = 0, pan = 0 } = {}) {
+        const a = atten(distance), k = clamp(amount, 0.1, 1), out = s.bus({ pan, lowpass: muffle(distance, 8, 4000), send: 0.3 }), r = rnd(0.85, 1.15);
+        s.tone(at, 110 * r, { dur: 0.5 + k * 0.4, gain: 0.12 * a * k, type: 'sawtooth', freqEnd: 70 * r, lowpass: 900, attack: 0.08, out });
+        s.tone(at, 163 * r, { dur: 0.45 + k * 0.3, gain: 0.07 * a * k, type: 'square', freqEnd: 120 * r, lowpass: 700, attack: 0.1, out });
+        s.noise(at, { dur: 0.4, gain: 0.05 * a * k, type: 'bandpass', freq: 600, freqEnd: 300, q: 4, attack: 0.1, out });
     },
     /** Ripping a lump out of the ground: a deep groan and a tearing crack. */
     rip(s, { at = s.now, family = 'earth' } = {}) {
@@ -487,7 +539,7 @@ export class Sfx {
     /** Everything the game does that makes a noise. */
     hook(game) {
         const me = () => game.player;
-        const fam = (m) => FAMILY[m] || 'earth';
+        const fam = familyOf;
         game.on('explosion', ({ center, radius, kind }) => {
             if(kind === 'rock') return; // the shatter sound covers it
             this.at('explosion', center, { radius, kind }, 0, 200);
@@ -531,6 +583,17 @@ export class Sfx {
             const d = e.detail; if(!d || d.speed < 4) return;
             this.at('crumble', d.point, { family: fam(d.mat ?? 0), size: Math.min(1.5, d.speed / 12) }, 0.05, 50);
         });
+        // material fracture events (src/physics/VoxelBodies.js), on ctx.events or through the game
+        const on = (name, fn) => { game.ctx.events.addEventListener(name, (e) => { if(e.detail?.point) fn(e.detail); }); game.on(name, (d) => { if(d?.point) fn(d); }); };
+        on('fracture', (d) => {
+            if(d.mode === 'bend') this.at('groan', d.point, { amount: Math.min(1, d.energy ?? 0.5) }, 0.35, 70);
+            else if(d.mode === 'crumble') this.at('crumble', d.point, { family: fam(d.mat ?? 1), size: Math.min(2, d.energy ?? 1) }, 0.06, 60);
+            else this.at('fracture', d.point, { family: fam(d.mat ?? 0), energy: d.energy ?? 1 }, 0.05, 120);
+        });
+        on('splinters', (d) => this.at('fracture', d.point, { family: 'wood', energy: Math.min(2, (d.count ?? 10) / 12) }, 0.06, 100));
+        on('crumble', (d) => this.at('crumble', d.point, { family: fam(d.mat ?? 1), size: Math.cbrt(Math.max(0.1, d.volume ?? 1)) }, 0.06, 60));
+        on('bend', (d) => this.at('groan', d.point, { amount: d.amount ?? 0.4 }, 0.35, 70));
+        on('chips', (d) => this.at('crumble', d.point, { family: fam(d.mat ?? 0), size: Math.min(1.2, (d.count ?? 8) / 10) }, 0.08, 50));
         game.ctx.events.addEventListener('detached', (e) => {
             const d = e.detail; if(!d) return;
             const p = d.prop?.body?.translation?.();
