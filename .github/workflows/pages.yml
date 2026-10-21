@@ -28,6 +28,7 @@ jobs:
         run: |
           mkdir -p _site
           cp -r index.html dist assets _site/
+          mkdir -p _site/vendor/box3d && cp vendor/box3d/*.wasm _site/vendor/box3d/
           rm -f _site/dist/*.map
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v3

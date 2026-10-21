@@ -1,14 +1,14 @@
 /**
  * A detached piece of terrain: a small voxel grid (islands.js Grid: Int8 distances + materials, padded for the
- * mesher) riding on a dynamic Rapier body. Created and managed by VoxelBodies (src/physics/VoxelBodies.js).
+ * mesher) riding on a dynamic box3d body. Created and managed by VoxelBodies (src/physics/VoxelBodies.js).
  *
- * Frames: grid-local metres put local sample i at i * VOXEL. The Rapier body's origin is the grid's centre of mass at
+ * Frames: grid-local metres put local sample i at i * VOXEL. The body's origin is the grid's centre of mass at
  * creation (`frame`, grid-local), so body.translation() is the middle of the piece (holding and throwing code can
  * treat it like any prop): world = T + R * (local - frame).
  *
  * Collider: a compound of at most 12 (fracture pieces 2-4, islands.maxBoxesFor) greedily merged boxes (at 1, 2, ... samples per cell, tightened to the solid
- * samples): concave pieces keep their shape, and cuboid-trimesh contacts are Rapier's cheapest (convex hulls cost ~3x
- * more per settling body; Rapier's voxel shape does not collide with trimeshes at all). Mass from material densities; CCD on.
+ * samples): concave pieces keep their shape, and box-mesh contacts are cheap. Mass from material densities; box3d's
+ * continuous collision keeps fast pieces out of the terrain. Hit events feed VoxelBodies' impacts.
  *
  * The Prop (physics.addProp) has userData { voxelBody, mat, volume, mass } plus whatever the creator passed.
  */
@@ -48,18 +48,12 @@ export class VoxelBody {
         if(prep?.stats) grid.count = prep.stats.count;
         this.frame = this.stats.com.slice();
         const { physics } = mgr;
-        const R = physics.R;
         _q.set(rotation[0], rotation[1], rotation[2], rotation[3]);
         _v.set(this.frame[0], this.frame[1], this.frame[2]).applyQuaternion(_q);
-        const bd = R.RigidBodyDesc.dynamic()
-            .setTranslation(origin[0] + _v.x, origin[1] + _v.y, origin[2] + _v.z)
-            .setRotation({ x: rotation[0], y: rotation[1], z: rotation[2], w: rotation[3] })
-            .setLinvel(linvel[0], linvel[1], linvel[2])
-            .setAngvel({ x: angvel[0], y: angvel[1], z: angvel[2] })
-            .setCcdEnabled(true)
-            .setLinearDamping(0.02).setAngularDamping(0.15)
-            .setEnabled(enabled);
-        const body = physics.rw.createRigidBody(bd);
+        const body = physics.createBody({
+            position: [origin[0] + _v.x, origin[1] + _v.y, origin[2] + _v.z], rotation: [...rotation],
+            linvel: [...linvel], angvel: [...angvel], linearDamping: 0.02, angularDamping: 0.15, enabled,
+        });
         this.group = new THREE.Group();
         this.group.position.set(origin[0] + _v.x, origin[1] + _v.y, origin[2] + _v.z);
         this.group.quaternion.copy(_q);
@@ -83,34 +77,31 @@ export class VoxelBody {
     /** Rebuild the collider(s) from the grid (after carving). `boxes`: islands.colliderBoxes(grid, ...) if known. */
     buildColliders(boxes = null) {
         const { physics } = this.mgr;
-        const R = physics.R;
         const g = this.grid, st = this.stats, f = this.frame;
         physics.detachColliders(this.prop);
-        const descs = [];
-        // boxes: Rapier's cuboid-triangle contacts are the cheapest against the terrain trimeshes (25 settling
-        // pieces: ~1 ms per step as boxes, ~3.5 ms as convex hulls; tools/test/restcost.mjs)
+        const specs = [];
+        // boxes: box-mesh contacts are the cheapest against the terrain (and keep concave pieces' shape)
         // fracture pieces are roughly convex: a few boxes do; big detached islands keep more of their shape
         boxes ||= colliderBoxes(g, st.count, this.generation);
+        const mass = Math.max(1, st.mass);
         if(boxes.length) {
             let vol = 0;
             for(const b of boxes) vol += b.h[0] * b.h[1] * b.h[2];
-            for(const b of boxes) descs.push([R.ColliderDesc.cuboid(b.h[0], b.h[1], b.h[2]).setTranslation(b.c[0] - f[0], b.c[1] - f[1], b.c[2] - f[2]), b.h[0] * b.h[1] * b.h[2] / vol]);
+            // each box's density puts its share of the mass (by volume) in it
+            const density = mass / (8 * vol);
+            for(const b of boxes) specs.push({ shape: 'box', half: b.h, center: [b.c[0] - f[0], b.c[1] - f[1], b.c[2] - f[2]], density });
         } else {
             const pts = gridHullPoints(g);
             for(let i = 0; i < pts.length; i += 3) { pts[i] -= f[0]; pts[i + 1] -= f[1]; pts[i + 2] -= f[2]; }
-            const d = pts.length >= 12 ? R.ColliderDesc.convexHull(pts) : null;
-            descs.push([d || R.ColliderDesc.ball(Math.max(0.1, Math.cbrt(st.volume * 0.24))), 1]);
+            if(pts.length >= 12) specs.push({ shape: 'hull', points: pts, density: 1000 });
         }
-        const mass = Math.max(1, st.mass);
-        const threshold = mass * this.mgr.impactDv / (1 / 60) / Math.sqrt(descs.length);
         const fr = MATERIALS[st.mat]?.hardness > 2 ? 0.75 : 0.9;
-        for(const [d, w] of descs) {
-            d.setMass(mass * w).setFriction(fr).setRestitution(0.05)
-                .setActiveEvents(R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(threshold);
-            d.setCollisionGroups(this.groups());
-            physics.attachCollider(this.prop, d);
-        }
-        this.colliderCount = descs.length;
+        const groups = this.groups();
+        let n = 0;
+        for(const sp of specs) if(physics.attachCollider(this.prop, { ...sp, friction: fr, restitution: 0.05, groups, hitEvents: true })) n++;
+        if(!n) physics.attachCollider(this.prop, { shape: 'sphere', radius: Math.max(0.1, Math.cbrt(st.volume * 0.24)), density: 1000, friction: fr, restitution: 0.05, groups, hitEvents: true });
+        this.body.setMass(mass);
+        this.colliderCount = this.prop.colliders.length;
     }
 
     /** Collision groups: bit 1 for every voxel body, a sibling bit (2..13) for fresh fracture pieces; while waiting
@@ -132,9 +123,9 @@ export class VoxelBody {
         const b = this.body;
         _q.set(rotation[0], rotation[1], rotation[2], rotation[3]);
         _v.set(this.frame[0], this.frame[1], this.frame[2]).applyQuaternion(_q);
+        b.setEnabled(true);
         b.setTranslation({ x: origin[0] + _v.x, y: origin[1] + _v.y, z: origin[2] + _v.z }, false);
         b.setRotation({ x: rotation[0], y: rotation[1], z: rotation[2], w: rotation[3] }, false);
-        b.setEnabled(true);
         b.setLinvel({ x: linvel[0], y: linvel[1], z: linvel[2] }, true);
         b.setAngvel({ x: angvel[0], y: angvel[1], z: angvel[2] }, true);
         this.prevV = [...linvel];

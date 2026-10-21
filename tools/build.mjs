@@ -8,5 +8,7 @@ export const buildOptions = {
     outdir: 'dist', entryNames: '[name]',
     bundle: true, format: 'esm', target: 'es2022', sourcemap: true, logLevel: 'info',
     minify: process.argv.includes('--minify'),
+    // node-only branches (the box3d loader and its Emscripten glue read the wasm from disk under node)
+    external: ['node:*'],
 };
 if(import.meta.url === `file://${process.argv[1]}`) await build(buildOptions);

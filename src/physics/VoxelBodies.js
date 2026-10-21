@@ -21,7 +21,8 @@
  * box a newer edit touches restarts merged with it.
  *
  * Lifecycle of a body:
- *   - impacts: Rapier contact force events, summed per body per step, give the velocity change dv = F h / m.
+ *   - impacts: box3d hit events (approach speed), the fastest per body per step, capped by the body's measured velocity
+ *     change, give dv.
  *     dv > impactDv emits 'impact' { point, speed, mat, prop }; dv over the body's break threshold (scaled by
  *     material hardness, falling with mass, rising with each generation of fracture) splits it into Voronoi pieces
  *     seeded densest around the hit. Pieces under DEBRIS samples are pulverized: 'destroyed' { kind: 'impact' }.
@@ -100,7 +101,7 @@ export class VoxelBodies {
         this.soft.onSplit = (vb, split) => this.crack(vb, split);
         // later generations are tougher (as breakDv); pieces too small to fracture only wobble
         this.soft.toughOf = (vb) => vb.grid.count >= MIN_FRACTURE ? 1 + 0.4 * vb.generation : 0;
-        this.physics.onContactForce((c1, c2, f) => this._contact(c1, c2, f));
+        this.physics.onHit((c1, c2, speed, point) => this._contact(c1, c2, speed, point));
         this.physics.onStep((h) => this._step(h));
         this.physics.onFrame(() => this._frame());
         const w = this.world;
@@ -197,7 +198,7 @@ export class VoxelBodies {
         const kicks = kick ? [kick] : [];
         if(rep.islandsMs !== undefined) this.stats.lastIslandsMs = rep.islandsMs;
         for(const d of rep.dust || []) this._dust(d.center, d.removed, 'carve');
-        // one body per budgeted unit (a frame each when several arrive): a body's first contacts cost a Rapier step
+        // one body per budgeted unit (a frame each when several arrive): a body's first contacts cost a physics step
         for(const isl of rep.islands || []) this.jobs.push({ kind: 'island', isl, kicks });
     }
     /** A body for an island the terrain worker cut out (dust when far over the body cap). */
@@ -480,7 +481,7 @@ export class VoxelBodies {
         vb.rebody = false;
         if(vb.dead || vb.stamping || !this.list.has(vb)) return true;
         const dust = new Float64Array(256);
-        const t = vb.body.translation(); // before replace() removes the body: reading a removed body panics Rapier
+        const t = vb.body.translation(); // before replace() removes the body
         const pieces = splitGrid(vb.grid, null, { minCount: DEBRIS, dust });
         if(pieces.length === 1 && pieces[0] === vb.grid) {
             vb.stats = gridStats(vb.grid);
@@ -617,30 +618,16 @@ export class VoxelBodies {
         this.events.dispatchEvent(new CustomEvent('destroyed', { detail: { center: [...point], box, removed, volume, author: null, kind, prop: vb?.prop ?? null } }));
     }
 
-    _contact(c1, c2, f) {
+    _contact(c1, c2, speed, point) {
         const p1 = this.physics.propOf(c1), p2 = this.physics.propOf(c2);
         const a = p1?.userData?.voxelBody, b = p2?.userData?.voxelBody;
-        if(a) this._hit(a, f, c1, c2);
-        if(b) this._hit(b, f, c2, c1);
+        if(a) this._hit(a, speed, point);
+        if(b) this._hit(b, speed, point);
     }
-    _hit(vb, f, c, o) {
+    _hit(vb, speed, point) {
         let h = this.hits.get(vb);
-        if(!h) this.hits.set(vb, h = { f: 0, fmax: 0, c, o });
-        h.f += f;
-        if(f > h.fmax) { h.fmax = f; h.c = c; h.o = o; }
-    }
-    _contactPoint(vb, c, o) {
-        let p = null;
-        // a collider removed since the step would panic inside Rapier (not catchable: it poisons the whole module)
-        if(c?.isValid() && o?.isValid()) try {
-            this.physics.rw.contactPair(c, o, (m) => {
-                if(p) return;
-                if(m.numSolverContacts() > 0) { const s = m.solverContactPoint(0); p = [s.x, s.y, s.z]; }
-            });
-        } catch(e) { /* a collider may be gone */ }
-        if(p) return p;
-        const t = vb.body.translation();
-        return [t.x, t.y - vb.radius * 0.5, t.z];
+        if(!h) this.hits.set(vb, h = { speed: 0, point });
+        if(speed > h.speed) { h.speed = speed; h.point = point; }
     }
 
     // ------------------------------------------------------------ per step
@@ -652,14 +639,14 @@ export class VoxelBodies {
                 if(vb.dead || !this.list.has(vb)) continue;
                 const b = vb.body;
                 if(!b.isDynamic() || vb.prop.userData.held) continue;
-                // velocity change: the contact force's (dv = F h / m) and the body's measured one, whichever is
-                // smaller (forces spike while Rapier pushes overlapping shapes apart; kicks change velocity without contact)
+                // velocity change: the hit's approach speed and the body's measured change, whichever is smaller (a
+                // light piece hitting a heavy one stops; a heavy one barely notices; kicks change velocity without contact)
                 const v = b.linvel(), p = vb.prevV;
                 const dx = v.x - p[0], dy = v.y - p[1] + GRAVITY * h, dz = v.z - p[2];
                 const dvV = Math.hypot(dx, dy, dz);
-                const dv = Math.min(hit.f * h / Math.max(1, b.mass()), dvV);
+                const dv = Math.min(hit.speed, dvV);
                 if(dv < Math.min(SOFT_DV, this.impactDv)) continue;
-                const point = this._contactPoint(vb, hit.c, hit.o);
+                const point = hit.point;
                 const brk = this.breakDv(vb), energy = dv / brk;
                 // the soft layer: matter away from the contact keeps going (a crack attempt when hit hard enough)
                 const sc = dv / (dvV || 1);
@@ -751,7 +738,7 @@ export class VoxelBodies {
         if(vb.stamping || vb.dead || vb.fracturing) return;
         this.stats.stamped++;
         this.soft.gridChanged(vb); // stamped as built: no more wobble
-        vb.body.setBodyType(this.physics.R.RigidBodyType.Fixed, false);
+        vb.body.setBodyType(BodyType.Fixed, false);
         vb.stamping = true;
         vb.stampKeys = null;
         const remote = this.world.remote;

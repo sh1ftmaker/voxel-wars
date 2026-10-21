@@ -12,6 +12,7 @@ import * as THREE from 'three/webgpu';
 import { rock, capsule, box } from '../../voxel/brushes.js';
 import { MATERIALS } from '../../voxel/materials.js';
 import { WEAPONS, SELF_DAMAGE_SCALE, BOT_DAMAGE_SCALE } from './defs.js';
+import { BodyType } from '../../physics/Physics.js';
 
 const _v = new THREE.Vector3();
 /** m/s added each frame to the ground under a lump being torn out (src/soft: SoftGround.pull). */
@@ -38,18 +39,11 @@ export class Combat {
     // ---- queries ----
     /** Ray against terrain colliders, bodies and actors, skipping the owner's capsule and whatever it holds. */
     raycast(origin, dir, maxDist, owner = null) {
-        const { R, rw } = this.ctx.physics;
-        this._skip = owner ? owner.ignoreHandles() : null;
-        const ray = this._ray ??= new R.Ray({ x: 0, y: 0, z: 0 }, { x: 0, y: 0, z: 1 });
-        ray.origin.x = origin[0]; ray.origin.y = origin[1]; ray.origin.z = origin[2];
-        ray.dir.x = dir[0]; ray.dir.y = dir[1]; ray.dir.z = dir[2];
-        this._pred ??= (c) => !this._skip.has(c.handle);
-        const hit = rw.castRayAndGetNormal(ray, maxDist, true, R.QueryFilterFlags.EXCLUDE_SENSORS, undefined, undefined, undefined, this._skip ? this._pred : undefined);
+        const physics = this.ctx.physics;
+        const hit = physics.raycast(origin, dir, maxDist, { ignore: owner ? owner.ignoreHandles() : null });
         if(!hit) return null;
-        const t = hit.timeOfImpact;
-        const actor = this.game.actorByCollider.get(hit.collider.handle) || null;
-        return { point: [origin[0] + dir[0] * t, origin[1] + dir[1] * t, origin[2] + dir[2] * t], normal: [hit.normal.x, hit.normal.y, hit.normal.z],
-            distance: t, collider: hit.collider, actor, prop: actor ? null : this.ctx.physics.propOf(hit.collider) };
+        const actor = this.game.actorByCollider.get(hit.collider?.handle) || null;
+        return { point: hit.point, normal: hit.normal, distance: hit.distance, collider: hit.collider, actor, prop: actor ? null : hit.prop };
     }
 
     // ---- explosions ----
@@ -297,15 +291,15 @@ export class Combat {
     }
     /** Hold: a kinematic body following `target`. */
     hold(prop, on) {
-        const { R } = this.ctx.physics;
         const b = prop.body;
-        b.setBodyType(on ? R.RigidBodyType.KinematicPositionBased : R.RigidBodyType.Dynamic, true);
+        b.setBodyType(on ? BodyType.Kinematic : BodyType.Dynamic, true);
         prop.userData ||= {};
         prop.userData.held = on; // VoxelBodies: a held body never settles or fractures
     }
     throwHeld(owner, prop, dir, speed) {
         this.hold(prop, false);
         const b = prop.body, ov = owner.body.vel;
+        b.setBullet(true); // fast: continuous collision against other bodies too
         b.setLinvel({ x: dir[0] * speed + ov.x * 0.5, y: dir[1] * speed + 3, z: dir[2] * speed + ov.z * 0.5 }, true);
         b.setAngvel({ x: Math.random() * 10 - 5, y: Math.random() * 10 - 5, z: Math.random() * 10 - 5 }, true);
         owner?.ignoreTemp?.(prop.collider.handle, 0.35);

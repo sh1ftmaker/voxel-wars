@@ -5,6 +5,7 @@
  */
 import * as THREE from 'three/webgpu';
 import { GAME, NUDGE } from '../level/fortwar.js';
+import { BodyType } from '../physics/Physics.js';
 
 const nudge = p => p.map(v => v + NUDGE);
 // gen-fortwar's scatter: bridge stump, gorge bed (two), arch top, the tube, then per side a crag, the sewer jog,
@@ -61,16 +62,14 @@ export class Crates {
     count(team) { let n = 0; for(const c of this.list) if(!c.carrier && c.vault === team) n++; return n; }
 
     pickUp(c, actor) {
-        const { R } = this.ctx.physics;
         c.carrier = actor; actor.carrying = c;
-        c.prop.body.setBodyType(R.RigidBodyType.KinematicPositionBased, true);
+        c.prop.body.setBodyType(BodyType.Kinematic, true);
         c.prop.collider.setEnabled(false);
         c.vaultBefore = c.vault; c.vault = null;
         this.game.emit('pickup', { crate: c, actor, from: c.vaultBefore });
     }
     drop(c, deposit = false) {
         const a = c.carrier; if(!a) return;
-        const { R } = this.ctx.physics;
         c.carrier = null; a.carrying = null;
         const b = c.prop.body;
         let at;
@@ -80,7 +79,7 @@ export class Crates {
             at = this.slots[a.team].find(s => used.every(u => Math.hypot(u.x - s[0], u.z - s[2]) > 1.0)) || this.slots[a.team][0];
             at = [at[0], at[1] + 0.3, at[2]];
         } else { const t = a.body.center; at = [t.x, t.y + 0.2, t.z]; }
-        b.setBodyType(R.RigidBodyType.Dynamic, true);
+        b.setBodyType(BodyType.Dynamic, true);
         b.setTranslation({ x: at[0], y: at[1], z: at[2] }, true);
         b.setRotation({ x: 0, y: 0, z: 0, w: 1 }, true);
         const v = deposit ? { x: 0, y: 0, z: 0 } : a.body.vel;
