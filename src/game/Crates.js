@@ -14,9 +14,11 @@ import { BodyType } from '../physics/Physics.js';
 
 const nudge = p => p.map(v => v + NUDGE);
 // gen-fortwar's scatter: bridge stump, gorge bed (two), arch top, the tube, then per side a crag, the sewer jog,
-// the cave entrance and the front tower top
+// the cave entrance and the front tower top (beside the catwalk)
 const SCATTER = [[0, 1.1, 6.5], [3, -5.5, 9.5], [-3, -5.5, -9.5], [0, 7.5, 32], [0, 0.5, -27.5]];
 for(const s of [-1, 1]) SCATTER.push([s * 38, 8.0, 19.5], [s * 30, -5.5, 5], [s * 43, 0.5, -22], [s * 36.5, 10.0, 12.5]);
+// materials showcase (src/level/showcase.js): on each watchtower's deck, inside each glass observatory
+for(const s of [-1, 1]) SCATTER.push([s * 22, 6.9, -13], [s * 24, 6.5, 30]);
 const CACHES = [[-46, -9.5, 6.5], [46, -9.5, 6.5], [-14, -10.5, -11.5], [14, -10.5, -11.5], [-0.8, -14.5, 0.8], [0.8, -14.5, -0.8]];
 const SLOTS = [[57.5, -2], [55, -2], [52.5, -2], [57.5, 2], [55, 2], [52.5, 2], [57.5, 0], [55, 0], [52.5, 0], [51, -3.5], [51, 3.5], [58.5, 3.5]];
 export const HALF = 0.45;
