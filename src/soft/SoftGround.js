@@ -25,6 +25,7 @@ import { SPC, SPC_FAR, MAX_ZONES, CELL_CAP, maxDim } from './core.js';
 import { SoftSim, MAX_KICKS } from './SoftSim.js';
 import { SoftSimCPU } from './SoftSimCPU.js';
 import { TetOverlay } from './TetOverlay.js';
+import { GroundRider } from './GroundRider.js';
 import { readRegion, chunkVersions, applyPatch } from './region.js';
 
 const BAKE_MIN = 0.012; // m: smaller final displacements are dropped instead of baked
@@ -64,6 +65,8 @@ export class SoftGround {
         console.log(`soft ground: ${this.label}`);
         this.enabled = true;
         this.overlay = new TetOverlay(ctx.scene, this.sim);
+        // things resting on the ground ride its wobble (drawn pose only); ?ride=0: off
+        if(params.get('ride') !== '0') this.rider = new GroundRider(this);
         if(params.get('tets') === '1') this.overlay.setVisible(true);
         addEventListener('keydown', (e) => {
             if(e.code !== 'F7' || e.repeat) return;
@@ -290,6 +293,7 @@ export class SoftGround {
         const t0 = performance.now();
         if(this.zones.length || this.deferred.length || this.timed.length) this._update(dt);
         this.sim.flush(); // parameter changes (sleep, free) reach the vertex stage this frame
+        this.rider?.update(dt);
         const ms = performance.now() - t0, st = this.stats;
         st.cpuMs = st.cpuMs * 0.95 + ms * 0.05; st.cpuMax = Math.max(st.cpuMax * 0.995, ms);
     }

@@ -55,6 +55,14 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   `softview.mjs` (headless WebGL2: screenshots and pixel change of a wake, a blast, `--wall`), `softreach.mjs` (punch,
   blast reach, wall shudder, bridge collapse, grab tear and throw; `--slowtear` for screenshots of the stretch),
   `softgame.mjs` (WebGPU path, SwiftShader).
+- **Ground riders** (`src/soft/GroundRider.js`, `?ride=0` off): the soft ground only bends the terrain's drawn mesh, so
+  things resting on it ride along visually: every frame (after physics and the game placed meshes, actors and camera)
+  props near a live zone sample the displacement at five points under their drawn AABB (weighted by height above the
+  ground, or by resting on a lower rider), rest on the highest of that ground (a fitted plane lifted over the support
+  points) and tilt with it; actors (bots, remote players) and the local camera take the displacement at their feet.
+  CPU solver: `SoftSimCPU.sample` on the texture data; GPU: `SoftSim.gather` (a compute pass over up to 256 query
+  points, read back asynchronously). Slots a chunk mesh has baked in are skipped, with a slow release so a landing bake
+  never pops. Purely cosmetic and local (not networked). `tools/test/softride.mjs` measures the drawn contact gap.
 - **Structural support** (`src/voxel/support.js`, run by the terrain worker after every edit): overhangs that cannot
   carry themselves break off. Cells of 0.5 m; supported = a solid column down to the ground; a hanging cell's lever
   is its horizontal distance to its support through the overhang; past its material's reach (`SPAN`, calibrated so the

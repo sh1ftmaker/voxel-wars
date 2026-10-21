@@ -26,6 +26,7 @@ const WG = 64;
 const MAXU = 0.9;      // m: clamp on a node's displacement
 const MAXV = 0.06;     // m per substep: clamp on a node's speed
 export const MAX_KICKS = 4;
+export const GATHER = 256; // ground-rider query points per frame
 const P_SLOTA = 0, P_SLOTB = MAX_ZONES, P_SLOTC = 2 * MAX_ZONES, P_KICKA = 3 * MAX_ZONES, P_KICKB = P_KICKA + MAX_KICKS,
     P_KICKC = P_KICKB + MAX_KICKS, PARAMS = P_KICKC + MAX_KICKS;
 
@@ -288,6 +289,50 @@ export class SoftSim {
         const cache = new Map();
         this.projectPasses = omegas.map((o) => { const key = o.toFixed(5); if(!cache.has(key)) cache.set(key, makeProject(o)); return cache.get(key); });
         this.allKernels = [this.initPass, this.kickPass, this.predictPass, this.tetPass, ...cache.values()];
+
+        // ground riders (src/soft/GroundRider.js): the displacement at up to GATHER query points (xyz, w = skip mask),
+        // read back asynchronously
+        const gQ = this.gatherQ = instancedArray(new Float32Array(GATHER * 4), 'vec4');
+        const gOut = this.gatherOut = instancedArray(GATHER, 'vec4');
+        this.gatherPass = K(() => {
+            const i = int(instanceIndex);
+            const q = gQ.element(i).toVar();
+            const skip = int(q.w).toVar();
+            const disp = vec3(0).toVar();
+            for(let s = 0; s < MAX_ZONES; s++) {
+                const A = u.slotA.element(s), B = u.slotB.element(s), h = u.slotC.element(s).y.toVar();
+                const gp = q.xyz.sub(A.xyz).div(h).toVar();
+                const on = A.w.greaterThan(0.5).and(skip.shiftRight(s).bitAnd(1).equal(0))
+                    .and(gp.x.greaterThanEqual(0)).and(gp.y.greaterThanEqual(0)).and(gp.z.greaterThanEqual(0))
+                    .and(gp.x.lessThan(B.x.sub(1))).and(gp.y.lessThan(B.y.sub(1))).and(gp.z.lessThan(B.z.sub(1)));
+                If(on, () => {
+                    const i0 = floor(gp).toVar(), f = gp.sub(i0).toVar();
+                    const nx = int(B.x), nxy = int(B.x).mul(int(B.y));
+                    const base = int(s * NODE_CAP).add(int(i0.x)).add(int(i0.y).mul(nx)).add(int(i0.z).mul(nxy)).toVar();
+                    const U = [];
+                    for(let c = 0; c < 8; c++) U.push(nPos.element(base.add(c & 1).add(nx.mul((c >> 1) & 1)).add(nxy.mul(c >> 2))).xyz);
+                    const lx = (a, b) => mix(a, b, f.x);
+                    disp.addAssign(mix(mix(lx(U[0], U[1]), lx(U[2], U[3]), f.y), mix(lx(U[4], U[5]), lx(U[6], U[7]), f.y), f.z));
+                });
+            }
+            gOut.element(i).assign(vec4(disp, 1));
+        }, GATHER);
+        this.allKernels.push(this.gatherPass);
+    }
+
+    /** The displacement at query points `q` (4 floats each: xyz, skip mask), n <= GATHER: a promise of 4 floats per
+     *  point (u xyz), or null while the last read is still in flight. Never stalls the frame. */
+    gather(q, n) {
+        if(this.gatherBusy) return null;
+        const a = this.gatherQ.value.array;
+        a.set(q.subarray(0, n * 4));
+        a.fill(0, n * 4);
+        this.gatherQ.value.needsUpdate = true;
+        this.flush();
+        this.renderer.compute(this.gatherPass);
+        this.gatherBusy = true;
+        return this.renderer.getArrayBufferAsync(this.gatherOut.value).then((buf) => { this.gatherBusy = false; return new Float32Array(buf); },
+            (e) => { this.gatherBusy = false; throw e; });
     }
 
     /** Set the dispatch extents to the slots in use (slots 0..maxSlot). */

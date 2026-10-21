@@ -98,6 +98,33 @@ export class SoftSimCPU {
         return new Promise((resolve, reject) => { this.reads.set(id, { resolve, reject }); this.worker.postMessage({ op: 'read', id, slot: s, nodes }); });
     }
 
+    /** The displacement the vertex stage draws at world point (x, y, z), skipping the slots in `skip`: the shader's
+     *  trilinear lookup on the texture's data, on the CPU (ground riders, src/soft/GroundRider.js). out = [ux, uy, uz]. */
+    sample(x, y, z, skip, out) {
+        const d = this.tex.image.data, live = this.live.value;
+        out[0] = out[1] = out[2] = 0;
+        for(let s = 0; s < MAX_ZONES; s++) {
+            if(!((live >> s) & 1) || ((skip >> s) & 1)) continue;
+            const a = (PBASE + 3 * s) * 4;
+            if(!(d[a + 3] > 0.5)) continue;
+            const h = Math.max(0.25, d[a + 9]);
+            const gx = (x - d[a]) / h, gy = (y - d[a + 1]) / h, gz = (z - d[a + 2]) / h;
+            const bx = d[a + 4], by = d[a + 5], bz = d[a + 6];
+            if(!(gx >= 0 && gy >= 0 && gz >= 0 && gx < bx - 1 && gy < by - 1 && gz < bz - 1)) continue;
+            const ix = Math.floor(gx), iy = Math.floor(gy), iz = Math.floor(gz);
+            const fx = gx - ix, fy = gy - iy, fz = gz - iz;
+            const nx = bx | 0, nxy = (bx | 0) * (by | 0);
+            const base = s * NODE_CAP + ix + iy * nx + iz * nxy;
+            for(let c = 0; c < 8; c++) {
+                const w = (c & 1 ? fx : 1 - fx) * ((c >> 1) & 1 ? fy : 1 - fy) * (c >> 2 ? fz : 1 - fz);
+                if(w === 0) continue;
+                const o = (base + (c & 1) + nx * ((c >> 1) & 1) + nxy * (c >> 2)) * 4;
+                out[0] += d[o] * w; out[1] += d[o + 1] * w; out[2] += d[o + 2] * w;
+            }
+        }
+        return out;
+    }
+
     /** As SoftSim.deformNode, reading the displacements from the texture. */
     deformNode(skip) {
         const tex = this.tex, live = this.live;

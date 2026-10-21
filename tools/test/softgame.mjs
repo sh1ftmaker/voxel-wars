@@ -31,6 +31,7 @@ let f = 0;
 for(const step of opts.steps || [2, 4, 6, 10, 20, 30, 40, 60, 80]) {
     const r = await page.evaluate((n) => window.frame(n), step - f); f = step;
     console.log(`frame ${f}`, JSON.stringify(r));
+    if(f === 10) console.log('gather (GPU vs CPU lookup)', JSON.stringify(await page.evaluate(() => window.gatherTest())));
     await save(String(f).padStart(3, '0'));
 }
 // wait for the bake and remesh

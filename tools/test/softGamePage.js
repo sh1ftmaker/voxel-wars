@@ -73,3 +73,33 @@ window.cacheTest = async () => {
     renderer.render(scene, camera);
     return { before, after: nodes.nodeBuilderCache.size, builds, remeshed: keys.length };
 };
+/** GPU ground-rider gather (SoftSim.gather) at points around the zone vs the same trilinear lookup on the CPU from a
+ *  readback of the node buffer: max difference (m). */
+window.gatherTest = async () => {
+    const { soft, p } = window.__g, sim = soft.sim;
+    const NODE_CAP = 6144, pts = [], q = new Float32Array(64 * 4);
+    for(let i = 0; i < 64; i++) { const a = i * 0.7, r = (i % 8) * 0.45; pts.push([p[0] + Math.cos(a) * r, p[1] - 0.3 + (i % 3) * 0.2, p[2] + Math.sin(a) * r]); q.set([...pts[i], 0], i * 4); }
+    const pr = sim.gather(q, 64);
+    if(!pr) return { error: 'busy' };
+    const g = await pr;
+    const P = sim.P, ref = [], all = new Float32Array(await sim.renderer.getArrayBufferAsync(sim.nPos.value));
+    let maxD = 0, maxU = 0;
+    for(let i = 0; i < 64; i++) {
+        const [x, y, z] = pts[i], u = [0, 0, 0];
+        for(let s = 0; s < 4; s++) {
+            const A = P.subarray(s * 4, s * 4 + 4), B = P.subarray((4 + s) * 4, (4 + s) * 4 + 4), h = P[(8 + s) * 4 + 1];
+            if(!(A[3] > 0.5)) continue;
+            const gx = (x - A[0]) / h, gy = (y - A[1]) / h, gz = (z - A[2]) / h;
+            if(!(gx >= 0 && gy >= 0 && gz >= 0 && gx < B[0] - 1 && gy < B[1] - 1 && gz < B[2] - 1)) continue;
+            const ix = Math.floor(gx), iy = Math.floor(gy), iz = Math.floor(gz), fx = gx - ix, fy = gy - iy, fz = gz - iz;
+            const nx = B[0] | 0, nxy = nx * (B[1] | 0), base = s * NODE_CAP + ix + iy * nx + iz * nxy;
+            for(let c = 0; c < 8; c++) {
+                const w = (c & 1 ? fx : 1 - fx) * ((c >> 1) & 1 ? fy : 1 - fy) * (c >> 2 ? fz : 1 - fz);
+                const o = (base + (c & 1) + nx * ((c >> 1) & 1) + nxy * (c >> 2)) * 4;
+                for(let k = 0; k < 3; k++) u[k] += all[o + k] * w;
+            }
+        }
+        for(let k = 0; k < 3; k++) { maxD = Math.max(maxD, Math.abs(u[k] - g[i * 4 + k])); maxU = Math.max(maxU, Math.abs(u[k])); }
+    }
+    return { maxDiff: +maxD.toFixed(5), maxU: +maxU.toFixed(3) };
+};
