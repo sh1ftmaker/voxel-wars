@@ -13,6 +13,8 @@ import { VOXEL, CHUNK, SDF_SCALE, SDF_MAX, PAD, WORLD_CHUNKS, BEDROCK_SAMPLES } 
 import { REACH, BEDROCK } from './materials.js';
 
 const N = CHUNK, N2 = N * N, N3 = N * N * N;
+const BLOCK_HALF_DIAG = 1.5 * Math.sqrt(3) * VOXEL; // a block of 4 samples spans 3 voxels
+const REACH_MAX = REACH.reduce((a, r) => Math.max(a, r), 0); // the softest material's reach
 export const toStored = (d) => { const v = Math.round(d / VOXEL * SDF_SCALE); return v > SDF_MAX ? SDF_MAX : v < -SDF_MAX ? -SDF_MAX : v; };
 export const toMetres = (s) => s * VOXEL / SDF_SCALE;
 export const chunkKey = (cx, cy, cz) => `${cx},${cy},${cz}`;
@@ -36,6 +38,8 @@ export class Chunk {
         if(!this.sdf) return;
         const s0 = this.sdf[0], m0 = this.mat[0];
         if(s0 !== SDF_MAX && s0 !== -SDF_MAX) return;
+        // a coarse pass first: a chunk on a surface differs somewhere within the first few strides
+        for(let i = 0; i < N3; i += 61) if(this.sdf[i] !== s0 || (s0 < 0 && this.mat[i] !== m0)) return;
         for(let i = 1; i < N3; i++) if(this.sdf[i] !== s0 || (s0 < 0 && this.mat[i] !== m0)) return;
         this.fill = s0; this.fillMat = m0; this.sdf = null; this.mat = null;
     }
@@ -139,6 +143,12 @@ export class VoxelWorld {
         const cell = VOXEL ** 3;
         const bedrockTop = this.smin[1] + BEDROCK_SAMPLES;
         const touched = new Set();
+        const bcx = (brush.min[0] + brush.max[0]) / 2, bcy = (brush.min[1] + brush.max[1]) / 2, bcz = (brush.min[2] + brush.max[2]) / 2;
+        // Block skipping (below): a sample cannot change when its distance is past the saturated band (4 voxels) for
+        // carve / add, or outside for paint. With hardness, a soft material (reach r > 1) grows the brush about its
+        // centre: r * d(c + (p - c) / r) >= r * d(p) - (r - 1) * |p - c| (Lipschitz), checked at r = 1 and r = REACH_MAX.
+        const SAT = 4 * VOXEL * 1.01;
+        const soft = op === 'carve' && hardness && REACH_MAX > 1;
         if(lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2]) return { removed, added, changed, dirty: touched, box: [lo, hi] };
         for(let cz = Math.floor(lo[2] / N); cz <= Math.floor(hi[2] / N); cz++)
         for(let cy = Math.floor(lo[1] / N); cy <= Math.floor(hi[1] / N); cy++)
@@ -151,21 +161,38 @@ export class VoxelWorld {
             const y0 = Math.max(lo[1], cy * N), y1 = Math.min(hi[1], cy * N + N - 1);
             const z0 = Math.max(lo[2], cz * N), z1 = Math.min(hi[2], cz * N + N - 1);
             let chunkChanged = false;
-            for(let iz = z0; iz <= z1; iz++) for(let iy = y0; iy <= y1; iy++) for(let ix = x0; ix <= x1; ix++) {
+            // blocks of 4³ samples the brush cannot reach are skipped (brush distances are Lipschitz, so the centre's
+            // distance minus the block's half diagonal bounds every sample's; beyond the saturated band nothing changes)
+            for(let bz = z0; bz <= z1; bz += 4) for(let by = y0; by <= y1; by += 4) for(let bx = x0; bx <= x1; bx += 4) {
+            const ex = Math.min(bx + 3, x1), ey = Math.min(by + 3, y1), ez = Math.min(bz + 3, z1);
+            const qx = (bx + ex) * 0.5 * VOXEL, qy = (by + ey) * 0.5 * VOXEL, qz = (bz + ez) * 0.5 * VOXEL;
+            const dc = brush.d(qx, qy, qz), low = dc - BLOCK_HALF_DIAG;
+            if(op === 'paint' ? low > 0 : low > SAT && (!soft || REACH_MAX * low - (REACH_MAX - 1) * (Math.hypot(qx - bcx, qy - bcy, qz - bcz) + BLOCK_HALF_DIAG) > SAT)) continue;
+            // a block deep inside saturates every rule the same way: skip evaluating the brush per sample there
+            // (a material with reach r != 1 re-evaluates the brush below anyway)
+            const deep = dc + BLOCK_HALF_DIAG < -SAT - VOXEL;
+            for(let iz = bz; iz <= ez; iz++) for(let iy = by; iy <= ey; iy++) for(let ix = bx; ix <= ex; ix++) {
                 const li = (ix - cx * N) + (iy - cy * N) * N + (iz - cz * N) * N2;
                 const old = c.sdf ? c.sdf[li] : c.fill;
                 const oldMat = c.sdf ? c.mat[li] : c.fillMat;
-                let db = brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
-                let nv = old, nm = oldMat;
+                let nv = old, nm = oldMat, db;
                 if(op === 'carve') {
                     if(iy < bedrockTop) continue;
-                    if(hardness) { const r = REACH[oldMat]; if(r === 0) continue; db = r > 0 ? db / r : db; }
+                    const r = hardness ? REACH[oldMat] : 1;
+                    if(r === 0) continue;
+                    // reach r: the brush shrinks (or grows) about its centre by r in this material. Deep in a block
+                    // (and for r >= 1, whose scaled point lies further inside a convex brush) everything saturates.
+                    if(deep && r >= 1) db = -1e9;
+                    else if(r !== 1) db = brush.d(bcx + (ix * VOXEL - bcx) / r, bcy + (iy * VOXEL - bcy) / r, bcz + (iz * VOXEL - bcz) / r) * r;
+                    else db = brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
                     const s = -toStored(db);
                     if(s > old) nv = s;
                 } else if(op === 'add') {
+                    db = deep ? -1e9 : brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
                     const s = toStored(db);
                     if(s < old) { nv = s; if(db < VOXEL || old >= 0) nm = mat; }
                 } else if(op === 'paint') {
+                    db = deep ? -1e9 : brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
                     if(db < 0 && old < 0 && oldMat !== mat) nm = mat;
                 }
                 if(nv === old && nm === oldMat) continue;
@@ -174,6 +201,7 @@ export class VoxelWorld {
                 if(old < 0 && nv >= 0) removed[oldMat] += cell;
                 else if(old >= 0 && nv < 0) added += cell;
                 changed++; chunkChanged = true;
+            }
             }
             if(chunkChanged) { c.version++; c.tryCollapse(); }
         }

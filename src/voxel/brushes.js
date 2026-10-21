@@ -55,10 +55,12 @@ export function rock(c, r, seed = 1) {
         planes.push([d[0], d[1], d[2], r * (0.82 + rand() * 0.3)]);
     }
     const R = r * 1.15;
+    const pl = Float64Array.from(planes.flat()), np = pl.length; // flat for the hot loop (same arithmetic)
+    const cx = c[0], cy = c[1], cz = c[2];
     return { min: [c[0] - R, c[1] - R, c[2] - R], max: [c[0] + R, c[1] + R, c[2] + R], d: (x, y, z) => {
-        const px = x - c[0], py = y - c[1], pz = z - c[2];
+        const px = x - cx, py = y - cy, pz = z - cz;
         let d = Math.hypot(px, py, pz) - R;
-        for(const p of planes) { const v = px * p[0] + py * p[1] + pz * p[2] - p[3]; if(v > d) d = v; }
+        for(let i = 0; i < np; i += 4) { const v = px * pl[i] + py * pl[i + 1] + pz * pl[i + 2] - pl[i + 3]; if(v > d) d = v; }
         return d;
     } };
 }

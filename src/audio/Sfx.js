@@ -1,0 +1,539 @@
+/** Sound effects, all synthesized in WebAudio (no files). The synth voices, the sound palette (D Mixolydian) and the
+ *  output bus come from WorldParty's Undermine (src/client/Sfx.js, same author, MIT); the Sfx class at the bottom is
+ *  new: it listens to the game's events (src/game/FortWar.js) and to ctx.events 'destroyed' / 'impact', and adds the
+ *  Donkey Kong sounds (punch, rip, shatter) and material-coloured impacts.
+ *
+ *  The context starts on the first user gesture, as browsers require; every call is a no-op until then. M mutes.
+ */
+
+export const SCALE = [62, 64, 66, 67, 69, 71, 72]; // D Mixolydian in octave 4, as midi notes
+export const midiHz = (m) => 440 * Math.pow(2, (m - 69) / 12);
+/** Scale degree (0 = D, 7 = D an octave up, negatives allowed) to midi, `octave` octaves above the 4th. */
+export const degreeMidi = (deg, octave = 0) => SCALE[((deg % 7) + 7) % 7] + 12 * (Math.floor(deg / 7) + octave);
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rnd = (a, b) => a + Math.random() * (b - a);
+/** Distance attenuation for world sounds. */
+export const atten = (d) => d <= 5 ? 1 : Math.max(0.03, 1 / (1 + (d - 5) / 18));
+/** Lowpass cutoff by distance: high frequencies die first, so far events sound muffled. */
+const muffle = (d, near = 8, full = 9000) => d > near ? full / (1 + (d - near) / 12) : 0;
+
+/** Sound primitives bound to one context and output. Times are absolute on the context's clock. */
+export class Synth {
+    constructor(ctx, dest, reverbSend = null) { this.ctx = ctx; this.dest = dest; this.reverbSend = reverbSend; this._noise = null; }
+    get now() { return this.ctx.currentTime; }
+
+    /** Two seconds of white noise, shared by every noise source (each starts at a random offset). */
+    noiseBuffer() {
+        if(this._noise) return this._noise;
+        let ctx = this.ctx, n = Math.floor(ctx.sampleRate * 2), b = ctx.createBuffer(1, n, ctx.sampleRate), d = b.getChannelData(0);
+        let s = 0x9e3779b9;
+        for(let i = 0; i < n; i++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; d[i] = ((s >>> 0) / 2147483648) - 1; }
+        return this._noise = b;
+    }
+
+    /** The output chain of one sound: [lowpass] -> [pan] -> dest, with a share into the reverb. Connect into the result. */
+    bus({ pan = 0, lowpass = 0, send = 0 } = {}) {
+        let ctx = this.ctx, head = this.dest;
+        if(send > 0 && this.reverbSend) {
+            let split = ctx.createGain(), g = ctx.createGain(); g.gain.value = send;
+            split.connect(this.dest); split.connect(g); g.connect(this.reverbSend); head = split;
+        }
+        if(pan && ctx.createStereoPanner) { let p = ctx.createStereoPanner(); p.pan.value = clamp(pan, -1, 1); p.connect(head); head = p; }
+        if(lowpass > 0 && lowpass < 18000) { let f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lowpass; f.Q.value = 0.5; f.connect(head); head = f; }
+        return head;
+    }
+
+    /** Gain envelope: linear attack to `peak`, hold, exponential decay to silence. Returns the GainNode (connected to `out`). */
+    env(at, peak, attack, decay, hold = 0, out = this.dest) {
+        let g = this.ctx.createGain(), p = g.gain;
+        p.setValueAtTime(0.0001, at);
+        p.linearRampToValueAtTime(Math.max(0.0002, peak), at + attack);
+        if(hold > 0) p.setValueAtTime(Math.max(0.0002, peak), at + attack + hold);
+        p.exponentialRampToValueAtTime(0.0001, at + attack + hold + decay);
+        g.connect(out);
+        return g;
+    }
+
+    /** Filtered noise burst. `freqEnd` sweeps the filter over the sound. */
+    noise(at, { dur = 0.2, gain = 0.5, attack = 0.002, hold = 0, decay = dur, type = 'lowpass', freq = 1000, freqEnd = 0, q = 0.7, out = this.dest } = {}) {
+        let ctx = this.ctx, end = at + attack + hold + decay;
+        let src = ctx.createBufferSource(); src.buffer = this.noiseBuffer(); src.loop = true;
+        let f = ctx.createBiquadFilter(); f.type = type; f.Q.value = q;
+        f.frequency.setValueAtTime(freq, at);
+        if(freqEnd > 0) f.frequency.exponentialRampToValueAtTime(freqEnd, end);
+        let g = this.env(at, gain, attack, decay, hold, out);
+        src.connect(f); f.connect(g);
+        src.start(at, Math.random() * 1.5); src.stop(end + 0.03);
+        return src;
+    }
+
+    /** An oscillator with an envelope; `freqEnd` glides the pitch over the sound; `lowpass` tames bright waveforms. */
+    tone(at, freq, { dur = 0.2, gain = 0.3, attack = 0.003, hold = 0, decay = dur, type = 'sine', freqEnd = 0, detune = 0, lowpass = 0, out = this.dest } = {}) {
+        let ctx = this.ctx, end = at + attack + hold + decay;
+        let o = ctx.createOscillator(); o.type = type; o.detune.value = detune;
+        o.frequency.setValueAtTime(Math.max(1, freq), at);
+        if(freqEnd > 0) o.frequency.exponentialRampToValueAtTime(freqEnd, end);
+        let g = this.env(at, gain, attack, decay, hold, out), n = o;
+        if(lowpass > 0) { let f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.frequency.value = lowpass; o.connect(f); n = f; }
+        n.connect(g);
+        o.start(at); o.stop(end + 0.03);
+        return o;
+    }
+
+    /** FM metal: a carrier with an inharmonic modulator whose index decays fast. Clinks, pings, clanks. */
+    metal(at, freq, { dur = 0.15, gain = 0.3, ratio = 2.76, index = 3, out = this.dest } = {}) {
+        let ctx = this.ctx, c = ctx.createOscillator(), m = ctx.createOscillator(), mg = ctx.createGain();
+        c.frequency.value = freq; m.frequency.value = freq * ratio;
+        mg.gain.setValueAtTime(freq * index, at); mg.gain.exponentialRampToValueAtTime(freq * 0.05, at + dur);
+        m.connect(mg); mg.connect(c.frequency);
+        let g = this.env(at, gain, 0.001, dur, 0, out);
+        c.connect(g);
+        c.start(at); m.start(at); c.stop(at + dur + 0.03); m.stop(at + dur + 0.03);
+    }
+
+    /** Bell / pluck for jingles and the arpeggio: fundamental, octave, a slightly sharp twelfth, a short bright partial. */
+    bell(at, freq, { dur = 0.5, gain = 0.3, bright = 1, out = this.dest } = {}) {
+        this.tone(at, freq, { dur, gain, attack: 0.002, out });
+        this.tone(at, freq * 2, { dur: dur * 0.6, gain: gain * 0.35, attack: 0.002, out });
+        this.tone(at, freq * 3.01, { dur: dur * 0.3, gain: gain * 0.15 * bright, attack: 0.002, out });
+        this.tone(at, freq * 5.4, { dur: 0.08, gain: gain * 0.12 * bright, attack: 0.001, out });
+    }
+
+    /** Brass-ish stinger voice: three detuned saws through a lowpass that opens with the attack. */
+    brass(at, freq, { dur = 0.4, gain = 0.2, attack = 0.03, out = this.dest } = {}) {
+        let ctx = this.ctx, f = ctx.createBiquadFilter(); f.type = 'lowpass'; f.Q.value = 1;
+        f.frequency.setValueAtTime(freq * 2, at); f.frequency.linearRampToValueAtTime(freq * 6, at + attack + 0.05); f.frequency.exponentialRampToValueAtTime(freq * 2, at + attack + dur);
+        let g = this.env(at, gain, attack, dur * 0.5, dur * 0.5, out);
+        f.connect(g);
+        for(let d of [-7, 0, 7]) { let o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.value = freq; o.detune.value = d; o.connect(f); o.start(at); o.stop(at + attack + dur + 0.05); }
+    }
+
+    /** Kick: a sine dropping an octave and a half, with a click. */
+    kick(at, { gain = 0.6, freq = 130, out = this.dest } = {}) {
+        this.tone(at, freq, { dur: 0.3, gain, freqEnd: 42, attack: 0.002, out });
+        this.noise(at, { dur: 0.02, gain: gain * 0.5, type: 'lowpass', freq: 2500, attack: 0.001, out });
+    }
+}
+
+/** The sounds. Each takes the synth and options (`at` defaults to now); loops return a stop(time) function. */
+export const SOUNDS = {
+    /** Rocket r2.4, grenade r3.2, buster r5.6: size scales the layers; distance attenuates and muffles. */
+    explosion(s, { at = s.now, radius = 3, distance = 0, pan = 0, kind = 'rocket' } = {}) {
+        let size = clamp(radius / 3, 0.6, 2.2), a = atten(distance), r = rnd(0.92, 1.08);
+        let v = a * clamp(0.6 + size * 0.35, 0.7, 1.0); // bigger blasts get longer and deeper, not much louder (headroom)
+        let out = s.bus({ pan, lowpass: muffle(distance), send: 0.3 * clamp(size, 0.8, 1.6) });
+        s.tone(at, 64 * r / Math.sqrt(size), { dur: 0.45 * size, gain: 0.7 * v, freqEnd: 24, attack: 0.004, out });                   // sub thump
+        s.noise(at, { dur: 0.75 * size, gain: 0.6 * v, type: 'lowpass', freq: 480 * r, freqEnd: 60, q: 0.9, attack: 0.004, out });     // body
+        s.noise(at, { dur: 0.05, gain: 0.45 * v * a, type: 'bandpass', freq: 2400 * r, q: 0.7, attack: 0.001, out });                   // crack
+        let ticks = 4 + Math.round(size * 5);
+        for(let i = 0; i < ticks; i++) {                                                                                                // debris
+            let dt = 0.08 + Math.pow(Math.random(), 1.6) * 0.9 * size, k = clamp(1 - dt / (1.1 * size), 0.1, 1);
+            s.noise(at + dt, { dur: rnd(0.02, 0.05), gain: 0.2 * v * k, type: 'bandpass', freq: rnd(500, 3200), q: 2.5, attack: 0.001, out });
+        }
+        if(size > 1.15) {                                                                                                               // rumble for the big ones
+            s.noise(at + 0.08, { dur: 1.5 * size, gain: 0.25 * v, type: 'lowpass', freq: 170, q: 1, attack: 0.06, out });
+            s.tone(at + 0.02, 40 * r, { dur: 1.3 * size, gain: 0.2 * v, freqEnd: 22, attack: 0.03, out });
+        }
+        if(kind === 'buster') s.tone(at + 0.05, 48 * r, { dur: 1.8, gain: 0.14 * v, type: 'triangle', freqEnd: 30, attack: 0.1, out });
+    },
+    /** Rocket launch: ignition thump (only in your own hands), a whoosh that recedes and drops in pitch, the motor falling away. */
+    rocket(s, { at = s.now, distance = 0, pan = 0 } = {}) {
+        let a = atten(distance), r = rnd(0.9, 1.1);
+        let out = s.bus({ pan, lowpass: muffle(distance, 10, 6000), send: 0.2 });
+        if(distance < 3) { s.noise(at, { dur: 0.05, gain: 0.45, type: 'lowpass', freq: 1200, attack: 0.001, out }); s.tone(at, 150 * r, { dur: 0.16, gain: 0.4, freqEnd: 50, out }); }
+        s.noise(at, { gain: 0.42 * a, type: 'bandpass', freq: 600 * r, freqEnd: 150, q: 1.1, attack: 0.05, hold: 0.08, decay: 0.95, out });
+        s.noise(at + 0.01, { dur: 0.45, gain: 0.18 * a, type: 'highpass', freq: 2200, attack: 0.02, out });
+        s.tone(at + 0.02, 360 * r, { dur: 0.75, gain: 0.08 * a, type: 'sawtooth', freqEnd: 80, lowpass: 1400, attack: 0.02, out });
+    },
+    /** Grenade: an arm swish scaled by the charge and the pin's ping. Buster: a heavy heave and a clank. */
+    throw(s, { at = s.now, power = 0.6, kind = 'grenade' } = {}) {
+        let out = s.bus({ send: 0.1 }), r = rnd(0.95, 1.05);
+        if(kind === 'buster') {
+            s.noise(at, { dur: 0.3, gain: 0.4, type: 'bandpass', freq: 400, freqEnd: 900, q: 1, attack: 0.04, out });
+            s.metal(at, 420 * r, { dur: 0.3, gain: 0.25, ratio: 1.41, index: 2.5, out });
+            s.tone(at, 110, { dur: 0.2, gain: 0.3, freqEnd: 60, out });
+        } else {
+            s.noise(at, { dur: 0.14 + power * 0.1, gain: 0.16 + power * 0.2, type: 'highpass', freq: 900, freqEnd: 2600, attack: 0.02, out });
+            s.metal(at, 2300 * r, { dur: 0.1, gain: 0.1, ratio: 3.1, index: 2, out });
+        }
+    },
+    /** A grenade's hollow metal tick or a buster's thud when it lands; `impact` 0..1 from the landing speed. */
+    bounce(s, { at = s.now, kind = 'grenade', impact = 1, distance = 0, pan = 0 } = {}) {
+        let a = atten(distance) * clamp(impact, 0.2, 1), r = rnd(0.9, 1.1), out = s.bus({ pan, lowpass: muffle(distance), send: 0.2 });
+        if(kind === 'buster') {
+            s.tone(at, 120 * r, { dur: 0.16, gain: 0.45 * a, freqEnd: 55, out });
+            s.noise(at, { dur: 0.1, gain: 0.35 * a, type: 'lowpass', freq: 500, attack: 0.001, out });
+            s.metal(at, 380 * r, { dur: 0.25, gain: 0.15 * a, ratio: 1.41, index: 1.5, out });
+        } else {
+            s.metal(at, 780 * r, { dur: 0.1, gain: 0.3 * a, ratio: 2.76, index: 2, out });
+            s.noise(at, { dur: 0.018, gain: 0.25 * a, type: 'bandpass', freq: 3000, q: 1, attack: 0.001, out });
+        }
+    },
+    /** One fuse tick; GameClient calls it on every blink of FuseFxSystem, `progress` 0..1 of the fuse so the pitch climbs. */
+    fuse(s, { at = s.now, kind = 'grenade', progress = 0, distance = 0, pan = 0 } = {}) {
+        let a = atten(distance), out = s.bus({ pan, lowpass: muffle(distance, 12) });
+        if(kind === 'buster') {
+            s.tone(at, 520 + progress * 480, { dur: 0.05, gain: 0.25 * a, type: 'triangle', attack: 0.002, out });
+            s.noise(at, { dur: 0.012, gain: 0.18 * a, type: 'bandpass', freq: 2500, q: 2, attack: 0.001, out });
+            if(progress > 0.7) s.tone(at, 70, { dur: 0.08, gain: 0.18 * a, out });
+        } else s.tone(at, 1400 + progress * 1300, { dur: 0.03, gain: 0.14 * a, type: 'square', attack: 0.001, lowpass: 5000, out });
+    },
+    /** One strike of the pickaxe (per actual carve, every 420 ms while the button is held): the point's tink on stone,
+     *  a dry thunk of earth giving way, a little grit falling. Short and bright, nothing deep: it replaced a drill
+     *  motor (saws at 46-92 Hz under a chopped grind) and a deep thud per bite, which together read as menacing. */
+    pick(s, { at = s.now } = {}) {
+        let r = rnd(0.93, 1.07), out = s.bus({ send: 0.1 });
+        s.noise(at, { dur: 0.012, gain: 0.3, type: 'bandpass', freq: 2400 * r, q: 1.2, attack: 0.001, out }); // the point's contact
+        s.metal(at, 1250 * r, { dur: 0.16, gain: 0.08, ratio: 2.4, index: 1.5, out });                        // a short ring, not a clang
+        s.noise(at + 0.004, { dur: 0.08, gain: 0.4, type: 'lowpass', freq: 1100 * r, freqEnd: 380, q: 0.8, attack: 0.002, out }); // earth giving way
+        s.tone(at + 0.004, 240 * r, { dur: 0.05, gain: 0.07, freqEnd: 170, out });                           // a little body
+        for(let i = 0; i < 3; i++) s.noise(at + 0.05 + Math.random() * 0.18, { dur: rnd(0.01, 0.025), gain: rnd(0.04, 0.08), type: 'bandpass', freq: rnd(1500, 4000), q: 2.5, attack: 0.001, out }); // grit
+    },
+    /** A glow rock dug out: it shatters with a glassy tinkle (high bell partials in D, a breath of sparkle noise). */
+    crystal(s, { at = s.now, count = 1, distance = 0, pan = 0 } = {}) {
+        let out = s.bus({ send: 0.35, pan, lowpass: distance > 12 ? 4000 : 0 }), g = clamp(0.2 / (1 + distance / 8), 0.02, 0.2);
+        let notes = [86, 90, 93, 98, 102], n = Math.min(4, 1 + Math.ceil(count / 2));
+        for(let i = 0; i < n; i++) s.bell(at + i * rnd(0.025, 0.05), midiHz(notes[Math.floor(Math.random() * notes.length)]), { dur: rnd(0.2, 0.35), gain: g * rnd(0.6, 1), bright: 1.4, out });
+        s.noise(at, { dur: 0.08, gain: g * 0.5, type: 'highpass', freq: 5000, attack: 0.001, out });
+    },
+    /** Mason: a stone block set down; `size` is the cube root of its volume (wall 1.8, block 2, plank 1.3, pillar 1.6). */
+    build(s, { at = s.now, size = 1.6 } = {}) {
+        let r = rnd(0.93, 1.07), k = clamp(size / 1.6, 0.7, 1.4), out = s.bus({ send: 0.25 });
+        s.tone(at, 110 * r / k, { dur: 0.22 * k, gain: 0.5, freqEnd: 40, attack: 0.002, out });
+        s.noise(at, { dur: 0.12 * k, gain: 0.5, type: 'lowpass', freq: 600 * r, freqEnd: 150, q: 0.8, attack: 0.002, out });
+        s.noise(at, { dur: 0.03, gain: 0.28, type: 'bandpass', freq: 1900 * r, q: 4, attack: 0.001, out });              // stone on stone
+        s.noise(at + 0.05, { dur: 0.25 * k, gain: 0.09, type: 'highpass', freq: 1600, attack: 0.04, out });               // grit settling
+    },
+    /** Grapple: the launch, the rope paying out, and the hook biting 150 ms later. */
+    hook(s, { at = s.now } = {}) {
+        let r = rnd(0.95, 1.05), out = s.bus({ send: 0.2 });
+        s.noise(at, { dur: 0.07, gain: 0.35, type: 'highpass', freq: 2500, attack: 0.002, out });
+        s.tone(at, 620 * r, { dur: 0.09, gain: 0.08, type: 'square', freqEnd: 180, lowpass: 2500, out });
+        s.noise(at + 0.01, { dur: 0.2, gain: 0.2, type: 'bandpass', freq: 800, freqEnd: 2600, q: 1.5, attack: 0.03, out });
+        s.metal(at + 0.15, 1900 * r, { dur: 0.25, gain: 0.3, ratio: 2.76, index: 3, out });
+        s.noise(at + 0.15, { dur: 0.015, gain: 0.25, type: 'bandpass', freq: 3500, q: 1, attack: 0.001, out });
+    },
+    /** The reel while the grapple pulls: a ratchet (noise chopped at 22 Hz) and a small motor whose pitch climbs. */
+    reelLoop(s, { at = s.now } = {}) {
+        let ctx = s.ctx, out = s.bus({ send: 0.1 });
+        let master = ctx.createGain(); master.gain.setValueAtTime(0.0001, at); master.gain.exponentialRampToValueAtTime(1, at + 0.08); master.connect(out);
+        let n = ctx.createBufferSource(); n.buffer = s.noiseBuffer(); n.loop = true;
+        let bp = ctx.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 1500; bp.Q.value = 2;
+        let chop = ctx.createGain(); chop.gain.value = 0.5; let lfo = ctx.createOscillator(); lfo.type = 'square'; lfo.frequency.value = 22; let lg = ctx.createGain(); lg.gain.value = 0.5; lfo.connect(lg); lg.connect(chop.gain);
+        let g1 = ctx.createGain(); g1.gain.value = 0.14; n.connect(bp); bp.connect(chop); chop.connect(g1); g1.connect(master);
+        let o = ctx.createOscillator(); o.type = 'sawtooth'; o.frequency.setValueAtTime(170, at); o.frequency.linearRampToValueAtTime(240, at + 2.5);
+        let lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500; let g2 = ctx.createGain(); g2.gain.value = 0.08; o.connect(lp); lp.connect(g2); g2.connect(master);
+        n.start(at, Math.random()); lfo.start(at); o.start(at);
+        return (t = ctx.currentTime) => {
+            let g = master.gain; if(g.cancelAndHoldAtTime) g.cancelAndHoldAtTime(t); else { g.cancelScheduledValues(t); g.setValueAtTime(1, t); }
+            g.exponentialRampToValueAtTime(0.0001, t + 0.12);
+            for(let x of [n, lfo, o]) x.stop(t + 0.15);
+            setTimeout(() => { for(let x of [master, bp, chop, g1, lp, g2]) x.disconnect(); }, (t - ctx.currentTime) * 1000 + 300);
+        };
+    },
+    unhook(s, { at = s.now } = {}) {
+        s.noise(at, { dur: 0.06, gain: 0.22, type: 'highpass', freq: 1800, attack: 0.002 });
+        s.tone(at, 500, { dur: 0.09, gain: 0.07, freqEnd: 1100, type: 'triangle' });
+    },
+    /** Taking damage: a body thud, a grunt-ish formant, ears ringing after a big one. */
+    hurt(s, { at = s.now, damage = 30 } = {}) {
+        let k = clamp(0.5 + damage / 70, 0.5, 1.1), r = rnd(0.9, 1.1), out = s.bus({ send: 0.1 });
+        s.noise(at, { dur: 0.22, gain: 0.45 * k, type: 'lowpass', freq: 260 * r, freqEnd: 90, attack: 0.002, out });
+        s.tone(at, 180 * r, { dur: 0.22, gain: 0.4 * k, freqEnd: 55, out });
+        s.noise(at + 0.01, { dur: 0.14, gain: 0.18 * k, type: 'bandpass', freq: 650 * r, freqEnd: 350, q: 4, attack: 0.01, out });
+        if(damage > 45) s.tone(at + 0.03, 3100, { dur: 0.6, gain: 0.04, attack: 0.05, out });
+    },
+    /** Death: a long sub drop and the parallel-minor fall A F D A. */
+    death(s, { at = s.now } = {}) {
+        let out = s.bus({ send: 0.4 });
+        s.tone(at, 110, { dur: 1.3, gain: 0.45, freqEnd: 32, attack: 0.01, out });
+        s.noise(at, { dur: 1.0, gain: 0.3, type: 'lowpass', freq: 400, freqEnd: 80, attack: 0.01, out });
+        [69, 65, 62, 57].forEach((m, i) => s.brass(at + 0.1 + i * 0.19, midiHz(m), { dur: i === 3 ? 0.9 : 0.3, gain: 0.14, attack: 0.02, out }));
+    },
+    /** Respawn: a rising sweep and D A D. */
+    respawn(s, { at = s.now } = {}) {
+        let out = s.bus({ send: 0.35 });
+        s.noise(at, { dur: 0.5, gain: 0.16, type: 'bandpass', freq: 300, freqEnd: 3200, q: 1.2, attack: 0.15, out });
+        [62, 69, 74].forEach((m, i) => s.bell(at + 0.12 + i * 0.09, midiHz(m + 12), { dur: 0.5, gain: 0.14, out }));
+    },
+    kill(s, { at = s.now } = {}) { let out = s.bus({ send: 0.3 }); s.bell(at, midiHz(81), { dur: 0.3, gain: 0.2, out }); s.bell(at + 0.09, midiHz(86), { dur: 0.5, gain: 0.22, out }); },
+    /** Pickup: D F# A up. */
+    pickup(s, { at = s.now } = {}) { let out = s.bus({ send: 0.3 }); [74, 78, 81].forEach((m, i) => s.bell(at + i * 0.075, midiHz(m), { dur: i === 2 ? 0.6 : 0.25, gain: 0.2, out })); },
+    /** A teammate (or an enemy, lower) grabbed a crate: a short version of the pickup, far away. */
+    pickupOther(s, { at = s.now, friendly = true } = {}) {
+        let out = s.bus({ send: 0.3 });
+        if(friendly) [74, 81].forEach((m, i) => s.bell(at + i * 0.08, midiHz(m), { dur: 0.3, gain: 0.08, out }));
+        else [57, 55].forEach((m, i) => s.tone(at + i * 0.12, midiHz(m), { dur: 0.3, gain: 0.08, type: 'triangle', out }));
+    },
+    /** Deposit: the team fanfare, D F# A D up, then C -> D home over a D3 root. */
+    deposit(s, { at = s.now } = {}) {
+        let out = s.bus({ send: 0.35 });
+        s.tone(at, midiHz(50), { dur: 1.4, gain: 0.22, attack: 0.02, out });
+        [62, 66, 69, 74].forEach((m, i) => s.bell(at + i * 0.1, midiHz(m + 12), { dur: 0.35, gain: 0.18, out }));
+        s.bell(at + 0.5, midiHz(84), { dur: 0.3, gain: 0.16, out }); s.bell(at + 0.62, midiHz(86), { dur: 1.0, gain: 0.24, out });
+        for(let [m, g] of [[62, 0.07], [66, 0.05], [69, 0.05]]) s.brass(at + 0.62, midiHz(m), { dur: 0.9, gain: g, out });
+    },
+    /** Tunnel rat: a quick scamper up the scale and a D chord. */
+    bonus(s, { at = s.now } = {}) {
+        let out = s.bus({ send: 0.35 });
+        [67, 69, 71, 74, 76, 78].forEach((m, i) => s.bell(at + i * 0.06, midiHz(m + 12), { dur: 0.22, gain: 0.14, out }));
+        [74, 78, 81].forEach(m => s.bell(at + 0.42, midiHz(m + 12), { dur: 0.9, gain: 0.12, out }));
+    },
+    /** Round start: drum, D D A D in brass, a bell chord on the landing. */
+    roundStart(s, { at = s.now } = {}) {
+        let out = s.bus({ send: 0.35 });
+        s.kick(at, { gain: 0.45, out }); s.noise(at, { dur: 0.4, gain: 0.2, type: 'lowpass', freq: 300, attack: 0.002, out });
+        for(let [m, dt, dur] of [[62, 0, 0.18], [62, 0.2, 0.18], [69, 0.4, 0.3], [74, 0.75, 0.9]]) { s.brass(at + dt, midiHz(m), { dur, gain: 0.14, out }); s.brass(at + dt, midiHz(m - 12), { dur, gain: 0.08, out }); }
+        s.kick(at + 0.75, { gain: 0.4, out });
+        [74, 78, 81].forEach(m => s.bell(at + 0.75, midiHz(m + 12), { dur: 1.0, gain: 0.1, out }));
+    },
+    /** Round over: win climbs A D F# A, loss falls A F D A over a low D, a draw hovers. */
+    roundOver(s, { at = s.now, result = 'draw' } = {}) {
+        let out = s.bus({ send: 0.4 });
+        s.kick(at, { gain: 0.5, out });
+        if(result === 'win') {
+            for(let [m, dt] of [[69, 0], [74, 0.15], [78, 0.3], [81, 0.45]]) s.brass(at + dt, midiHz(m), { dur: dt === 0.45 ? 1.4 : 0.35, gain: 0.16, out });
+            [74, 78, 81, 86].forEach(m => s.bell(at + 0.45, midiHz(m + 12), { dur: 1.4, gain: 0.1, out }));
+        } else if(result === 'loss') {
+            for(let [m, dt] of [[69, 0], [65, 0.25], [62, 0.5], [57, 0.75]]) s.brass(at + dt, midiHz(m), { dur: dt === 0.75 ? 1.6 : 0.4, gain: 0.15, out });
+            s.tone(at + 0.75, midiHz(38), { dur: 1.8, gain: 0.22, attack: 0.05, out });
+        } else for(let [m, dt] of [[69, 0], [67, 0.3], [69, 0.6]]) s.brass(at + dt, midiHz(m), { dur: dt === 0.6 ? 1.2 : 0.4, gain: 0.14, out });
+    },
+    votePass(s, { at = s.now } = {}) { let out = s.bus({ send: 0.3 }); s.bell(at, midiHz(81), { dur: 0.3, gain: 0.18, out }); s.bell(at + 0.12, midiHz(86), { dur: 0.6, gain: 0.18, out }); },
+    /** UI: weapon switch, vote cast, menu. */
+    click(s, { at = s.now } = {}) { s.noise(at, { dur: 0.012, gain: 0.14, type: 'highpass', freq: 2500, attack: 0.001 }); s.tone(at, 1700, { dur: 0.03, gain: 0.07, type: 'triangle' }); },
+    /** Rubble: a collapse of `count` fragments, thuds scattered over half a second and a rumble. */
+    rubble(s, { at = s.now, count = 1, distance = 0, pan = 0 } = {}) {
+        let a = atten(distance), n = Math.min(9, 2 + count), k = clamp(count / 6, 0.3, 1), out = s.bus({ pan, lowpass: muffle(distance, 10, 7000), send: 0.3 });
+        for(let i = 0; i < n; i++) {
+            let dt = Math.random() * 0.55, r = rnd(0.8, 1.25);
+            s.noise(at + dt, { dur: 0.09, gain: 0.26 * a, type: 'lowpass', freq: 380 * r, freqEnd: 120, q: 1, attack: 0.002, out });
+            s.tone(at + dt, 75 * r, { dur: 0.1, gain: 0.2 * a, freqEnd: 40, out });
+        }
+        s.noise(at, { dur: 0.7, gain: 0.26 * a * k, type: 'lowpass', freq: 130, q: 1, attack: 0.05, out });
+    },
+    /** Landing after a fall; `speed` in m/s. */
+    land(s, { at = s.now, speed = 10 } = {}) {
+        let k = clamp((speed - 6) / 20, 0.15, 1), out = s.bus({ send: 0.1 });
+        s.noise(at, { dur: 0.09, gain: 0.32 * k, type: 'lowpass', freq: 450, freqEnd: 150, attack: 0.002, out });
+        s.tone(at, 95, { dur: 0.12, gain: 0.28 * k, freqEnd: 45, out });
+    },
+    step(s, { at = s.now } = {}) {
+        let r = rnd(0.85, 1.15);
+        s.noise(at, { dur: 0.06, gain: 0.11, type: 'lowpass', freq: 750 * r, freqEnd: 250, attack: 0.002 });
+        s.tone(at, 120 * r, { dur: 0.04, gain: 0.05, freqEnd: 70 });
+    },
+};
+
+/** The output bus for a context: fx -> master -> soft clipper -> destination, plus the reverb (send -> lowpass -> convolver -> master). */
+export function createBus(ctx) {
+    let fx = ctx.createGain(), master = ctx.createGain(), limiter = ctx.createWaveShaper();
+    // unity below the knee, then a tanh shoulder that tops out at 0.89: a safety net, not a gain stage
+    let curve = new Float32Array(1025), knee = 0.55;
+    for(let i = 0; i < curve.length; i++) { let x = (i / 512) - 1, ax = Math.abs(x); curve[i] = Math.sign(x) * (ax < knee ? ax : knee + (1 - knee) * Math.tanh((ax - knee) / (1 - knee))); }
+    limiter.curve = curve; limiter.oversample = '2x';
+    fx.connect(master); master.connect(limiter); limiter.connect(ctx.destination);
+    let reverbSend = ctx.createGain(), lp = ctx.createBiquadFilter(), conv = ctx.createConvolver(), ret = ctx.createGain();
+    lp.type = 'lowpass'; lp.frequency.value = 3200; ret.gain.value = 0.35;
+    let len = Math.floor(ctx.sampleRate * 1.6), ir = ctx.createBuffer(2, len, ctx.sampleRate);
+    for(let c = 0; c < 2; c++) { let d = ir.getChannelData(c), s = 12345 + c * 777; for(let i = 0; i < len; i++) { s ^= s << 13; s ^= s >>> 17; s ^= s << 5; let t = i / ctx.sampleRate; d[i] = (((s >>> 0) / 2147483648) - 1) * Math.exp(-t * 4.2) * (t < 0.02 ? t / 0.02 : 1); } }
+    conv.buffer = ir;
+    reverbSend.connect(lp); lp.connect(conv); conv.connect(ret); ret.connect(master);
+    return { fx, master, limiter, reverbSend };
+}
+
+
+/** Material families for impacts and blasts: what a material sounds like when it breaks. */
+const FAMILY = { 0: 'stone', 1: 'earth', 2: 'earth', 3: 'sand', 4: 'sand', 5: 'stone', 6: 'metal', 7: 'earth', 8: 'stone', 9: 'stone', 10: 'wood', 11: 'stone', 12: 'stone', 13: 'stone' };
+
+Object.assign(SOUNDS, {
+    /** Donkey Kong's punch: a meaty thump and the crack of whatever it hit. */
+    punch(s, { at = s.now, kind = 'terrain', family = 'earth' } = {}) {
+        const r = rnd(0.9, 1.1), out = s.bus({ send: 0.12 });
+        s.noise(at, { dur: 0.05, gain: 0.25, type: 'highpass', freq: 1200, freqEnd: 400, attack: 0.002, out }); // swing
+        if(kind === 'air') return;
+        s.tone(at, 140 * r, { dur: 0.14, gain: 0.55, freqEnd: 45, attack: 0.002, out });
+        s.noise(at, { dur: 0.1, gain: 0.45, type: 'lowpass', freq: 900 * r, freqEnd: 200, attack: 0.001, out });
+        if(kind === 'actor') { s.noise(at, { dur: 0.07, gain: 0.3, type: 'bandpass', freq: 500, q: 2, attack: 0.001, out }); return; }
+        SOUNDS.crumble(s, { at, family, size: 0.6 });
+    },
+    /** Breaking material: stone cracks and rattles, earth thuds and pours, wood splinters, metal clanks. */
+    crumble(s, { at = s.now, family = 'earth', size = 1, distance = 0, pan = 0 } = {}) {
+        const a = atten(distance), k = clamp(size, 0.3, 2), out = s.bus({ pan, lowpass: muffle(distance), send: 0.15 });
+        const r = rnd(0.9, 1.1);
+        if(family === 'stone') {
+            s.noise(at, { dur: 0.03, gain: 0.4 * a, type: 'bandpass', freq: 2800 * r, q: 1.2, attack: 0.001, out });
+            for(let i = 0; i < 3 + k * 4; i++) s.noise(at + 0.02 + Math.random() * 0.3 * k, { dur: rnd(0.015, 0.04), gain: rnd(0.08, 0.18) * a, type: 'bandpass', freq: rnd(1200, 4200), q: 3, attack: 0.001, out });
+        } else if(family === 'wood') {
+            s.noise(at, { dur: 0.06, gain: 0.35 * a, type: 'bandpass', freq: 700 * r, q: 3, attack: 0.001, out });
+            s.tone(at, 330 * r, { dur: 0.08, gain: 0.2 * a, type: 'triangle', freqEnd: 180, out });
+            for(let i = 0; i < 3; i++) s.noise(at + 0.03 + Math.random() * 0.15, { dur: 0.02, gain: 0.12 * a, type: 'bandpass', freq: rnd(1500, 3000), q: 4, attack: 0.001, out });
+        } else if(family === 'metal') {
+            s.metal(at, 520 * r, { dur: 0.35, gain: 0.25 * a, ratio: 2.76, index: 3, out });
+        } else if(family === 'sand') {
+            s.noise(at, { dur: 0.25 * k, gain: 0.25 * a, type: 'highpass', freq: 1800, attack: 0.01, out });
+        } else {
+            s.noise(at, { dur: 0.18 * k, gain: 0.3 * a, type: 'lowpass', freq: 500 * r, freqEnd: 120, attack: 0.003, out });
+            s.noise(at + 0.04, { dur: 0.3 * k, gain: 0.12 * a, type: 'bandpass', freq: 1400, q: 0.8, attack: 0.05, out }); // dirt pouring
+        }
+    },
+    /** Ripping a lump out of the ground: a deep groan and a tearing crack. */
+    rip(s, { at = s.now, family = 'earth' } = {}) {
+        const out = s.bus({ send: 0.2 }), r = rnd(0.9, 1.1);
+        s.tone(at, 90 * r, { dur: 0.35, gain: 0.45, freqEnd: 50, attack: 0.02, out });
+        s.noise(at, { dur: 0.3, gain: 0.35, type: 'bandpass', freq: 300 * r, freqEnd: 1600, q: 1.2, attack: 0.03, out });
+        SOUNDS.crumble(s, { at: at + 0.05, family, size: 1.2 });
+    },
+    whoosh(s, { at = s.now, power = 1 } = {}) {
+        const out = s.bus({ send: 0.1 });
+        s.noise(at, { dur: 0.25, gain: 0.25 * power, type: 'bandpass', freq: 500, freqEnd: 1800, q: 1, attack: 0.05, out });
+    },
+    /** A thrown boulder bursting: a short explosion plus a lot of its material. */
+    shatter(s, { at = s.now, family = 'stone', distance = 0, pan = 0 } = {}) {
+        SOUNDS.explosion(s, { at, radius: 1.6, distance, pan });
+        SOUNDS.crumble(s, { at: at + 0.01, family, size: 1.8, distance, pan });
+    },
+    /** Hit marker: you hurt someone. */
+    hitmark(s, { at = s.now, kill = false } = {}) {
+        const out = s.bus({});
+        s.tone(at, kill ? 1800 : 2400, { dur: 0.05, gain: 0.12, type: 'square', lowpass: 6000, out });
+        if(kill) s.tone(at + 0.06, 2600, { dur: 0.09, gain: 0.12, type: 'square', lowpass: 6000, out });
+    },
+    /** The match clock: a woodblock in the last ten seconds. */
+    tick(s, { at = s.now } = {}) { s.tone(at, 1250, { dur: 0.05, gain: 0.18, type: 'triangle', out: s.bus({}) }); s.noise(at, { dur: 0.01, gain: 0.1, type: 'bandpass', freq: 3000, q: 2, attack: 0.001 }); },
+    /** The enemy took one of your crates. */
+    alarm(s, { at = s.now } = {}) { const out = s.bus({ send: 0.2 }); for(let i = 0; i < 3; i++) s.tone(at + i * 0.16, 880, { dur: 0.1, gain: 0.12, type: 'square', lowpass: 2500, out }); },
+});
+
+export class Sfx {
+    constructor(game) {
+        this.game = game;
+        this.ctx = null; this.synth = null; this.master = null; this.reverbSend = null;
+        this.readyFns = [];
+        this.listener = { x: 0, y: 0, z: 0, rx: 1, ry: 0, rz: 0 };
+        this.recent = new Map(); // throttles per sound name
+        let store = (k) => { try { return localStorage.getItem(k); } catch(e) { return null; } };
+        this.muted = store('bananza.muted') === '1';
+        this.volume = 0.9;
+        const start = () => {
+            try {
+                if(!this.ctx) {
+                    const AC = window.AudioContext || window.webkitAudioContext; if(!AC) return;
+                    this.ctx = new AC();
+                    const bus = createBus(this.ctx);
+                    this.fx = bus.fx; this.master = bus.master; this.reverbSend = bus.reverbSend;
+                    this.master.gain.value = this.muted ? 0 : this.volume;
+                    this.synth = new Synth(this.ctx, this.fx, this.reverbSend);
+                }
+                if(this.ctx.state === 'suspended') this.ctx.resume().then(() => this.fireReady()).catch(() => {});
+                else this.fireReady();
+            } catch(e) { console.warn('audio unavailable', e); }
+        };
+        for(const ev of ['pointerdown', 'keydown', 'touchstart']) window.addEventListener(ev, start, { passive: true });
+        addEventListener('keydown', (e) => { if(e.code === 'KeyM' && !e.repeat) { this.toggleMute(); game.emit('hint', { text: this.muted ? 'Sound off (M)' : 'Sound on (M)' }); } });
+        if(game) this.hook(game);
+    }
+    get ready() { return !!this.ctx && this.ctx.state === 'running'; }
+    onReady(fn) { if(this.ready) fn(); else this.readyFns.push(fn); }
+    fireReady() { if(!this.ready) return; const fns = this.readyFns; this.readyFns = []; for(const fn of fns) { try { fn(); } catch(e) { console.warn(e); } } }
+    setMuted(m) {
+        this.muted = !!m;
+        try { localStorage.setItem('bananza.muted', this.muted ? '1' : '0'); } catch(e) {}
+        if(this.master) { const g = this.master.gain, t = this.ctx.currentTime; g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(this.muted ? 0 : this.volume, t + 0.15); }
+        return this.muted;
+    }
+    toggleMute() { return this.setMuted(!this.muted); }
+    listen(camera) {
+        const l = this.listener, p = camera.position, q = camera.quaternion;
+        l.x = p.x; l.y = p.y; l.z = p.z;
+        l.rx = 1 - 2 * (q.y * q.y + q.z * q.z); l.ry = 2 * (q.x * q.y + q.w * q.z); l.rz = 2 * (q.x * q.z - q.w * q.y);
+    }
+    spatial(pos) {
+        if(!pos) return { distance: 0, pan: 0 };
+        const x = pos.x ?? pos[0], y = pos.y ?? pos[1], z = pos.z ?? pos[2];
+        const l = this.listener, dx = x - l.x, dy = y - l.y, dz = z - l.z, d = Math.hypot(dx, dy, dz);
+        const pan = d > 0.5 ? (dx * l.rx + dy * l.ry + dz * l.rz) / d * clamp(d / 6, 0, 1) * 0.8 : 0;
+        return { distance: d, pan };
+    }
+    /** Play a sound; `minGap` seconds throttles repeats of the same name (debris storms). */
+    play(name, opts = {}, minGap = 0) {
+        if(!this.ready || this.muted || !SOUNDS[name]) return;
+        const now = this.ctx.currentTime;
+        if(minGap > 0) { const last = this.recent.get(name) ?? -1; if(now - last < minGap) return; this.recent.set(name, now); }
+        try { SOUNDS[name](this.synth, { at: now, ...opts }); } catch(e) { console.warn(`sfx ${name}`, e); }
+    }
+    at(name, pos, opts = {}, minGap = 0, maxDist = 90) {
+        const sp = this.spatial(pos);
+        if(sp.distance > maxDist) return;
+        this.play(name, { ...opts, ...sp }, minGap);
+    }
+
+    /** Debug: render every sound into an OfflineAudioContext; returns { name: peak | error }. */
+    static async selfTest(seconds = 1.5) {
+        const OAC = window.OfflineAudioContext || window.webkitOfflineAudioContext, out = {};
+        for(const name of Object.keys(SOUNDS)) {
+            try {
+                const ctx = new OAC(2, Math.ceil(44100 * seconds), 44100), bus = createBus(ctx), synth = new Synth(ctx, bus.fx, bus.reverbSend);
+                const stop = SOUNDS[name](synth, { at: 0.01 });
+                if(typeof stop === 'function') stop(seconds * 0.6);
+                const buf = await ctx.startRendering(), d = buf.getChannelData(0);
+                let peak = 0; for(let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+                out[name] = +peak.toFixed(3);
+            } catch(e) { out[name] = 'ERROR ' + e.message; }
+        }
+        return out;
+    }
+
+    /** Everything the game does that makes a noise. */
+    hook(game) {
+        const me = () => game.player;
+        const fam = (m) => FAMILY[m] || 'earth';
+        game.on('explosion', ({ center, radius, kind }) => {
+            if(kind === 'rock') return; // the shatter sound covers it
+            this.at('explosion', center, { radius, kind }, 0, 200);
+        });
+        game.on('rocket', ({ origin, owner }) => owner === me() ? this.play('rocket') : this.at('rocket', origin, {}, 0.05, 70));
+        game.on('throw', ({ kind, owner }) => { if(owner === me()) kind === 'rock' ? this.play('whoosh', { power: 1.2 }) : this.play('throw', { kind, power: 0.7 }); });
+        game.on('bounce', ({ kind, point, impact }) => this.at('bounce', point, { kind, impact }, 0.04, 50));
+        game.on('fuse', ({ kind, progress, point }) => this.at('fuse', point, { kind, progress }, 0, 40));
+        game.on('punch', ({ kind, mat, owner, point }) => owner === me() ? this.play('punch', { kind, family: fam(mat) }) : this.at('punch', point, { kind, family: fam(mat) }, 0.05, 40));
+        game.on('dig', ({ owner, point, volume }) => { if(owner === me()) { this.play('pick'); } else this.at('pick', point, {}, 0.1, 35); });
+        game.on('build', ({ size, owner, center }) => owner === me() ? this.play('build', { size: Math.cbrt(size[0] * size[1] * size[2]) }) : this.at('build', center, {}, 0.1));
+        game.on('rip', ({ mat }) => this.play('rip', { family: fam(mat) }));
+        game.on('shatter', ({ point, mat }) => this.at('shatter', point, { family: fam(mat) }, 0, 150));
+        game.on('damage', ({ actor, amount, by }) => {
+            if(actor === me()) this.play('hurt', { damage: amount }, 0.08);
+            else if(by === me()) this.play('hitmark', { kill: actor.health <= 0 });
+        });
+        game.on('death', ({ actor, by }) => { if(actor === me()) this.play('death'); else if(by === me()) this.play('kill'); });
+        game.on('respawn', ({ actor }) => { if(actor === me()) this.play('respawn'); });
+        game.on('pickup', ({ actor, from }) => {
+            if(actor === me()) this.play('pickup');
+            else { if(from === 'red') this.play('alarm'); else this.play('pickupOther', { friendly: actor.team === 'red' }); }
+        });
+        game.on('deposit', ({ actor }) => actor.team === 'red' ? this.play('deposit') : this.play('pickupOther', { friendly: false }));
+        game.on('step', ({ actor }) => { if(actor === me()) this.play('step'); });
+        game.on('land', ({ actor, speed }) => { if(actor === me()) this.play('land', { speed }); });
+        game.on('tool', () => this.play('click'));
+        game.on('tick', () => this.play('tick'));
+        game.on('ui', ({ sound }) => this.play(sound || 'click'));
+        game.on('start', () => this.onReady(() => this.play('roundStart')));
+        game.on('matchOver', ({ result }) => this.play('roundOver', { result }));
+        // the world: debris from any destruction, bodies hitting things
+        game.ctx.events.addEventListener('destroyed', (e) => {
+            const d = e.detail; if(!d || d.kind === 'blast') return;
+            let best = 1, bv = 0; for(let i = 0; i < 16; i++) if(d.removed[i] > bv) { bv = d.removed[i]; best = i; }
+            if(d.author === me()?.name) return; // our own punches and digs already sound
+            this.at('crumble', d.center, { family: fam(best), size: Math.cbrt(d.volume) }, 0.06, 50);
+        });
+        game.ctx.events.addEventListener('impact', (e) => {
+            const d = e.detail; if(!d || d.speed < 4) return;
+            this.at('crumble', d.point, { family: fam(d.mat ?? 0), size: Math.min(1.5, d.speed / 12) }, 0.05, 50);
+        });
+        game.ctx.events.addEventListener('detached', (e) => {
+            const d = e.detail; if(!d) return;
+            const p = d.prop?.body?.translation?.();
+            if(p) this.at('rubble', p, { count: Math.min(9, Math.ceil(Math.cbrt(d.volume || 1) * 2)) }, 0.15, 120);
+        });
+    }
+}
