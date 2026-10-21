@@ -124,3 +124,63 @@ export function brushFromSpec(s) {
 }
 /** A brush's spec, sampling it into a grid brush when it has none. */
 export function specOf(b) { return b.spec || gridBrush(b).spec; }
+
+// ---------------------------------------------------------------- material-shaped carving
+/**
+ * How carving bites into each material (VoxelWorld.applyBrush with hardness): the brush's distance at a solid sample is
+ * offset by `carveOffset(mat, x, y, z)` (metres, + carves less, - carves more) and, along a wood's grain, stretched by
+ * CARVE_STRETCH (the evaluation point is pulled toward the brush centre on that axis: an elongated bite).
+ *   stone (0, 8, 9), dark rock (12): faceted chips, a random plane per 0.7 m cell
+ *   brick (5): whole bricks (running bond cells 0.5 x 0.25 x 0.5 m) go or stay: stepped, brick-shaped holes
+ *   cobble (11): rounded (smooth value noise, 0.5 m)
+ *   wood (10, 14, 15): stretched 1.8x along the grain, fibres (0.25 m cross-grain cells, 1.5 m long) stick out or
+ *                      break deeper: a splintered, jagged bite
+ *   metal, glass, soils: plain (clean holes; soils get a rim mound instead, VoxelWorld.applyBrush `rim`)
+ * Pure functions of the position: every client carves the same.
+ * CARVE_AMP[m] bounds |carveOffset| (block skipping in applyBrush relies on it).
+ */
+export const CARVE_AMP = new Float32Array(256);
+export const CARVE_STRETCH = new Float32Array(256).fill(1);
+export const CARVE_GRAIN = new Int8Array(256).fill(-1);
+const SHAPE = new Uint8Array(256);
+for(const m of [0, 8, 9, 12]) { SHAPE[m] = 1; CARVE_AMP[m] = 0.32; }
+SHAPE[5] = 2; CARVE_AMP[5] = 0.19;
+SHAPE[11] = 3; CARVE_AMP[11] = 0.16;
+[10, 14, 15].forEach((m, axis) => { SHAPE[m] = 4; CARVE_AMP[m] = 0.26; CARVE_STRETCH[m] = 1.8; CARVE_GRAIN[m] = axis; });
+
+function hash3u(x, y, z) {
+    let h = Math.imul(x, 0x8da6b343) ^ Math.imul(y, 0xd8163841) ^ Math.imul(z, 0xcb1ab31f);
+    h = Math.imul(h ^ (h >>> 15), 0x2c1b3c6d); h ^= h >>> 12; h = Math.imul(h, 0x297a2d39); h ^= h >>> 15;
+    return h >>> 0;
+}
+const hash3 = (x, y, z) => hash3u(x, y, z) / 4294967296;
+export function carveOffset(m, x, y, z) {
+    switch(SHAPE[m]) {
+        case 1: { // facets: a plane through each 0.7 m cell at a random tilt and height
+            const cs = 0.7, fx = x / cs, fy = y / cs, fz = z / cs, ix = Math.floor(fx), iy = Math.floor(fy), iz = Math.floor(fz);
+            // one hash: 8 bits each for the height and the plane's tilt
+            const u = hash3u(ix, iy, iz), h = (u & 255) / 255 - 0.5, nx = ((u >>> 8) & 255) / 255 - 0.5, ny = ((u >>> 16) & 255) / 255 - 0.5, nz = (u >>> 24) / 255 - 0.5;
+            return h * 0.18 + ((fx - ix - 0.5) * nx + (fy - iy - 0.5) * ny + (fz - iz - 0.5) * nz) * 0.3;
+        }
+        case 2: { // bricks in running bond
+            const row = Math.floor(y / 0.25), off = (row & 1) * 0.25;
+            return (hash3(Math.floor((x + off) / 0.5), row, Math.floor((z + off) / 0.5)) - 0.5) * 0.38;
+        }
+        case 3: { // cobbles: trilinear value noise
+            const cs = 0.5, fx = x / cs, fy = y / cs, fz = z / cs, ix = Math.floor(fx), iy = Math.floor(fy), iz = Math.floor(fz);
+            const tx = fx - ix, ty = fy - iy, tz = fz - iz;
+            const sx = tx * tx * (3 - 2 * tx), sy = ty * ty * (3 - 2 * ty), sz = tz * tz * (3 - 2 * tz);
+            const l = (a, b, t) => a + (b - a) * t;
+            const c = (dx, dy, dz) => hash3(ix + dx, iy + dy, iz + dz);
+            const v = l(l(l(c(0, 0, 0), c(1, 0, 0), sx), l(c(0, 1, 0), c(1, 1, 0), sx), sy), l(l(c(0, 0, 1), c(1, 0, 1), sx), l(c(0, 1, 1), c(1, 1, 1), sx), sy), sz);
+            return (v - 0.5) * 0.32;
+        }
+        case 4: { // wood fibres: constant along the grain for 1.5 m, random across it
+            const g = CARVE_GRAIN[m], fs = 0.25;
+            const a = g === 0 ? x : g === 1 ? y : z, u = g === 0 ? y : x, v = g === 2 ? y : z;
+            const h = hash3(Math.floor(u / fs), Math.floor(v / fs), Math.floor(a / 1.5) + g * 977);
+            return (h - 0.5) * 0.52;
+        }
+    }
+    return 0;
+}

@@ -11,6 +11,8 @@
  *       terrain around the edit for regions that lost their support: those become bodies over the next few frames
  *       ('detached'), pushed by the blast's impulse.
  *   destruction.blast(center, radius, { strength, author, seed })    rock-shaped crater + impulse; returns carve's result
+ *       Craters take the shape of what they bite into (brushes.js carveOffset: faceted stone, brick-shaped steps,
+ *       splintered wood stretched along its grain, clean holes in metal and glass) and soils pile a rim around them.
  *   destruction.rip(center, radius, { author }) -> Prop | null        tear a lump of terrain out as a dynamic body
  *                                                                     (Donkey Kong style: grab it, throw it)
  *       The prop's body origin is the lump's centre; userData { voxelBody, ripped: true, mat, volume, mass, author }.
@@ -36,11 +38,19 @@
  *   'destroyed' { center: [x,y,z], box: [min, max] (metres), removed: Float64Array, volume, author, kind: 'carve'|'blast'|'impact' }
  *   'detached'  { prop, volume, mat }      a piece of terrain broke loose and is now a body
  *   'impact'    { point, speed, mat, prop } a voxel body hit something hard (speed = its velocity change, m/s)
+ *   'chips'     { point, mat, count, volume, dir } a carve or blast bit into shattering material (stone, brick, cobble,
+ *               dark rock, glass): `count` pieces worth throwing out as chips (fracture / FX code spawns them)
+ *
+ * Wood grain: a 'build' (kind) of wood (10, 14, 15) takes its grain from the longest side of the brush's box; other
+ * adds keep the id they are given (the level places its grain explicitly). Every carve marks
+ * a fresh break there (render/terrainMaterial.js markFresh).
  */
 import { VOXEL } from '../config.js';
 import { rock, specOf, brushFromSpec } from '../voxel/brushes.js';
 import * as brushes from '../voxel/brushes.js';
 import { VoxelBodies, DEBRIS } from './VoxelBodies.js';
+import { MATERIALS, isWood, woodWithGrain } from '../voxel/materials.js';
+import { markFresh } from '../render/terrainMaterial.js';
 
 export class Destruction {
     constructor(ctx) {
@@ -74,12 +84,12 @@ export class Destruction {
         const brush = brushFromSpec(e.spec);
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
         const kick = e.impulse ? { center, radius: Math.max(...brush.max.map((v, i) => v - brush.min[i])) * 0.9, strength: e.impulse } : null;
-        if(history) return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris });
+        if(history) return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, rim: e.rim });
         if(!local && !e.lift) {
             if(e.op === 'carve') this.bodies.carve(brush, { hardness: e.hardness });
             if(kick) physics.explode(kick.center, kick.radius, kick.strength);
         }
-        return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, lift: e.lift }).then(rep => {
+        return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, lift: e.lift, rim: e.rim }).then(rep => {
             rep.seq = seq;
             this.bodies.fromWorker(rep, kick, { seq, from, local, lift: e.lift });
             const r = rep.result;
@@ -88,6 +98,7 @@ export class Destruction {
                 const size = Math.max(...brush.max.map((x, i) => x - brush.min[i])) / 2;
                 for(const fn of this.editHooks) try { fn({ op: e.op, center, size, impulse: e.impulse || 0, kind: e.kind, changed: r.changed, box, dir: e.dir || null }); } catch(err) { console.error(err); }
             }
+            if(!e.lift && e.op === 'carve' && r.changed) this._afterCarve(center, brush, r.removed, e.dir);
             if(!local) {
                 let v = 0;
                 for(let i = 0; i < 256; i++) v += r.removed[i];
@@ -98,9 +109,10 @@ export class Destruction {
     }
     carve(brush, opts = {}) {
         if(this.ctx.world.remote) return this._carveRemote(brush, opts);
-        const { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve', dir = null } = opts;
+        const { op = 'carve', hardness = true, author = null, impulse = 0, kind = 'carve', dir = null } = opts;
+        const mat = kind === 'build' ? this._grain(brush, op, opts.mat ?? 1) : opts.mat ?? 1;
         const { world, physics, events } = this.ctx;
-        const r = world.applyBrush(brush, { op, mat, hardness });
+        const r = world.applyBrush(brush, { op, mat, hardness, rim: kind === 'blast' });
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
         const removed = r.removed;
         const detached = [];
@@ -120,6 +132,7 @@ export class Destruction {
             const size = Math.max(...brush.max.map((v, i) => v - brush.min[i])) / 2;
             for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box, dir }); } catch(e) { console.error(e); }
         }
+        if(op === 'carve' && r.changed) this._afterCarve(center, brush, r.removed, dir);
         if(volume > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box, removed, volume, author, kind } }));
         result.done = Promise.resolve(result);
         return result;
@@ -132,6 +145,7 @@ export class Destruction {
      */
     _carveRemote(brush, { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve', dir = null } = {}) {
         const { world, physics, events } = this.ctx;
+        if(kind === 'build') mat = this._grain(brush, op, mat);
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
         const removed = new Float64Array(256);
         const kick = impulse ? { center, radius: Math.max(...brush.max.map((v, i) => v - brush.min[i])) * 0.9, strength: impulse } : null;
@@ -145,7 +159,7 @@ export class Destruction {
         if(kick) physics.explode(kick.center, kick.radius, kick.strength);
         const result = { removed, volume, added: 0, center, box: [brush.min.map(v => v - 4 * VOXEL), brush.max.map(v => v + 4 * VOXEL)], changed: 0, detached: [], pending: true };
         const bodies = this.bodies;
-        const terrainDone = this.submit({ k: 'brush', spec: specOf(brush), op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS, kind, impulse, dir, author });
+        const terrainDone = this.submit({ k: 'brush', spec: specOf(brush), op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS, kind, impulse, dir, author, rim: kind === 'blast' && op === 'carve' });
         result.done = Promise.all([terrainDone, bodyDone]).then(([rep, b]) => {
             if(b) for(let i = 0; i < 256; i++) removed[i] += b.removed[i]; // the bodies' share (carved in the worker too)
             const r = rep.result;
@@ -157,6 +171,29 @@ export class Destruction {
             return result;
         });
         return result;
+    }
+    /** Wood placed by a build runs its grain along the longest side of the brush's box. */
+    _grain(brush, op, mat) {
+        if(op !== 'add' || !isWood(mat)) return mat;
+        const s = brush.max.map((v, a) => v - brush.min[a]);
+        return woodWithGrain(s[1] > s[0] && s[1] >= s[2] ? 1 : s[2] > s[0] ? 2 : 0);
+    }
+    /** After a carve landed (every client, in edit order): mark the fresh break and announce chips of brittle stuff. */
+    _afterCarve(center, brush, removed, dir) {
+        const R = Math.max(...brush.max.map((v, a) => v - brush.min[a])) / 2;
+        markFresh(center, R);
+        let vol = 0, best = -1, bestV = 0;
+        for(let i = 0; i < 32; i++) {
+            const v = removed[i];
+            if(!(v > 0)) continue;
+            const f = MATERIALS[i]?.fracture;
+            if(f !== 'shatter' && f !== 'glass') continue;
+            vol += v;
+            if(v > bestV) { bestV = v; best = i; }
+        }
+        if(best < 0 || vol < 0.08) return;
+        const count = Math.min(best === 16 ? 10 : 6, Math.max(1, Math.round(vol * (best === 16 ? 14 : 3))));
+        this.ctx.events.dispatchEvent(new CustomEvent('chips', { detail: { point: center, mat: best, count, volume: vol, dir: dir || null } }));
     }
     blast(center, radius, { strength = 14, author = null, seed } = {}) {
         return this.carve(rock(center, radius, seed ?? this.seed++), { author, impulse: strength, kind: 'blast' });

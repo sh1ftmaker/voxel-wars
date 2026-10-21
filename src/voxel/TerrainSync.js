@@ -86,8 +86,8 @@ export class TerrainSync {
         console.log(`terrain worker: voxelized in ${rep.ms.toFixed(0)} ms${this.worker ? ' (off the main thread)' : ''}`);
         return rep;
     }
-    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16, lift = false } = {}) {
-        return this._send({ type: 'brush', spec: brush.type ? brush : specOf(brush), op, mat, hardness, conn, erode, debris, lift });
+    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16, lift = false, rim = false } = {}) {
+        return this._send({ type: 'brush', spec: brush.type ? brush : specOf(brush), op, mat, hardness, conn, erode, debris, lift, rim });
     }
     hash(keys = null) { return this._send({ type: 'hash', keys }).then(r => r.hashes); }
     chunkData({ keys = null, modified = false } = {}) { return this._send({ type: 'chunks', keys, modified }).then(r => r.data); }

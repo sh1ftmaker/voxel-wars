@@ -61,7 +61,7 @@ const SOFT = {
 };
 SOFT[14] = SOFT[15] = SOFT[10];
 // metal dents and stays dented (the soft ground bakes plastic zones into the SDF)
-SOFT[6] = { ...SOFT[6], plasticity: 0.12, yield: 0.025 };
+SOFT[6] = { ...SOFT[6], plasticity: 0.07, yield: 0.025 };
 for(const m of MATERIALS) {
     const s = SOFT[m.id] || SOFT[1];
     // `toughness` there is the soft ground's (tearing); the fracture table below owns `toughness`
