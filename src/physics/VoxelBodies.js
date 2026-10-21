@@ -11,6 +11,8 @@
  *        { removed, volume }, or null when no body was touched)
  *   bodies.rip(brush) -> VoxelBody | null                                          tear a lump out of the world
  *   bodies.fracture(vb, point, dv)                                                 break a body (Voronoi pieces)
+ *   bodies.crack(vb, split)                                                        break a body along its soft
+ *        lattice's broken faces (bodies.soft: src/softbody/SoftBodies.js calls it)
  *   bodies.list                                                                    the live VoxelBody set
  *   bodies.budgetMs, maxBodies, breakScale, erode, impactDv                        tuning
  *
@@ -23,6 +25,10 @@
  *     dv > impactDv emits 'impact' { point, speed, mat, prop }; dv over the body's break threshold (scaled by
  *     material hardness, falling with mass, rising with each generation of fracture) splits it into Voronoi pieces
  *     seeded densest around the hit. Pieces under DEBRIS samples are pulverized: 'destroyed' { kind: 'impact' }.
+ *   - soft layer (bodies.soft): impacts and blasts also kick the body's tet lattice, so it bends and jiggles. A hit
+ *     over the break threshold but under SHATTER times it cracks the lattice instead of the Voronoi split: faces break
+ *     where it bent most and the body splits along them (crack()); if no crack forms within CRACK_WAIT s, a hit over
+ *     CRACK_FALLBACK times the threshold shatters it after all.
  *   - settling: a body asleep (or barely moving) for SETTLE seconds is stamped back into the VoxelWorld at its pose
  *     and removed once the terrain under it has been remeshed: rubble becomes diggable terrain again.
  *   - budget: over maxBodies (48), the stillest bodies are stamped early and small moving ones are pulverized; near
@@ -39,6 +45,8 @@ import { PAD } from '../config.js';
 import { VoxelBody } from '../voxel/VoxelBody.js';
 import { GRAVITY } from './Physics.js';
 import { createTerrainMaterial } from '../render/terrainMaterial.js';
+import { SoftBodies } from '../softbody/SoftBodies.js';
+import { cellSampleLabels } from '../softbody/lattice.js';
 
 /** Rotate vector v by quaternion q = [x,y,z,w]. */
 function rotate(q, v) {
@@ -55,6 +63,11 @@ const SETTLE = 2;
 const WAIT = 'wait';
 /** Bodies smaller than this never fracture (≈ 1.9 m³). */
 const MIN_FRACTURE = 120;
+/** Hits up to this many times the break threshold crack the soft lattice; harder ones shatter (Voronoi). */
+const SHATTER = 2.5;
+const CRACK_WAIT = 0.4, CRACK_FALLBACK = 1.8;
+/** Velocity changes (m/s) under this do not shake the soft layer. */
+const SOFT_DV = 1.5;
 
 export class VoxelBodies {
     constructor(ctx) {
@@ -77,6 +90,10 @@ export class VoxelBodies {
         this.breaks = new Map();   // VoxelBody -> [point, dv]: fractures waiting for the next frame's budget
         this.stats = { detached: 0, fractured: 0, stamped: 0, pulverized: 0, lastIslandsMs: 0, lastFractureMs: 0, frameMs: 0, frameMsMax: 0, jobs: 0 };
         this.physics.voxelBodies = this;
+        this.soft = new SoftBodies({ material: this.material, params: ctx.params });
+        this.soft.onSplit = (vb, split) => this.crack(vb, split);
+        // later generations are tougher (as breakDv); pieces too small to fracture only wobble
+        this.soft.toughOf = (vb) => vb.grid.count >= MIN_FRACTURE ? 1 + 0.4 * vb.generation : 0;
         this.physics.onContactForce((c1, c2, f) => this._contact(c1, c2, f));
         this.physics.onStep((h) => this._step(h));
         this.physics.onFrame(() => this._frame());
@@ -209,13 +226,15 @@ export class VoxelBodies {
 
     _frame() {
         const t0 = performance.now(), end = t0 + this.budgetMs;
+        this.soft.frame(Math.min(0.1, (t0 - (this.lastFrame ?? t0)) / 1000));
+        this.lastFrame = t0;
         this.frameNo = (this.frameNo || 0) + 1;
         // fractures go first (staged jobs: pieces, then one disabled body per unit, then an atomic swap)
-        for(const [vb, [point, dv]] of this.breaks) {
+        for(const [vb, [point, dv, cells]] of this.breaks) {
             this.breaks.delete(vb);
-            if(vb.dead || vb.fracturing || !this.list.has(vb) || !vb.body.isDynamic()) continue;
+            if(vb.dead || vb.fracturing || vb.stamping || !this.list.has(vb) || !vb.body.isDynamic() || (cells && vb.prop.userData.held)) { if(cells) this.soft.gridChanged(vb); continue; }
             vb.fracturing = true;
-            this.jobs.unshift({ kind: 'frac', vb, point, dv, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
+            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
         }
         // jobs run in order; one waiting for the terrain worker (WAIT) lets the next ones run meanwhile
         let first = true, k = 0;
@@ -255,6 +274,7 @@ export class VoxelBodies {
         if(vb.dead || !this.list.has(vb) || vb.stamping || !vb.body.isDynamic()) {
             for(const k of j.kids) k.kid.dispose();
             vb.fracturing = false;
+            if(j.cells && !vb.dead) this.soft.gridChanged(vb); // the lattice stopped at the split: start over
             return true;
         }
         const t0 = performance.now();
@@ -267,7 +287,8 @@ export class VoxelBodies {
             const energy = Math.min(4, j.dv / this.breakDv(vb));
             const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
             const n = Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
-            remote.split(g, { point: vb.toLocal(j.point), n, minCount: this.debrisMin(), generation: vb.generation + 1 }).then(rep => {
+            const c = j.cells, cells = c ? { labels: c.labels, cellOf: c.cellOf, cs: c.cs, dims: c.dims } : null;
+            remote.split(g, { point: vb.toLocal(j.point), n, cells, minCount: this.debrisMin(), generation: vb.generation + 1 }).then(rep => {
                 j.pieces = rep.same ? [g] : rep.pieces;
                 j.dust.set(rep.dust);
             }, () => { j.pieces = []; });
@@ -282,7 +303,8 @@ export class VoxelBodies {
             const energy = Math.min(4, j.dv / this.breakDv(vb));
             const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
             const n = Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
-            j.pieces = splitGrid(g, voronoiLabels(g, vb.toLocal(j.point), n), { minCount: this.debrisMin(), dust: j.dust });
+            const c = j.cells;
+            j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), n), { minCount: this.debrisMin(), dust: j.dust });
             j.sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
             j.held = { ...vb.prop.userData }; delete j.held.voxelBody; delete j.held.ripped;
             j.ms = performance.now() - t0;
@@ -296,9 +318,11 @@ export class VoxelBodies {
             j.ms += performance.now() - t0;
             return false;
         }
-        // swap: the pieces take over the parent's motion where it is now, plus a spread away from the hit
+        // swap: the pieces take over the parent's motion where it is now, plus a spread away from the hit (a crack:
+        // a nudge apart; the pieces keep the parent's wobble)
         const b = vb.body, v = b.linvel(), w = b.angvel(), com = b.worldCom(), rot = vb.rotation();
-        const spread = Math.min(8, 1.5 + j.dv * 0.15), point = j.point;
+        const spread = j.cells ? 0.8 : Math.min(8, 1.5 + j.dv * 0.15), point = j.cells ? [com.x, com.y, com.z] : j.point;
+        for(const { kid, p } of j.kids) this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
         for(const { kid, p } of j.kids) {
             const o = vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
             const rc = rotate(rot, kid.stats.com), c = [o[0] + rc[0], o[1] + rc[1], o[2] + rc[2]];
@@ -319,7 +343,8 @@ export class VoxelBodies {
         Promise.all(j.kids.map(k => k.kid.meshed)).then(() => { ghost.done = true; });
         this.stats.fractured++;
         this.stats.lastFractureMs = j.ms + performance.now() - t0; // total over its frames
-        this._dust(point, j.dust, 'impact', vb);
+        if(j.cells) j.dust[vb.mat] += 0.1; // crumbs along the crack
+        this._dust(j.point, j.dust, 'impact', vb);
         return true;
     }
     _runStamp(j, end) {
@@ -419,6 +444,7 @@ export class VoxelBodies {
     /** A body's grid was carved: remesh at once, the shape (split, colliders) in a budgeted job. */
     _carved(vb) {
         vb.carves = (vb.carves || 0) + 1;
+        this.soft.gridChanged(vb);
         vb.remesh();
         vb.body.wakeUp();
         vb.still = 0;
@@ -509,6 +535,7 @@ export class VoxelBodies {
                 for(let a = 0; a < 3; a++) av[a] += (Math.random() - 0.5) * spread * 0.6;
             }
             const kid = this.add(p, { origin: o, rotation: rot, linvel: lv, angvel: av, generation, userData: { ...held }, waitKeys: vb.waitKeys, sibling: pieces.length > 1 ? sibling : 0, prep: p.prep || null });
+            this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
             kids.push(kid);
         }
         // keep showing the old mesh until the pieces have theirs (a frame or two)
@@ -524,6 +551,13 @@ export class VoxelBodies {
     debrisMin() { const p = this.pressure(); return p > 0.6 ? Math.round(DEBRIS * (1 + (p - 0.6) * 8)) : DEBRIS; }
 
     // ------------------------------------------------------------ fracture
+
+    /** The soft lattice of `vb` came apart (a SoftBodies split): break the body along it (a 'frac' job). */
+    crack(vb, split) {
+        if(this.breaks.has(vb) || vb.dead || !this.list.has(vb)) return;
+        this.stats.cracked = (this.stats.cracked || 0) + 1;
+        this.breaks.set(vb, [vb.toWorld(split.at || vb.frame), 0, split]);
+    }
 
     /** Velocity change (m/s) a body takes before breaking. */
     breakDv(vb) {
@@ -598,17 +632,28 @@ export class VoxelBodies {
                 // velocity change: the contact force's (dv = F h / m) and the body's measured one, whichever is
                 // smaller (forces spike while Rapier pushes overlapping shapes apart; kicks change velocity without contact)
                 const v = b.linvel(), p = vb.prevV;
-                const dvV = Math.hypot(v.x - p[0], v.y - p[1] + GRAVITY * h, v.z - p[2]);
+                const dx = v.x - p[0], dy = v.y - p[1] + GRAVITY * h, dz = v.z - p[2];
+                const dvV = Math.hypot(dx, dy, dz);
                 const dv = Math.min(hit.f * h / Math.max(1, b.mass()), dvV);
-                if(dv < this.impactDv) continue;
+                if(dv < Math.min(SOFT_DV, this.impactDv)) continue;
                 const point = this._contactPoint(vb, hit.c, hit.o);
+                const brk = this.breakDv(vb), energy = dv / brk;
+                // the soft layer: matter away from the contact keeps going (a crack attempt when hit hard enough)
+                const sc = dv / (dvV || 1);
+                this.soft.impact(vb, point, [dx * sc, dy * sc, dz * sc], energy > 1 ? energy * 1.3 : 1);
+                if(dv < this.impactDv) continue;
                 if(vb.cool <= 0) {
                     vb.cool = 0.12;
                     this.events.dispatchEvent(new CustomEvent('impact', { detail: { point, speed: dv, mat: vb.mat, prop: vb.prop } }));
                 }
-                if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > this.breakDv(vb)) {
-                    const q = this.breaks.get(vb);
-                    if(!q || q[1] < dv) this.breaks.set(vb, [point, dv]);
+                if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > brk) {
+                    // under SHATTER: let the soft lattice crack it (crack()), with a Voronoi fallback if it holds
+                    const soft = this.soft.enabled && energy < SHATTER && vb.softRec?.state !== 'dead';
+                    if(soft) { if(!vb.crackWait || vb.crackWait.dv < dv) vb.crackWait = { t: vb.age, point, dv, energy }; }
+                    else {
+                        const q = this.breaks.get(vb);
+                        if(!q || q[1] < dv) this.breaks.set(vb, [point, dv]);
+                    }
                 }
             }
             this.hits.clear();
@@ -625,6 +670,12 @@ export class VoxelBodies {
                 if(vb.waitT > 1.5 || (!vb.waitRemote && !vb.waitKeys.some(k => pool.queue.has(k) || pool.inflight.has(k) || this.physics.colliderPending(k)))) vb.touchTerrain();
             }
             if(vb.stamping) { if(vb.stampKeys) this._finishStamp(vb, h); continue; }
+            const cw = vb.crackWait;
+            if(cw && vb.age - cw.t > CRACK_WAIT) {
+                vb.crackWait = null;
+                // the lattice held: a hit far over the threshold shatters it after all
+                if(cw.energy >= CRACK_FALLBACK && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb)) this.breaks.set(vb, [cw.point, cw.dv]);
+            }
             const b = vb.body;
             const lv = b.linvel(); vb.prevV[0] = lv.x; vb.prevV[1] = lv.y; vb.prevV[2] = lv.z;
             if(!b.isDynamic() || vb.prop.userData.held) { vb.still = 0; continue; }
@@ -673,6 +724,7 @@ export class VoxelBodies {
     stamp(vb) {
         if(vb.stamping || vb.dead || vb.fracturing) return;
         this.stats.stamped++;
+        this.soft.gridChanged(vb); // stamped as built: no more wobble
         vb.body.setBodyType(this.physics.R.RigidBodyType.Fixed, false);
         vb.stamping = true;
         vb.stampKeys = null;

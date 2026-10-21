@@ -13,7 +13,7 @@
  *   sync.stamp(grid, t, q) -> Promise<reply>                  union a grid into the world (copied, not transferred)
  *   sync.samples(patch) -> Promise<reply>                     write a sample patch (soft-ground bakes)
  *   world.applySamples(patch)                                 the same, the documented entry for src/soft
- *   sync.split(grid, { point, n, minCount, generation }) -> Promise<reply>   fracture / component split (grid copied)
+ *   sync.split(grid, { point, n, cells, minCount, generation }) -> Promise<reply>   fracture / component split (grid copied)
  *   sync.carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness }) -> Promise<reply>   carve a body's grid
  *   sync.pending                                              requests in flight
  *   sync.stats                                                { requests, lastMs (worker time), maxMs }
@@ -91,8 +91,8 @@ export class TerrainSync {
     carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness = true }) {
         return this._send({ type: 'carveGrid', grid: copyGrid(grid), spec, lmin, lmax, t, m, f, hardness });
     }
-    split(grid, { point = null, n = 0, minCount = 0, generation = 0 } = {}) {
-        return this._send({ type: 'split', grid: copyGrid(grid), point, n, minCount, generation });
+    split(grid, { point = null, n = 0, cells = null, minCount = 0, generation = 0 } = {}) {
+        return this._send({ type: 'split', grid: copyGrid(grid), point, n, cells, minCount, generation });
     }
 }
 
