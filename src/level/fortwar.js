@@ -1,55 +1,25 @@
 /**
- * Twin Forts as a signed distance field: the same CSG program as tools/gen-fortwar.mjs (same primitives, same
- * order of unions and subtractions, same seeded rock lumps, same 0.1 m nudge), evaluated per point instead of
- * through Manifold, so the DMM world builder can voxelize it and snap surface nodes onto the real surfaces.
+ * Twin Forts as a signed distance field: the CSG program of tools/gen-fortwar.mjs (same primitives, same order of
+ * unions and subtractions, same seeded rock lumps, same 0.1 m nudge), evaluated per point instead of through
+ * Manifold, plus the materials showcase (src/level/showcase.js, docs/LEVEL.md): wood with grain, glass, metal, brick,
+ * snow, lava, dunes and earthworks. Primitives live in src/level/prims.js.
  *
  * sdf(p) < 0 inside solid. Union = min, subtraction = max(a, -b). Box / prism distances are max-of-planes
  * (exact inside, a slight underestimate past edges outside), which is all the voxelizer and the node snapping need.
  * material(p) is the material of the last primitive (in program order) that contains p.
  */
 
-// Material ids (fortwar's table: palette 0..7, then the level's own entries)
-export const STONE = 0, DIRT = 1, GRASS = 2, SAND = 3;
-export const RED_STONE = 8, BLUE_STONE = 9, WOOD = 10, COBBLE = 11, DARK = 12;
-export const MAT_NAMES = { 0: 'Stone', 1: 'Dirt', 2: 'Grass', 3: 'Sand', 8: 'Red Stone', 9: 'Blue Stone', 10: 'Wood', 11: 'Cobble', 12: 'Dark Rock' };
+import { box, cyl, slopeZ, wedgeX, wedgeZ, STONE, DIRT, GRASS, SAND, SNOW, RED_STONE, BLUE_STONE, WOOD_Y, COBBLE, DARK } from './prims.js';
+import { showcase } from './showcase.js';
+export { STONE, DIRT, GRASS, SAND, RED_STONE, BLUE_STONE, WOOD, COBBLE, DARK } from './prims.js';
+export const MAT_NAMES = { 0: 'Stone', 1: 'Dirt', 2: 'Grass', 3: 'Sand', 4: 'Snow', 5: 'Brick', 6: 'Metal', 7: 'Lava', 8: 'Red Stone', 9: 'Blue Stone',
+    10: 'Wood', 11: 'Cobble', 12: 'Dark Rock', 14: 'Wood (vertical grain)', 15: 'Wood (z grain)', 16: 'Glass' };
 
 export const X = 80, Z = 40;
 export const SURFACE = 0, BOTTOM = -40;
 const WALL_H = 6.5, MERLON_H = 7.6, WALK_Y = 5.5, TOWER_H = 9.5;
 const GORGE_W = 8, GORGE_D = 6, BED = -GORGE_D - 0.6;
 export const NUDGE = 0.1;
-
-// ---- primitives (bounding box + signed distance) ----
-function box(x0, x1, y0, y1, z0, z1, mat) {
-    const min = [Math.min(x0, x1), Math.min(y0, y1), Math.min(z0, z1)], max = [Math.max(x0, x1), Math.max(y0, y1), Math.max(z0, z1)];
-    return { min, max, mat, d: (x, y, z) => Math.max(min[0] - x, x - max[0], min[1] - y, y - max[1], min[2] - z, z - max[2]) };
-}
-function cyl(cx, cz, y0, y1, r, mat) {
-    return { min: [cx - r, y0, cz - r], max: [cx + r, y1, cz + r], mat, d: (x, y, z) => Math.max(Math.hypot(x - cx, z - cz) - r, y0 - y, y - y1) };
-}
-/** Prism along z: at parameter t = (z - nearZ) / (farZ - nearZ), x in [x0, x1], y in [lerp(lo), lerp(hi)]. */
-function prismZ(nearZ, farZ, x0, x1, nY0, nY1, fY0, fY1, mat) {
-    const zl = Math.min(nearZ, farZ), zh = Math.max(nearZ, farZ);
-    const xl = Math.min(x0, x1), xh = Math.max(x0, x1);
-    const L = farZ - nearZ;
-    // planes of the sloped floor and ceiling (y - (a + b z)) / sqrt(1 + b^2)
-    const bLo = (fY0 - nY0) / L, aLo = nY0 - bLo * nearZ, nLo = Math.hypot(1, bLo);
-    const bHi = (fY1 - nY1) / L, aHi = nY1 - bHi * nearZ, nHi = Math.hypot(1, bHi);
-    return { min: [xl, Math.min(nY0, fY0), zl], max: [xh, Math.max(nY1, fY1), zh], mat,
-        d: (x, y, z) => Math.max(xl - x, x - xh, zl - z, z - zh, ((aLo + bLo * z) - y) / nLo, (y - (aHi + bHi * z)) / nHi) };
-}
-function prismX(nearX, farX, z0, z1, nY0, nY1, fY0, fY1, mat) {
-    const xl = Math.min(nearX, farX), xh = Math.max(nearX, farX);
-    const zl = Math.min(z0, z1), zh = Math.max(z0, z1);
-    const L = farX - nearX;
-    const bLo = (fY0 - nY0) / L, aLo = nY0 - bLo * nearX, nLo = Math.hypot(1, bLo);
-    const bHi = (fY1 - nY1) / L, aHi = nY1 - bHi * nearX, nHi = Math.hypot(1, bHi);
-    return { min: [xl, Math.min(nY0, fY0), zl], max: [xh, Math.max(nY1, fY1), zh], mat,
-        d: (x, y, z) => Math.max(xl - x, x - xh, zl - z, z - zh, ((aLo + bLo * x) - y) / nLo, (y - (aHi + bHi * x)) / nHi) };
-}
-const slopeZ = (nearZ, farZ, x0, x1, nY0, nY1, fY0, fY1, mat) => prismZ(nearZ, farZ, x0, x1, nY0, nY1, fY0, fY1, mat);
-const wedgeX = (nearX, farX, z0, z1, yBase, yLow, yHigh, mat) => prismX(nearX, farX, z0, z1, yBase, yLow, yBase, yHigh, mat);
-const wedgeZ = (nearZ, farZ, x0, x1, yBase, yLow, yHigh, mat) => prismZ(nearZ, farZ, x0, x1, yBase, yLow, yBase, yHigh, mat);
 
 /** Builds the program: five groups applied in order (add, cut, add, cut, add), exactly as gen-fortwar.mjs. */
 function program() {
@@ -78,7 +48,7 @@ function program() {
         adds.push(wedgeX(x(-53), x(-41.5), 8, 10.6, 0, 0, WALK_Y, mat));
         adds.push(wedgeX(x(-53), x(-41.5), -10.6, -8, 0, 0, WALK_Y, mat));
         lateCuts.push(box(x(-39), x(-35.5), 0, 4.5, -2.2, 2.2, mat));
-        last.push(box(x(-37.6), x(-37), 0, 4.5, -2.2, 2.2, WOOD));
+        last.push(box(x(-37.6), x(-37), 0, 4.5, -2.2, 2.2, WOOD_Y)); // the gate: vertical planks
         cuts.push(box(x(-59.5), x(-38.5), SURFACE - 0.6, SURFACE + 0.01, -10.5, 10.5, DIRT));
         late.push(box(x(-59.5), x(-38.5), SURFACE - 0.6, SURFACE, -10.5, 10.5, COBBLE));
         lateCuts.push(box(x(-60), x(-50), -6, -2.5, -5, 5, mat));
@@ -99,6 +69,7 @@ function program() {
         let cx = -78 + i * 6.2 + rnd() * 2, cz = 25 + rnd() * 13, r = 2.5 + rnd() * 3.5, h = 6.5 + rnd() * 3;
         if(Math.abs(cx) < 11) continue;
         adds.push(cyl(cx, cz, 0, h, r, DARK));
+        late.push(cyl(cx, cz, h - 0.4, h + 0.3, r, SNOW)); // snow caps on the north crags (flush: a lip would hang loose where the crag is cut)
     }
     adds.push(box(-X, X, 0, 9, 37, Z, DARK));
     for(let s of [-1, 1]) for(let rx of [14, 44]) adds.push(wedgeZ(11, 22.2, s * rx - 2, s * rx + 2, 0, 0, 6, DIRT));
@@ -123,6 +94,7 @@ function program() {
     lateCuts.push(box(-44, 44, 0, 3.2, -29, -26, STONE));
     for(let wx of [-28, -12, 12, 28]) lateCuts.push(box(wx - 1, wx + 1, 1, 3, -26.5, -19.5, STONE));
     lateCuts.push(box(-2, 2, -15, -12, -2, 2, STONE));
+    showcase({ late, lateCuts, last }, { TOWER_H, GORGE_W }); // the materials showcase (src/level/showcase.js)
     return [{ add: true, list: adds }, { add: false, list: cuts }, { add: true, list: late }, { add: false, list: lateCuts }, { add: true, list: last }];
 }
 
@@ -138,7 +110,7 @@ export class Level {
             // nudge: the whole design moves by +0.1 on every axis
             // bounds are copied (box closures hold their own min/max arrays: shifting those would nudge them twice)
             p.min = p.min.map((v) => v + NUDGE); p.max = p.max.map((v) => v + NUDGE);
-            let d = p.d; p.d = (x, y, z) => d(x - NUDGE, y - NUDGE, z - NUDGE);
+            const d = p.d0 = p.d; p.d = (x, y, z) => d(x - NUDGE, y - NUDGE, z - NUDGE);
             const lo = p.min.map(v => Math.floor((v - this.REACH) / this.B)), hi = p.max.map(v => Math.floor((v + this.REACH) / this.B));
             for(let i = lo[0]; i <= hi[0]; i++) for(let j = lo[1]; j <= hi[1]; j++) for(let k = lo[2]; k <= hi[2]; k++) {
                 const key = (i * 4096 + j) * 4096 + k; // offsets keep keys unique for |i|,|j|,|k| < 2048
@@ -146,34 +118,38 @@ export class Level {
                 b.push(p);
             }
         }));
-        this.empty = [];
+        // per bucket, the adding primitives by priority (later group, then later in the group, first): material() takes
+        // the first that contains the point
+        for(const b of this.buckets.values()) b.byPriority = b.filter(p => this.groups[p.group].add).sort((a, c) => c.group - a.group || c.order - a.order);
+        this.empty = []; this.empty.byPriority = [];
     }
     _bucket(x, y, z) {
         return this.buckets.get((Math.floor(x / this.B) * 4096 + Math.floor(y / this.B)) * 4096 + Math.floor(z / this.B)) || this.empty;
     }
     /** Signed distance (negative inside). Far from every primitive: +REACH (air). */
     sdf(x, y, z) {
-        const prims = this._bucket(x, y, z);
-        let S = this.REACH;
-        const gmin = [this.REACH, this.REACH, this.REACH, this.REACH, this.REACH];
-        for(const p of prims) { const d = p.d(x, y, z); if(d < gmin[p.group]) gmin[p.group] = d; }
-        S = gmin[0];
-        S = Math.max(S, -gmin[1]);
-        S = Math.min(S, gmin[2]);
-        S = Math.max(S, -gmin[3]);
-        S = Math.min(S, gmin[4]);
-        return S;
+        const prims = this._bucket(x, y, z), R = this.REACH;
+        const px = x - NUDGE, py = y - NUDGE, pz = z - NUDGE;
+        let g0 = R, g1 = R, g2 = R, g3 = R, g4 = R;
+        for(let i = 0; i < prims.length; i++) {
+            const p = prims[i], d = p.d0(px, py, pz);
+            switch(p.group) {
+                case 0: if(d < g0) g0 = d; break;
+                case 1: if(d < g1) g1 = d; break;
+                case 2: if(d < g2) g2 = d; break;
+                case 3: if(d < g3) g3 = d; break;
+                default: if(d < g4) g4 = d;
+            }
+        }
+        return Math.min(Math.max(Math.min(Math.max(g0, -g1), g2), -g3), g4);
     }
     /** Material at a solid point: last containing primitive of the last adding group that contains it. */
     material(x, y, z) {
-        const prims = this._bucket(x, y, z);
-        let best = null;
-        for(const p of prims) {
-            if(!this.groups[p.group].add) continue;
-            if(p.d(x, y, z) > 1e-6) continue; // same inclusive test as voxelize: faces on the lattice read 0 ± rounding
-            if(!best || p.group > best.group || (p.group === best.group && p.order > best.order)) best = p;
-        }
-        return best ? best.mat : DIRT;
+        const prims = this._bucket(x, y, z).byPriority;
+        const px = x - NUDGE, py = y - NUDGE, pz = z - NUDGE;
+        // same inclusive test as voxelize: faces on the lattice read 0 ± rounding
+        for(let i = 0; i < prims.length; i++) if(prims[i].d0(px, py, pz) <= 1e-6) return prims[i].mat;
+        return DIRT;
     }
 }
 

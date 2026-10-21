@@ -34,6 +34,8 @@ export const SAMPLE_VOLUME = VOXEL ** 3;
  *  of the walls it touches.) */
 export const BOND_CLASS = new Uint8Array(256);
 for(const id of [5, 6, 8, 9, 10]) BOND_CLASS[id] = 1 + id;
+BOND_CLASS[14] = BOND_CLASS[15] = BOND_CLASS[10]; // wood with y / z grain bonds with wood
+BOND_CLASS[16] = 17;                              // glass: its own class (a pane is not glued into its frame)
 
 // ---------------------------------------------------------------- terrain connectivity
 

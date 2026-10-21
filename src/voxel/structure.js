@@ -46,12 +46,13 @@ const DENSITY = new Float32Array(256).fill(1600);
     set([0, 8, 9], 14, 4e6);    // stone, red / blue stone
     set([5], 13, 3e6);          // brick
     set([6], 20, 5e7);          // metal
-    set([10], 12, 5e6);         // wood
+    set([10, 14, 15], 12, 5e6); // wood (any grain)
+    set([16], 14, 5e6);         // glass (panes lie in frames: they reach as far as what carries them)
     set([11], 16, 5e6);         // cobble (the bridge's wide middle reaches ~15 m from the rims by sample paths)
     set([12], 17, 6e6);         // dark rock
     set([7], 3, 3e4);           // lava (crust)
     REACH_M[BEDROCK] = 1e9; STRENGTH[BEDROCK] = Infinity;
-    const dens = { 0: 2400, 1: 1600, 2: 1600, 3: 1700, 4: 500, 5: 2000, 6: 7800, 7: 3000, 8: 2300, 9: 2300, 10: 700, 11: 2300, 12: 2600, 13: 3000 };
+    const dens = { 0: 2400, 1: 1600, 2: 1600, 3: 1700, 4: 500, 5: 2000, 6: 7800, 7: 3000, 8: 2300, 9: 2300, 10: 700, 11: 2300, 12: 2600, 13: 3000, 14: 700, 15: 700, 16: 2500 };
     for(const k in dens) DENSITY[k] = dens[k];
 }
 const G = 9.81;
