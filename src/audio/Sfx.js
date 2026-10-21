@@ -501,6 +501,7 @@ export class Sfx {
         game.on('build', ({ size, owner, center }) => owner === me() ? this.play('build', { size: Math.cbrt(size[0] * size[1] * size[2]) }) : this.at('build', center, {}, 0.1));
         game.on('rip', ({ mat }) => this.play('rip', { family: fam(mat) }));
         game.on('shatter', ({ point, mat }) => this.at('shatter', point, { family: fam(mat) }, 0, 150));
+        game.on('slam', ({ point, mat }) => this.at('shatter', point, { family: fam(mat) }, 0, 150));
         game.on('damage', ({ actor, amount, by }) => {
             if(actor === me()) this.play('hurt', { damage: amount }, 0.08);
             else if(by === me()) this.play('hitmark', { kill: actor.health <= 0 });

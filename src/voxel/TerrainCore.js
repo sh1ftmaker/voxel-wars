@@ -32,6 +32,7 @@ import { VoxelWorld } from './VoxelWorld.js';
 import { voxelize } from './voxelize.js';
 import { brushFromSpec } from './brushes.js';
 import { findIslands, detachIsland, stampGrid, splitGrid, voronoiLabels, gridPrep, carveGrid } from './islands.js';
+import { findUnsupported } from './support.js';
 import { cellSampleLabels } from '../softbody/lattice.js';
 import { findCollapses } from './structure.js';
 import { Level } from '../level/fortwar.js';
@@ -86,37 +87,35 @@ export class TerrainCore {
         const w = this.world, brush = brushFromSpec(msg.spec);
         const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness });
         const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [] };
-        if(msg.conn && msg.op === 'carve' && r.changed) {
-            const t0 = performance.now();
-            const res = findIslands(w, r.box[0], r.box[1], { erode: msg.erode ?? 0, near: brush });
-            for(const isl of res.islands) {
-                const small = isl.count < msg.debris;
+        const detach = (list) => {
+            for(const isl of list) {
+                const small = isl.count < (msg.debris ?? 16);
                 const d = detachIsland(w, isl, { keepGrid: !small });
                 if(!d.count) continue;
                 if(small || !d.grid.count) { reply.dust.push({ center: isl.min.map((v, a) => (v + isl.max[a]) * 0.5 * VOXEL), removed: d.removed }); continue; }
                 const g = d.grid;
                 g.prep = gridPrep(g, 0);
                 transfer.push(g.sdf.buffer, g.mat.buffer);
-                reply.islands.push({ grid: g, dirty: [...d.dirty] });
+                reply.islands.push({ grid: g, dirty: [...d.dirty], support: !!isl.support, collapse: isl.collapse });
             }
+        };
+        if(msg.conn && msg.op === 'carve' && r.changed) {
+            const t0 = performance.now();
+            detach(findIslands(w, r.box[0], r.box[1], { erode: msg.erode ?? 0, near: brush }).islands);
             reply.islandsMs = performance.now() - t0;
             // structural failure: overhangs still attached but too weak to hold themselves (src/voxel/structure.js)
             if(msg.collapse !== false) {
                 const t1 = performance.now();
                 const col = findCollapses(w, r.box[0], r.box[1]);
-                for(const isl of col.islands) {
-                    const small = isl.count < msg.debris;
-                    const d = detachIsland(w, isl, { keepGrid: !small });
-                    if(!d.count) continue;
-                    if(small || !d.grid.count) { reply.dust.push({ center: isl.min.map((v, a) => (v + isl.max[a]) * 0.5 * VOXEL), removed: d.removed }); continue; }
-                    const g = d.grid;
-                    g.prep = gridPrep(g, 0);
-                    transfer.push(g.sdf.buffer, g.mat.buffer);
-                    reply.islands.push({ grid: g, dirty: [...d.dirty], collapse: isl.collapse });
-                }
+                detach(col.islands);
                 reply.collapseMs = performance.now() - t1;
                 reply.collapseChecked = col.checked;
             }
+        }
+        if(msg.support === true && r.changed) { // the older reach-based check (src/voxel/support.js), opt-in; structure.js is the default
+            const sup = findUnsupported(w, r.box[0], r.box[1]);
+            detach(sup.islands);
+            reply.supportMs = sup.ms;
         }
         return reply;
     }

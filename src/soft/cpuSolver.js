@@ -8,7 +8,8 @@
  * The GPU runs 4 iterations at 240 Hz; this runs fewer, so the materials' per-iteration stiffness is rescaled to give
  * the same pull per second (stiffness' = 1 - (1 - stiffness)^(960 / (rate * iterations))).
  *
- * Parameters arrive as the same packed vec4 array as the GPU parameter buffer (slotA/B/C, kickA/B/C: see SoftSim.js).
+ * Parameters arrive as the same packed vec4 array as the GPU parameter buffer (slotA/B/C, kickA/B/C: see SoftSim.js;
+ * slotC.y is the slot's cell size in metres, slotC.z its plasticity scale, kickC.z a ring kick's inner radius).
  */
 import { MATERIALS } from '../voxel/materials.js';
 import { H, MAX_ZONES, NODE_CAP, CELL_CAP, TET_OFF, F_ACTIVE, F_PINNED } from './core.js';
@@ -21,7 +22,7 @@ export const MAXV_PER_S = 14.4;   // m/s: clamp on a node's speed
 
 class Slot {
     constructor() {
-        this.n = [0, 0, 0]; this.count = 0;
+        this.n = [0, 0, 0]; this.count = 0; this.h = H;
         this.pos = new Float32Array(NODE_CAP * 3); this.prev = new Float32Array(NODE_CAP * 3);
         this.old = new Float32Array(NODE_CAP * 3); this.rest = new Float32Array(NODE_CAP * 3);
         this.sum = new Float32Array(NODE_CAP * 3); this.wsum = new Float32Array(NODE_CAP);
@@ -56,9 +57,10 @@ export class CpuSoft {
         // tet corner offsets as (dx, dy, dz) in nodes: TET_OFF bits -> per parity, tet, corner
         this.tetOff = Int32Array.from(TET_OFF);
         this._Pq = new Float64Array(12); this._Rr = new Float64Array(12);
-        // corner offsets (m) of tet l's corners in a cell of parity p: XT[(p * 5 + l) * 12 + k * 3 + axis]
+        // corner offsets (cells) of tet l's corners in a cell of parity p: XT[(p * 5 + l) * 12 + k * 3 + axis] (times the
+        // slot's cell size: Slot.xt)
         this.XT = new Float64Array(120);
-        for(let i = 0; i < 40; i++) { const o = TET_OFF[i]; this.XT[i * 3] = (o & 1) * H; this.XT[i * 3 + 1] = ((o >> 1) & 1) * H; this.XT[i * 3 + 2] = ((o >> 2) & 1) * H; }
+        for(let i = 0; i < 40; i++) { const o = TET_OFF[i]; this.XT[i * 3] = o & 1; this.XT[i * 3 + 1] = (o >> 1) & 1; this.XT[i * 3 + 2] = (o >> 2) & 1; }
     }
 
     /** A zone's lattice (from classifyZone). `init`: zero its state (a new zone) or keep the motion (a refresh). */
@@ -106,7 +108,7 @@ export class CpuSoft {
         P.set([1.5, 3, 1.5, 2], P_KICKA * 4); P.set([0, -1, 0, 5], P_KICKB * 4);
         this.upload(0, { n, flags, cellIdx, cells, count }, true);
         for(let f = 0; f < 40; f++) this.step(1, 1 / 60, f === 0);
-        this.write(new Float32Array((MAX_ZONES * NODE_CAP + 2 * MAX_ZONES) * 4));
+        this.write(new Float32Array((MAX_ZONES * NODE_CAP + 3 * MAX_ZONES) * 4));
         this.read(0, nodes);
         P.set(keep);
         this.slots[0].reset();
@@ -120,13 +122,21 @@ export class CpuSoft {
         for(let s = 0; s < MAX_ZONES; s++) {
             if(P[(P_SLOTA + s) * 4 + 3] !== 1) continue;
             const S = this.slots[s];
-            const extra = P[(P_SLOTC + s) * 4];
+            const extra = P[(P_SLOTC + s) * 4], plastic = P[(P_SLOTC + s) * 4 + 2];
+            this._setH(S, P[(P_SLOTC + s) * 4 + 1] || H);
             for(let i = 0; i < substeps; i++) {
-                this._predict(S, dt, extra);
+                this._predict(S, dt, extra, plastic);
                 for(const om of this.omegas) { this._tets(S); this._project(S, om); work += S.count * 5; }
             }
         }
         return work;
+    }
+
+    /** The slot's cell size: its tet corner offsets in metres (S.xt). */
+    _setH(S, h) {
+        if(S.xt && S.h === h) return;
+        S.h = h;
+        S.xt = this.XT.map(v => v * h);
     }
 
     _kicks(dt) {
@@ -135,18 +145,20 @@ export class CpuSoft {
             const a = (P_KICKA + k) * 4, b = (P_KICKB + k) * 4, c = (P_KICKC + k) * 4;
             const R = P[a + 3];
             if(!(R > 0)) continue;
-            const s = P[c] | 0, up = P[c + 1], S = this.slots[s];
+            const s = P[c] | 0, up = P[c + 1], rin = P[c + 2], S = this.slots[s];
             if(P[(P_SLOTA + s) * 4 + 3] !== 1) continue;
+            const h = P[(P_SLOTC + s) * 4 + 1] || H, half = (R - rin) * 0.5, mid = rin + half;
             const ox = P[(P_SLOTA + s) * 4], oy = P[(P_SLOTA + s) * 4 + 1], oz = P[(P_SLOTA + s) * 4 + 2];
             const NX = S.n[0] + 1, NXY = NX * (S.n[1] + 1);
             const dl = Math.hypot(P[b], P[b + 1], P[b + 2]), speed = P[b + 3];
             for(let j = 0; j < S.nActive; j++) {
                 const i = S.active[j];
                 const lx = i % NX, ly = ((i / NX) | 0) % (S.n[1] + 1), lz = (i / NXY) | 0;
-                const dx = ox + lx * H - P[a], dy = oy + ly * H - P[a + 1], dz = oz + lz * H - P[a + 2];
+                const dx = ox + lx * h - P[a], dy = oy + ly * h - P[a + 1], dz = oz + lz * h - P[a + 2];
                 const r = Math.sqrt(dx * dx + dy * dy + dz * dz);
-                if(r >= R) continue;
-                const f1 = 1 - r / R, fall = f1 * f1 * (3 - 2 * f1);
+                if(r >= R || r <= rin) continue;
+                // a disc (smoothstep falloff) or, with an inner radius, a ring band
+                const f1 = rin > 0 ? 1 - Math.abs(r - mid) / half : 1 - r / R, fall = f1 * f1 * (3 - 2 * f1);
                 let vx, vy, vz;
                 if(dl > 0.01) { vx = P[b]; vy = P[b + 1]; vz = P[b + 2]; }
                 else { vx = dx; vy = dy + R * up + 1e-4; vz = dz; const l = Math.hypot(vx, vy, vz); vx /= l; vy /= l; vz /= l; }
@@ -156,7 +168,7 @@ export class CpuSoft {
         }
     }
 
-    _predict(S, dt, extra) {
+    _predict(S, dt, extra, plastic = 1) {
         const { pos, prev, old, rest, flags, active } = S, mat = this.mat;
         const maxv = MAXV_PER_S * dt;
         for(let j = 0; j < S.nActive; j++) {
@@ -166,7 +178,7 @@ export class CpuSoft {
             let vx = (px - prev[o]) * damp, vy = (py - prev[o + 1]) * damp, vz = (pz - prev[o + 2]) * damp;
             const vl = Math.sqrt(vx * vx + vy * vy + vz * vz);
             if(vl > maxv) { const f = maxv / vl; vx *= f; vy *= f; vz *= f; }
-            const plast = mat[m + 2];
+            const plast = mat[m + 2] * plastic;
             if(plast > 0) {
                 const dx = px - rest[o], dy = py - rest[o + 1], dz = pz - rest[o + 2];
                 const dl = Math.sqrt(dx * dx + dy * dy + dz * dz), yld = mat[m + 3];
@@ -183,7 +195,7 @@ export class CpuSoft {
     /** Per tet shape matching; each corner's goal displacement (weighted) is added to its node's sum (the weight
      *  sums per node are fixed: S.wsum, from upload). */
     _tets(S) {
-        const { pos, rest, sum, tetN, tetX, tetQ } = S, XT = this.XT, mat = this.mat, cells = S.cells;
+        const { pos, rest, sum, tetN, tetX, tetQ } = S, XT = S.xt, mat = this.mat, cells = S.cells;
         sum.fill(0, 0, S.nodes * 3);
         const Pq = this._Pq, Rr = this._Rr;
         for(let c = 0, t = 0; c < S.count; c++) {
@@ -265,16 +277,17 @@ export class CpuSoft {
         }
     }
 
-    /** Write slot displacements (RGBA per node, slot-major, NODE_CAP per slot) and the slot parameters (2 texels per
-     *  slot after the nodes) into `out`, the data of the deformation texture. */
+    /** Write slot displacements (RGBA per node, slot-major, NODE_CAP per slot) and the slot parameters (3 texels per
+     *  slot after the nodes: slotA, slotB, slotC) into `out`, the data of the deformation texture. */
     write(out) {
         const P = this.P;
         for(let s = 0; s < MAX_ZONES; s++) {
             const a = (P_SLOTA + s) * 4, mode = P[a + 3], S = this.slots[s];
-            const pb = (MAX_ZONES * NODE_CAP + s * 2) * 4;
+            const pb = (MAX_ZONES * NODE_CAP + s * 3) * 4;
             out[pb] = P[a]; out[pb + 1] = P[a + 1]; out[pb + 2] = P[a + 2]; out[pb + 3] = mode;
-            const b = (P_SLOTB + s) * 4;
+            const b = (P_SLOTB + s) * 4, c = (P_SLOTC + s) * 4;
             out[pb + 4] = P[b]; out[pb + 5] = P[b + 1]; out[pb + 6] = P[b + 2]; out[pb + 7] = P[b + 3];
+            out[pb + 8] = P[c]; out[pb + 9] = P[c + 1] || H; out[pb + 10] = P[c + 2]; out[pb + 11] = P[c + 3];
             if(!(mode > 0)) continue;
             const nodes = (S.n[0] + 1) * (S.n[1] + 1) * (S.n[2] + 1), pos = S.pos;
             let o = s * NODE_CAP * 4;

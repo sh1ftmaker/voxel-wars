@@ -36,7 +36,8 @@
  *   - budget: over maxBodies (48), the stillest bodies are stamped early and small moving ones are pulverized; near
  *     the cap fractures make fewer pieces and more dust.
  *   - bodies leaving the world are removed; bodies the game removes (physics.removeBody) are forgotten.
- *   - a kinematic body (held by a player) or one with userData.held never settles or fractures.
+ *   - a kinematic body (held by a player) or one with userData.held never settles or fractures; one with
+ *     userData.thrown (a thrown rock) only cracks along its soft lattice, it never shatters.
  */
 import { VOXEL, CHUNK } from '../config.js';
 import { MATERIALS } from '../voxel/materials.js';
@@ -670,7 +671,8 @@ export class VoxelBodies {
                 }
                 if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > brk) {
                     // under SHATTER: let the soft lattice crack it (crack()), with a Voronoi fallback if it holds
-                    const soft = this.soft.enabled && energy < SHATTER && vb.softRec?.state !== 'dead';
+                    // (a thrown body always cracks rather than bursting: Combat.throwHeld)
+                    const soft = this.soft.enabled && (energy < SHATTER || vb.prop.userData.thrown) && vb.softRec?.state !== 'dead';
                     if(soft) { if(!vb.crackWait || vb.crackWait.dv < dv) vb.crackWait = { t: vb.age, point, dv, energy }; }
                     else {
                         // no soft layer (off, or too big for one): cleave into a few pieces; only extreme hits shatter
@@ -697,7 +699,7 @@ export class VoxelBodies {
             if(cw && vb.age - cw.t > CRACK_WAIT) {
                 vb.crackWait = null;
                 // the lattice held: a hit far over the threshold shatters it after all
-                if(cw.energy >= CRACK_FALLBACK && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb))
+            if(cw.energy >= CRACK_FALLBACK && !vb.prop.userData.thrown && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb))
                     this.breaks.set(vb, [cw.point, cw.dv, null, Math.min(CLEAVE, 2 + Math.floor(cw.energy / 4))]);
             }
             const b = vb.body;

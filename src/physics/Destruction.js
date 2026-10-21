@@ -3,9 +3,10 @@
  * push physics bodies around, detect what lost its support, and announce what was destroyed.
  *
  * API (gameplay depends on these signatures):
- *   destruction.carve(brush, { op = 'carve', mat, hardness = true, author, impulse })
+ *   destruction.carve(brush, { op = 'carve', mat, hardness = true, author, impulse, kind, dir })
  *       brush from src/voxel/brushes.js. Returns { removed: Float64Array m³ per material, volume, added, center, box }.
- *       `impulse` (number) also kicks dynamic bodies near the brush outward.
+ *       `impulse` (number) also kicks dynamic bodies near the brush outward. `dir` (unit vector): the blow's direction (a
+ *       punch: the soft ground is driven in along it).
  *       A carve also cuts every voxel body it overlaps (and splits bodies cut in two), then queues a check of the
  *       terrain around the edit for regions that lost their support: those become bodies over the next few frames
  *       ('detached'), pushed by the blast's impulse.
@@ -41,13 +42,13 @@ export class Destruction {
         this.seed = 1;
         this.bodies = new VoxelBodies(ctx);
         this.brushes = brushes; // the brush constructors (src/voxel/brushes.js), for tools and tests
-        /** Soft ground (src/soft/SoftGround.js) and other observers: fn({ op, center, size, impulse, kind, changed, box })
+        /** Soft ground (src/soft/SoftGround.js) and other observers: fn({ op, center, size, impulse, kind, changed, box, dir })
          *  after every carve / add (box in metres). */
         this.editHooks = [];
     }
     carve(brush, opts = {}) {
         if(this.ctx.world.remote) return this._carveRemote(brush, opts);
-        const { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve' } = opts;
+        const { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve', dir = null } = opts;
         const { world, physics, events } = this.ctx;
         const r = world.applyBrush(brush, { op, mat, hardness });
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
@@ -67,7 +68,7 @@ export class Destruction {
         const result = { removed, volume, added: r.added, center, box, changed: r.changed, detached };
         if(this.editHooks.length) {
             const size = Math.max(...brush.max.map((v, i) => v - brush.min[i])) / 2;
-            for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box }); } catch(e) { console.error(e); }
+            for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box, dir }); } catch(e) { console.error(e); }
         }
         if(volume > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box, removed, volume, author, kind } }));
         result.done = Promise.resolve(result);
@@ -79,7 +80,7 @@ export class Destruction {
      * at once is provisional (removed / volume count the bodies only, changed 0, box the brush's); `result.done`
      * resolves to the final one, and 'destroyed', 'detached' and the edit hooks fire then.
      */
-    _carveRemote(brush, { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve' } = {}) {
+    _carveRemote(brush, { op = 'carve', mat = 1, hardness = true, author = null, impulse = 0, kind = 'carve', dir = null } = {}) {
         const { world, physics, events } = this.ctx;
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
         const removed = new Float64Array(256);
@@ -106,7 +107,7 @@ export class Destruction {
             bodies.fromWorker(rep, kick);
             if(this.editHooks.length) {
                 const size = Math.max(...brush.max.map((x, i) => x - brush.min[i])) / 2;
-                for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box }); } catch(e) { console.error(e); }
+                for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box, dir }); } catch(e) { console.error(e); }
             }
             if(v > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box, removed, volume: v, author, kind } }));
             return result;

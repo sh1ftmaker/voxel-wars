@@ -5,7 +5,8 @@
  *
  * Game events emitted (game.emit): 'explosion' { center, radius, kind, owner }, 'rocket' { origin, owner },
  * 'punch' { point, kind: 'terrain'|'prop'|'actor'|'air', mat }, 'dig' { point, volume }, 'build' { center, size },
- * 'rip' { prop }, 'throw' { kind, owner }, 'shatter' { point, mat }, 'bounce' { kind, point, impact }.
+ * 'rip' { prop }, 'throw' { kind, owner }, 'slam' { point, mat, volume, speed } (a thrown rock lands its hit),
+ * 'bounce' { kind, point, impact }.
  */
 import * as THREE from 'three/webgpu';
 import { rock, capsule, box } from '../../voxel/brushes.js';
@@ -13,6 +14,8 @@ import { MATERIALS } from '../../voxel/materials.js';
 import { WEAPONS, SELF_DAMAGE_SCALE, BOT_DAMAGE_SCALE } from './defs.js';
 
 const _v = new THREE.Vector3();
+/** m/s added each frame to the ground under a lump being torn out (src/soft: SoftGround.pull). */
+const RIP_PULL = 1.6;
 const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
 
 export class Combat {
@@ -174,6 +177,9 @@ export class Combat {
                 const m = b.mass(), s = def.propSpeed * Math.min(1, 60 / Math.max(m, 1)) + 4;
                 b.applyImpulse({ x: dir[0] * s * m, y: (dir[1] + 0.35) * s * m, z: dir[2] * s * m }, true);
                 b.applyTorqueImpulse({ x: (Math.random() - 0.5) * m, y: (Math.random() - 0.5) * m, z: (Math.random() - 0.5) * m }, true);
+                // a voxel body's soft layer: the far side lags behind the fist (a jiggle at least as big as a 6 m/s hit)
+                const vb = hit.prop.userData?.voxelBody, k = Math.max(s, 6);
+                if(vb) this.ctx.destruction.bodies?.soft?.impact(vb, hit.point, [dir[0] * k, (dir[1] + 0.35) * k, dir[2] * k], 1);
             }
             this.game.emit('punch', { point: hit.point, kind: 'prop', owner, mat: hit.prop.userData?.mat ?? 10 });
             return 'prop';
@@ -182,7 +188,7 @@ export class Combat {
         const p = hit.point;
         const c = [p[0] + dir[0] * 0.35, p[1] + dir[1] * 0.35, p[2] + dir[2] * 0.35];
         const mat = this.ctx.world.materialAt(p[0] + dir[0] * 0.1, p[1] + dir[1] * 0.1, p[2] + dir[2] * 0.1);
-        const res = this.ctx.destruction.carve(rock(c, def.radius, this.seed++), { author: owner?.name ?? null, impulse: 5, kind: 'carve' });
+        const res = this.ctx.destruction.carve(rock(c, def.radius, this.seed++), { author: owner?.name ?? null, impulse: 5, kind: 'carve', dir });
         // the terrain edit runs in the terrain worker: the stone counts once it is done
         res.done.then(r => owner?.addStone?.(r.volume));
         this.game.emit('punch', { point: p, kind: 'terrain', owner, mat, volume: res.volume });
@@ -222,23 +228,58 @@ export class Combat {
         if(!m) { m = new THREE.MeshStandardNodeMaterial({ color: MATERIALS[mat]?.color ?? 0x888888, roughness: 0.9, flatShading: true }); this.rockMats.set(mat, m); }
         return m;
     }
-    /** Rip a lump out of the terrain (or grab a loose body) in front of the owner. Returns a held prop or null. */
+    /** Rip a lump out of the terrain (or grab a loose body) in front of the owner at once (bots). Returns a held prop
+     *  or null. The player tears it out over a moment instead: startRip, pullRip each frame, finishRip. */
     rip(owner, origin, dir) {
+        const r = this.startRip(owner, origin, dir);
+        if(!r) return null;
+        return r.prop || this.finishRip(owner, r, [0, 1, 0]);
+    }
+    /**
+     * Take hold of what is in front of the owner: { prop } for a loose body, or a tear for the ground
+     * { point, center, mat, g (soft ground handle or null), dur (s it holds on: harder matter longer) }; null for
+     * nothing (or bedrock).
+     */
+    startRip(owner, origin, dir) {
         const def = WEAPONS.grab;
         const hit = this.raycast(origin, dir, def.reach, owner);
         if(!hit || hit.actor) return null;
         if(hit.prop) {
             const ud = hit.prop.userData || {};
             if(ud.crate || ud.kind) return null;   // crates are carried by walking into them, bombs are not toys
-            return hit.prop.body.isDynamic() ? hit.prop : null;
+            return hit.prop.body.isDynamic() ? { prop: hit.prop } : null;
         }
         const p = hit.point;
         const c = [p[0] + dir[0] * 0.45, p[1] + dir[1] * 0.45, p[2] + dir[2] * 0.45];
         const mat = this.ctx.world.materialAt(p[0] + dir[0] * 0.1, p[1] + dir[1] * 0.1, p[2] + dir[2] * 0.1);
+        const hard = MATERIALS[mat]?.hardness ?? 1;
+        if(hard === Infinity) return null;
+        const g = this.ctx.soft?.grab?.(c, def.radius) || null;
+        return { point: p, center: c, mat, g, dur: g ? 0.14 + 0.07 * Math.min(6, hard) : 0 };
+    }
+    /** A frame of tearing: the soft ground is dragged along `dir` (toward the hand). */
+    pullRip(tear, dir, dt) {
+        if(tear.g) this.ctx.soft.pull(tear.g, dir, RIP_PULL * Math.min(2, dt * 60));
+    }
+    /** The ground lets go: the lump comes out as a body (null if there was nothing), the rim springs back. */
+    finishRip(owner, tear, dir) {
+        const def = WEAPONS.grab, { point: p, center: c, mat } = tear;
         let prop = null;
         try { prop = this.ctx.destruction.rip?.(c, def.radius, { author: owner?.name ?? null }) || null; } catch(e) { console.warn('rip failed', e); prop = null; }
-        if(prop) { prop.userData ||= {}; prop.userData.mat ??= mat; this.game.emit('rip', { prop, point: p, mat }); return prop; }
-        // fallback until Destruction.rip lands: carve a lump and make a boulder of what came out
+        if(tear.g) this.ctx.soft.tear(tear.g, dir, 7);
+        if(prop) {
+            prop.userData ||= {}; prop.userData.mat ??= mat;
+            if(tear.g) {
+                // it comes out where the stretched ground drew it, still wobbling from the pull
+                const t = prop.body.translation(), lift = 0.45;
+                prop.body.setTranslation({ x: t.x + dir[0] * lift, y: t.y + dir[1] * lift, z: t.z + dir[2] * lift }, true);
+                const vb = prop.userData.voxelBody;
+                if(vb) this.ctx.destruction.bodies?.soft?.impact(vb, [c[0] - dir[0], c[1] - dir[1], c[2] - dir[2]], [dir[0] * 8, dir[1] * 8, dir[2] * 8], 1);
+            }
+            this.game.emit('rip', { prop, point: p, mat });
+            return prop;
+        }
+        // no voxel body came out: carve a lump and make a boulder of what came out
         const res = this.ctx.destruction.carve(rock(c, def.radius, this.seed++), { author: owner?.name ?? null, kind: 'carve' });
         if(res.volume < 0.08) return null;
         let best = 1, bv = 0;
@@ -268,6 +309,8 @@ export class Combat {
         b.setLinvel({ x: dir[0] * speed + ov.x * 0.5, y: dir[1] * speed + 3, z: dir[2] * speed + ov.z * 0.5 }, true);
         b.setAngvel({ x: Math.random() * 10 - 5, y: Math.random() * 10 - 5, z: Math.random() * 10 - 5 }, true);
         owner?.ignoreTemp?.(prop.collider.handle, 0.35);
+        // VoxelBodies: a thrown body cracks along its soft lattice when it hits hard, it never bursts into rubble
+        prop.userData.thrown = true;
         this.thrown.push({ prop, owner, age: 0, prevV: [b.linvel().x, b.linvel().y, b.linvel().z] });
         this.game.emit('throw', { kind: 'rock', owner });
     }
@@ -283,37 +326,42 @@ export class Combat {
         for(let i = this.thrown.length - 1; i >= 0; i--) {
             const t = this.thrown[i];
             t.age += dt;
-            if(t.smackAt) { const at = t.smackAt; t.smackAt = null; this.smack(t, at); }
-            if(!this.ctx.physics.props.has(t.prop)) { this.thrown.splice(i, 1); continue; } // settled into the terrain, or cracked into pieces
+            if(!this.ctx.physics.props.has(t.prop)) { this.thrown.splice(i, 1); continue; } // cracked into pieces, settled or pulverized
             const b = t.prop.body, p = b.translation(), v = b.linvel();
             const dv = Math.hypot(v.x - t.prevV[0], v.y - t.prevV[1], v.z - t.prevV[2]);
             const speed = Math.hypot(t.prevV[0], t.prevV[1], t.prevV[2]);
             t.prevV[0] = v.x; t.prevV[1] = v.y; t.prevV[2] = v.z;
-            if(t.age > 0.06 && dv > def.shatterSpeed && speed > def.shatterSpeed) this.smack(t, [p.x, p.y, p.z], speed);
-            // a direct hit on an enemy: damage and knockback by the lump's speed and size (once per actor)
-            if(speed > 8) for(const a of this.game.actors) {
-                if(!a.alive || a === t.owner || a.team === t.owner?.team || t.hit?.has(a)) continue;
-                const c = a.body.center;
-                if(Math.abs(c.x - p.x) < 1.2 && Math.abs(c.z - p.z) < 1.2 && Math.abs(c.y - p.y) < 1.6) {
-                    if(!t.hit) t.hit = new Set();
-                    t.hit.add(a);
-                    const k = Math.min(1.5, speed / def.throwSpeed) * Math.min(1.5, 0.6 + Math.cbrt(t.prop.userData?.volume ?? 1) * 0.4);
-                    const s = Math.max(speed, 1e-3);
-                    let dmg = def.damage * k;
-                    if(t.owner && !t.owner.isPlayer && a.isPlayer) dmg *= BOT_DAMAGE_SCALE;
-                    this.game.damage(a, dmg, t.owner, [v.x / s * def.knock * k, (Math.max(0, v.y / s) + 0.4) * def.knock * k, v.z / s * def.knock * k], 'rock');
-                    this.smack(t, [p.x, p.y, p.z], speed);
+            if(!t.slammed) {
+                let hit = t.slamAt || (t.age > 0.06 && dv > def.shatterSpeed && speed > def.shatterSpeed ? [p.x, p.y, p.z] : null);
+                // a direct hit on an enemy
+                if(!hit && speed > 8) for(const a of this.game.actors) {
+                    if(!a.alive || a === t.owner || a.team === t.owner?.team) continue;
+                    const c = a.body.center;
+                    if(Math.abs(c.x - p.x) < 1.2 && Math.abs(c.z - p.z) < 1.2 && Math.abs(c.y - p.y) < 1.6) { hit = [p.x, p.y, p.z]; break; }
                 }
+                if(hit) { t.slammed = true; this.slam(t, hit, Math.max(speed, def.shatterSpeed)); }
             }
             if(t.age > 6 || (t.age > 0.5 && speed < 1.5)) this.thrown.splice(i, 1); // came to rest: plain rubble now
         }
     }
-    /** A thrown lump hits something hard: chips and a crack sound. It stays a physics body (VoxelBodies bends it and,
-     *  over its break threshold, cracks it into a few pieces); no crater. */
-    smack(t, at, speed = 20) {
-        if(t.smackT !== undefined && t.age - t.smackT < 0.15) return; // one per bounce
-        t.smackT = t.age;
-        this.game.emit('shatter', { point: at, mat: t.prop.userData?.mat ?? 1, volume: Math.min(0.6, speed / 60) });
+    /** A thrown lump lands its hit: whoever it strikes takes damage and knockback (no blast: the rock stays a body
+     *  and cracks only if the hit was hard enough for its lattice). */
+    slam(t, point, speed) {
+        const def = WEAPONS.grab, vol = t.prop.userData?.volume ?? 1;
+        const reach = 1.1 + Math.cbrt(vol) * 0.55, f0 = Math.min(1, speed / def.throwSpeed + 0.3);
+        for(const a of this.game.actors) {
+            if(!a.alive || a === t.owner) continue;
+            const c = a.body.center;
+            const d = Math.hypot(c.x - point[0], c.y - point[1], c.z - point[2]);
+            if(d > reach + 0.6) continue;
+            const f = f0 * Math.min(1, 1.2 - d / (reach + 0.6) * 0.6);
+            const dir = d > 1e-3 ? [(c.x - point[0]) / d, (c.y - point[1]) / d, (c.z - point[2]) / d] : [0, 1, 0];
+            let dmg = def.damage * f;
+            if(t.owner && !t.owner.isPlayer && a.isPlayer) dmg *= BOT_DAMAGE_SCALE;
+            if(t.owner && t.owner.team === a.team) dmg = 0;
+            this.game.damage(a, dmg, t.owner, [dir[0] * def.knock * f, Math.max(dir[1], 0.4) * def.knock * f, dir[2] * def.knock * f], 'rock');
+        }
+        this.game.emit('slam', { point, mat: t.prop.userData?.mat ?? 1, volume: vol, speed });
     }
 
     update(dt) {
@@ -323,11 +371,11 @@ export class Combat {
     }
 }
 
-/** 'impact' from physics: a thrown lump that hits hard smacks (chips, sound) where it hit. */
+/** 'impact' from physics: a thrown prop that hits hard lands its blow there. */
 function ctx_events(combat) {
     combat.ctx.events.addEventListener('impact', (e) => {
         const d = e.detail; if(!d?.prop) return;
         const t = combat.thrown.find(t => t.prop === d.prop);
-        if(t && t.age > 0.06 && d.speed > WEAPONS.grab.shatterSpeed * 0.7) t.smackAt = d.point; // handled in update (not inside the physics step)
+        if(t && t.age > 0.06 && d.speed > WEAPONS.grab.shatterSpeed * 0.7) t.slamAt = d.point; // handled in update (not inside the physics step)
     });
 }

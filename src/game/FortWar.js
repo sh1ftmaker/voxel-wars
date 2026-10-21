@@ -5,7 +5,7 @@
  * effects and the sounds, and exposes itself as ctx.game for tests.
  *
  * Game events (game.on / game.emit; also dispatched on ctx.events): explosion, rocket, punch, dig, build, rip, throw,
- * shatter, bounce, fuse, fired, tool, hint, damage { actor, amount, by, cause }, death { actor, by, cause },
+ * slam, bounce, fuse, fired, tool, hint, damage { actor, amount, by, cause }, death { actor, by, cause },
  * respawn { actor }, pickup { crate, actor, from }, deposit { crate, actor }, step, jump, land, matchOver { result }.
  *
  * URL: ?bots=N (0..5, default 3), ?minutes=M (default 10), ?music=0, ?touch=1 (force touch controls).
