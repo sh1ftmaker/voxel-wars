@@ -11,6 +11,7 @@ import * as THREE from 'three/webgpu';
 
 export const PLAYER_GRAVITY = 8 * 9.81;     // WorldParty: players fall at 8 g, bodies at 30 m/s²
 const COYOTE = 0.1;
+const STEP_UP = 0.6;          // tallest ledge (or collider seam) walked over without jumping
 
 export class CharacterBody {
     constructor(ctx, { position = [0, 0, 0], radius = 0.4, halfHeight = 0.5, gravity = PLAYER_GRAVITY, owner = null } = {}) {
@@ -29,11 +30,12 @@ export class CharacterBody {
         this.body = rw.createRigidBody(R.RigidBodyDesc.kinematicPositionBased().setTranslation(this.center.x, this.center.y, this.center.z));
         this.collider = rw.createCollider(R.ColliderDesc.capsule(halfHeight, radius).setFriction(0), this.body);
         this.collider.userData = { actor: owner };
-        this.cc = rw.createCharacterController(0.03);
-        this.cc.enableAutostep(0.55, 0.15, true);
-        this.cc.enableSnapToGround(0.35);
-        this.cc.setMaxSlopeClimbAngle(55 * Math.PI / 180);
-        this.cc.setMinSlopeSlideAngle(65 * Math.PI / 180);
+        this.cc = rw.createCharacterController(0.05);
+        // voxel terrain is a field of small facets and ledges: step over anything knee high, even narrow tops
+        this.cc.enableAutostep(0.6, 0.05, true);
+        this.cc.enableSnapToGround(0.5);
+        this.cc.setMaxSlopeClimbAngle(60 * Math.PI / 180);
+        this.cc.setMinSlopeSlideAngle(70 * Math.PI / 180);
         this.cc.setApplyImpulsesToDynamicBodies(true);
         this.cc.setCharacterMass(90);
         this.cc.setSlideEnabled(true);
@@ -105,13 +107,24 @@ export class CharacterBody {
         this.collider.setTranslation(this.center);
         const desired = this._desired; desired.x = v.x * dt; desired.y = v.y * dt; desired.z = v.z * dt;
         this.cc.computeColliderMovement(this.collider, desired, this.R.QueryFilterFlags.EXCLUDE_SENSORS, undefined, this.filter);
-        const m = this.cc.computedMovement(this._moved);
+        let m = this.cc.computedMovement(this._moved);
+        let ground = this.cc.computedGrounded();
+        // Blocked on the ground: retry the step from higher up and settle back down. The terrain is many trimesh
+        // colliders, and Rapier's controller catches on the seams between them and on small ledges the voxel surface
+        // leaves (its autostep needs a clean step); lifting over them keeps walking smooth up any walkable slope.
+        const want = Math.hypot(desired.x, desired.z);
+        if((this.grounded || ground) && want > 1e-4 && Math.hypot(m.x, m.z) < want * 0.6) {
+            const r = this._stepUp(desired);
+            if(r) { m = r; ground = true; }
+        }
         const wasGrounded = this.grounded;
-        this.grounded = this.cc.computedGrounded() && v.y <= 0.5;
-        // blocked: drop the velocity the obstacle ate
-        if(dt > 0) {
-            if(Math.abs(m.x) < Math.abs(desired.x) - 1e-4) v.x = m.x / dt;
-            if(Math.abs(m.z) < Math.abs(desired.z) - 1e-4) v.z = m.z / dt;
+        this.grounded = ground && v.y <= 0.5;
+        // blocked: drop the velocity the obstacle ate. Not while climbing: a slope turns part of the step into height,
+        // and taking that off the speed every frame stalled the player halfway up any ramp
+        const climbing = m.y > Math.max(desired.y, 0) + 1e-4;
+        if(dt > 0 && !climbing) {
+            const want = Math.hypot(desired.x, desired.z), got = Math.hypot(m.x, m.z);
+            if(got < want * 0.2) { if(Math.abs(m.x) < Math.abs(desired.x) - 1e-4) v.x = m.x / dt; if(Math.abs(m.z) < Math.abs(desired.z) - 1e-4) v.z = m.z / dt; }
             if(desired.y > 0 && m.y < desired.y * 0.5) v.y = Math.min(v.y, 0);           // head bump
         }
         if(this.grounded) {
@@ -121,6 +134,36 @@ export class CharacterBody {
         } else this.airTime += dt;
         this.center.x += m.x; this.center.y += m.y; this.center.z += m.z;
         this.body.setNextKinematicTranslation(this.center);
+    }
+
+    /** Move by `desired` horizontally after lifting up to STEP_UP, then drop back onto the ground. Returns the total
+     *  movement (into this._stepMoved) if that got further than the plain move and lands on walkable ground, else null. */
+    _stepUp(desired) {
+        const cc = this.cc, col = this.collider, c = this.center, flags = this.R.QueryFilterFlags.EXCLUDE_SENSORS;
+        const d = this._d2 ??= { x: 0, y: 0, z: 0 }, out = this._stepMoved ??= { x: 0, y: 0, z: 0 }, tmp = this._tmpV ??= { x: 0, y: 0, z: 0 };
+        const p = this._p2 ??= { x: 0, y: 0, z: 0 };
+        // up
+        d.x = 0; d.y = STEP_UP; d.z = 0;
+        cc.computeColliderMovement(col, d, flags, undefined, this.filter);
+        const up = cc.computedMovement(tmp).y;
+        if(up < 0.1) return null;
+        p.x = c.x; p.y = c.y + up; p.z = c.z;
+        col.setTranslation(p);
+        // across
+        d.x = desired.x; d.y = 0; d.z = desired.z;
+        cc.computeColliderMovement(col, d, flags, undefined, this.filter);
+        const a = cc.computedMovement(tmp);
+        const ax = a.x, az = a.z;
+        p.x += ax; p.z += az;
+        col.setTranslation(p);
+        // down: as far as we went up plus the ordinary descent
+        d.x = 0; d.y = -(up + Math.max(0, -desired.y) + 0.05); d.z = 0;
+        cc.computeColliderMovement(col, d, flags, undefined, this.filter);
+        const dn = cc.computedMovement(tmp).y, landed = cc.computedGrounded();
+        col.setTranslation(c);
+        if(!landed || Math.hypot(ax, az) < 1e-3) return null;
+        out.x = ax; out.y = up + dn; out.z = az;
+        return out;
     }
 
     dispose() {
