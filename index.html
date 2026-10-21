@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Undermine Voxel</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover, user-scalable=0">
+<link rel="icon" href="data:,">
+<style>
+  * { -webkit-tap-highlight-color: transparent; user-select: none; box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9fc3e6; font: 13px/1.3 system-ui, -apple-system, Segoe UI, sans-serif; color: #eef1f6; touch-action: none; }
+  canvas { display: block; }
+  #loading { position: fixed; inset: 0; display: grid; place-items: center; font-size: 18px; color: #1c2430; background: #9fc3e6; z-index: 50; padding: 24px; text-align: center; }
+  #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
+  #stats { position: fixed; top: 10px; left: 10px; background: rgba(16,20,28,.6); padding: 6px 9px; border-radius: 7px; font-variant-numeric: tabular-nums; white-space: pre; pointer-events: none; z-index: 10; }
+  #crosshair { position: fixed; top: 50%; left: 50%; width: 6px; height: 6px; margin: -3px 0 0 -3px; border-radius: 50%; background: #fff; box-shadow: 0 0 2px #000; pointer-events: none; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="loading">Loading...</div>
+<div id="hud"></div>
+<div id="stats"></div>
+<div id="crosshair"></div>
+<script type="module" src="./dist/main.js"></script>
+</body>
+</html>

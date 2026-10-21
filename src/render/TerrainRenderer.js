@@ -1,0 +1,62 @@
+/**
+ * Draws the VoxelWorld: one mesh per chunk, meshed in the worker pool and remeshed whenever an edit dirties it.
+ * Chunk meshes sit at their chunk's world origin; geometry attributes: position, normal, ao (float), mat (float id).
+ */
+import * as THREE from 'three/webgpu';
+import { CHUNK_M } from '../config.js';
+import { MeshPool } from '../voxel/MeshPool.js';
+import { createTerrainMaterial } from './terrainMaterial.js';
+import { geometryFromMesh } from './geometry.js';
+
+export class TerrainRenderer {
+    constructor(world, scene, camera) {
+        this.world = world;
+        this.scene = scene;
+        this.camera = camera;
+        this.group = new THREE.Group();
+        this.group.name = 'terrain';
+        scene.add(this.group);
+        this.meshes = new Map();
+        this.material = createTerrainMaterial();
+        this.listeners = [];
+        this.pool = new MeshPool({
+            onMesh: (key, mesh) => this._apply(key, mesh),
+            priority: (key) => {
+                const c = world.chunks.get(key), p = camera.position;
+                if(!c) return -1; // one-shot grids (detached bodies) first
+                return Math.hypot((c.cx + 0.5) * CHUNK_M - p.x, (c.cy + 0.5) * CHUNK_M - p.y, (c.cz + 0.5) * CHUNK_M - p.z);
+            },
+        });
+        world.onChange(({ dirty }) => { for(const k of dirty) this.remesh(k); });
+    }
+    /** Called with (key, geometry | null) after a chunk's mesh changes. */
+    onChunkMesh(fn) { this.listeners.push(fn); }
+    remeshAll() { for(const k of this.world.chunks.keys()) this.remesh(k); }
+    remesh(key) {
+        const c = this.world.chunks.get(key);
+        if(!c) return;
+        this.pool.request(key, (sdf, mat) => this.world.extractPadded(c.cx, c.cy, c.cz, sdf, mat));
+    }
+    get pending() { return this.pool.pending; }
+    _apply(key, mesh) {
+        let m = this.meshes.get(key);
+        if(!mesh || !mesh.indices.length) {
+            if(m) { this.group.remove(m); m.geometry.dispose(); this.meshes.delete(key); }
+            for(const fn of this.listeners) fn(key, null);
+            return;
+        }
+        const g = geometryFromMesh(mesh);
+        if(m) { m.geometry.dispose(); m.geometry = g; }
+        else {
+            const c = this.world.chunks.get(key);
+            m = new THREE.Mesh(g, this.material);
+            m.position.set(c.cx * CHUNK_M, c.cy * CHUNK_M, c.cz * CHUNK_M);
+            m.castShadow = true; m.receiveShadow = true;
+            m.matrixAutoUpdate = false; m.updateMatrix();
+            m.userData.chunkKey = key;
+            this.group.add(m);
+            this.meshes.set(key, m);
+        }
+        for(const fn of this.listeners) fn(key, g);
+    }
+}
