@@ -1,12 +1,13 @@
 /**
  * CPU soft solver check (node): a full-size zone around a ground point of the Fort War level, kicked like a blast;
  * prints solver cost per frame and the displacement over time, checks it springs back / keeps a plastic dent.
- * node tools/test/softcpu.mjs [x z] [--iters 2] [--rate 60] [--speed 19] [--full (no surface shell)]
+ * node tools/test/softcpu.mjs [x z] [--iters 2] [--rate 60] [--speed 19] [--full (no surface shell)] [--far (1 m cells, a blast's zone)]
  */
 import { VoxelWorld } from '../../src/voxel/VoxelWorld.js';
 import { voxelize } from '../../src/voxel/voxelize.js';
 import { Level } from '../../src/level/fortwar.js';
-import { classifyZone, H, SPC, MAX_DIM } from '../../src/soft/core.js';
+import { classifyZone, SPC, SPC_FAR, maxDim } from '../../src/soft/core.js';
+import { VOXEL } from '../../src/config.js';
 import { readRegion } from '../../src/soft/region.js';
 import { CpuSoft, P_SLOTA, P_SLOTB, P_SLOTC, P_KICKA, P_KICKB, P_KICKC } from '../../src/soft/cpuSolver.js';
 import { BEDROCK_SAMPLES } from '../../src/config.js';
@@ -25,14 +26,15 @@ const hit = world.raycast([px, 30, pz], [0, -1, 0], 60);
 const p = hit.point;
 console.log('ground', p.map(v => v.toFixed(2)).join(' '), 'mat', hit.mat);
 
-// the biggest zone SoftGround makes (a strong blast)
-const hor = 5.5, below = 3.5, above = 2.2;
+// the biggest zone SoftGround makes (a strong blast; --far: a blast's far zone)
+const far = args.includes('--far'), spc = far ? SPC_FAR : SPC, H = spc * VOXEL, MAX_DIM = maxDim(spc);
+const hor = far ? 12 : 5.5, below = far ? 4 : 3.5, above = far ? 8 : 2.2;
 let lo = [Math.floor((p[0] - hor) / H), Math.floor((p[1] - below) / H), Math.floor((p[2] - hor) / H)];
 let hi = [Math.ceil((p[0] + hor) / H), Math.ceil((p[1] + above) / H), Math.ceil((p[2] + hor) / H)];
 for(let a = 0; a < 3; a++) { const pc = Math.floor(p[a] / H); while(hi[a] - lo[a] > MAX_DIM[a]) { if(hi[a] - pc > pc - lo[a]) hi[a]--; else lo[a]++; } }
 const n = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
-const region = readRegion(world, lo.map(v => (v - 1) * SPC), lo.map((v, i) => (v + n[i] + 1) * SPC));
-const z = classifyZone(region, lo, n, world.smin[1] + BEDROCK_SAMPLES, undefined, { shell: !args.includes("--full") });
+const region = readRegion(world, lo.map(v => (v - 1) * spc), lo.map((v, i) => (v + n[i] + 1) * spc));
+const z = classifyZone(region, lo, n, world.smin[1] + BEDROCK_SAMPLES, undefined, { shell: !args.includes("--full"), spc });
 console.log('zone', n.join('x'), 'cells', z.count, 'tets', z.count * 5);
 
 const sim = new CpuSoft({ iterations, rate });
@@ -40,8 +42,8 @@ sim.upload(0, { ...z, n }, true);
 const P = sim.P;
 P.set([lo[0] * H, lo[1] * H, lo[2] * H, 1], P_SLOTA * 4);
 P.set([n[0] + 1, n[1] + 1, n[2] + 1, z.count], P_SLOTB * 4);
-P.set([0, 0, 0, 0], P_SLOTC * 4);
-P.set([p[0], p[1], p[2], 3.5], P_KICKA * 4);
+P.set([0, H, far ? 0 : 1, 0], P_SLOTC * 4); // far zones are elastic
+P.set([p[0], p[1], p[2], far ? 7 : 3.5], P_KICKA * 4);
 P.set([0, 0, 0, +(args.includes("--speed") ? args[args.indexOf("--speed") + 1] : 19)], P_KICKB * 4);
 P.set([0, 0.45, 0, 0], P_KICKC * 4);
 const dt = 1 / rate, NX = n[0] + 1, NY = n[1] + 1;

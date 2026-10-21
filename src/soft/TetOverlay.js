@@ -5,7 +5,7 @@
  */
 import * as THREE from 'three/webgpu';
 import { Fn, int } from 'three/tsl';
-import { H, MAX_ZONES, TETS_EVEN, TETS_ODD, CUBE, F_PINNED } from './core.js';
+import { MAX_ZONES, TETS_EVEN, TETS_ODD, CUBE, F_PINNED } from './core.js';
 
 export class TetOverlay {
     constructor(scene, sim) {
@@ -32,7 +32,7 @@ export class TetOverlay {
         const put = (n) => {
             const i = n % NX, j = Math.floor(n / NX) % (z.n[1] + 1), k = Math.floor(n / NXY);
             // a hair inside the lattice: the far faces' nodes are outside the trilinear lookup otherwise
-            pos.push((z.c0[0] + Math.min(i, z.n[0] - 1e-3)) * H, (z.c0[1] + Math.min(j, z.n[1] - 1e-3)) * H, (z.c0[2] + Math.min(k, z.n[2] - 1e-3)) * H);
+            pos.push((z.c0[0] + Math.min(i, z.n[0] - 1e-3)) * z.h, (z.c0[1] + Math.min(j, z.n[1] - 1e-3)) * z.h, (z.c0[2] + Math.min(k, z.n[2] - 1e-3)) * z.h);
         };
         for(let c = 0; c < count; c++) {
             const v = cells[c], ci = v & 255, cj = (v >> 8) & 255, ck = (v >> 16) & 255;

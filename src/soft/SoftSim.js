@@ -9,7 +9,10 @@
  * over-relaxation }. Pinned nodes stay at u = 0. No gravity: the rest shape is the current terrain.
  *
  * Slot uniforms: slotA[s] = (origin xyz (m), mode: 0 off, 1 simulating, 2 frozen = drawn only),
- *                slotB[s] = (node dims x, y, z, cell count), slotC[s] = (extra damping 1/s, -, -, -).
+ *                slotB[s] = (node dims x, y, z, cell count), slotC[s] = (extra damping 1/s, cell size (m), plasticity
+ *                scale (0: elastic), -).
+ * Kicks:         kickA[k] = (centre xyz, radius), kickB[k] = (direction xyz or 0 = radial, speed m/s),
+ *                kickC[k] = (slot, radial upward tilt, inner radius: > 0 kicks a ring band (inner..radius) only, -).
  */
 import * as THREE from 'three/webgpu';
 import {
@@ -85,6 +88,7 @@ export class SoftSim {
         const views = (base, n) => Array.from({ length: n }, (_, i) => new V4(this, (base + i) * 4));
         this.slotA = views(P_SLOTA, Z); this.slotB = views(P_SLOTB, Z); this.slotC = views(P_SLOTC, Z);
         this.kickA = views(P_KICKA, MAX_KICKS); this.kickB = views(P_KICKB, MAX_KICKS); this.kickC = views(P_KICKC, MAX_KICKS);
+        for(const c of this.slotC) { c.y = H; c.z = 1; } // cell size, plasticity until a zone sets its own
         const par = this.params;
         const el = (base) => ({ element: (i) => par.element(int(i).add(base)) });
         this.u = {
@@ -141,7 +145,7 @@ export class SoftSim {
             If(f.bitAnd(F_ACTIVE).equal(0).or(f.bitAnd(F_PINNED).notEqual(0)), () => { Return(); });
             const B = u.slotB.element(slot);
             const L = latticeOf(local, B);
-            const wp = A.xyz.add(vec3(float(L.x), float(L.y), float(L.z)).mul(H)).toVar();
+            const wp = A.xyz.add(vec3(float(L.x), float(L.y), float(L.z)).mul(u.slotC.element(slot).y)).toVar();
             const soft = u.mat2.element(f.shiftRight(8).bitAnd(15)).x.toVar();
             const dv = vec3(0).toVar();
             for(let k = 0; k < MAX_KICKS; k++) {
@@ -149,9 +153,11 @@ export class SoftSim {
                 If(ka.w.greaterThan(0).and(int(kc.x).equal(slot)), () => {
                     const d = wp.sub(ka.xyz).toVar();
                     const r = length(d).toVar();
-                    If(r.lessThan(ka.w), () => {
-                        const f1 = float(1).sub(r.div(ka.w));
-                        const fall = f1.mul(f1).mul(float(3).sub(f1.mul(2))).toVar(); // smoothstep: no crease at the rim
+                    If(r.lessThan(ka.w).and(r.greaterThan(kc.z)), () => {
+                        // a disc (smoothstep falloff: no crease at the rim) or, with an inner radius, a ring band
+                        const half = ka.w.sub(kc.z).mul(0.5);
+                        const f1 = select(kc.z.greaterThan(0), float(1).sub(abs(r.sub(kc.z.add(half))).div(half)), float(1).sub(r.div(ka.w)));
+                        const fall = f1.mul(f1).mul(float(3).sub(f1.mul(2))).toVar();
                         const radial = normalize(d.add(vec3(0, ka.w.mul(kc.y), 0)).add(vec3(0, 1e-4, 0)));
                         const dir = select(length(kb.xyz).greaterThan(0.01), kb.xyz, radial);
                         dv.addAssign(dir.mul(kb.w.mul(fall)));
@@ -171,6 +177,7 @@ export class SoftSim {
                 Return();
             });
             const M = u.mat.element(f.shiftRight(8).bitAnd(15)).toVar();
+            M.z.mulAssign(u.slotC.element(slot).z);
             const p = nPos.element(g).xyz.toVar();
             const damp = M.y.add(u.slotC.element(slot).x);
             const vel = p.sub(nPrev.element(g).xyz).mul(max(float(0), float(1).sub(damp.mul(u.dt)))).toVar();
@@ -205,12 +212,13 @@ export class SoftSim {
             const m = cell.shiftRight(24).bitAnd(15).toVar();
             const par = ci.add(cj).add(ck).bitAnd(1).toVar();
             const nx = int(B.x).toVar(), nxy = int(B.x).mul(int(B.y)).toVar();
+            const h = u.slotC.element(slot).y.toVar();
             const P = [], R = [];
             for(let k = 0; k < 4; k++) {
                 const o = u.tetOff.element(par.mul(20).add(l.mul(4)).add(k)).toVar();
                 const ox = ci.add(o.bitAnd(1)), oy = cj.add(o.shiftRight(1).bitAnd(1)), oz = ck.add(o.shiftRight(2).bitAnd(1));
                 const n = slot.mul(NODE_CAP).add(ox).add(oy.mul(nx)).add(oz.mul(nxy)).toVar();
-                const X = vec3(float(ox), float(oy), float(oz)).mul(H).toVar();
+                const X = vec3(float(ox), float(oy), float(oz)).mul(h).toVar();
                 P.push(X.add(nPos.element(n).xyz).toVar());
                 R.push(X.add(nRest.element(n).xyz).toVar());
             }
@@ -265,7 +273,7 @@ export class SoftSim {
                 });
             }
             If(wsum.lessThanEqual(0), () => { Return(); });
-            const X = vec3(float(L.x), float(L.y), float(L.z)).mul(H);
+            const X = vec3(float(L.x), float(L.y), float(L.z)).mul(u.slotC.element(slot).y);
             const cur = nPos.element(g).xyz.toVar();
             const np = mix(nOld.element(g).xyz, sum.div(wsum).sub(X), float(omega)).toVar();
             const nl = length(np);
@@ -348,8 +356,8 @@ export class SoftSim {
         const wp = modelWorldMatrix.mul(vec4(p, 1)).xyz.toVar();
         const disp = vec3(0).toVar(), jx = vec3(0).toVar(), jy = vec3(0).toVar(), jz = vec3(0).toVar();
         for(let s = 0; s < MAX_ZONES; s++) {
-            const A = u.slotA.element(s), B = u.slotB.element(s);
-            const gp = wp.sub(A.xyz).div(H).toVar();
+            const A = u.slotA.element(s), B = u.slotB.element(s), h = u.slotC.element(s).y.toVar();
+            const gp = wp.sub(A.xyz).div(h).toVar();
             const on = A.w.greaterThan(0.5).and(skip.shiftRight(s).bitAnd(1).equal(0))
                 .and(gp.x.greaterThanEqual(0)).and(gp.y.greaterThanEqual(0)).and(gp.z.greaterThanEqual(0))
                 .and(gp.x.lessThan(B.x.sub(1))).and(gp.y.lessThan(B.y.sub(1))).and(gp.z.lessThan(B.z.sub(1)));
@@ -369,9 +377,9 @@ export class SoftSim {
                 const uy0 = mix(u00, u10, f.y), uy1 = mix(u01, u11, f.y);
                 disp.addAssign(mix(uy0, uy1, f.z));
                 const dx00 = U[1].sub(U[0]), dx10 = U[3].sub(U[2]), dx01 = U[5].sub(U[4]), dx11 = U[7].sub(U[6]);
-                jx.addAssign(mix(mix(dx00, dx10, f.y), mix(dx01, dx11, f.y), f.z).div(H));
-                jy.addAssign(mix(u10.sub(u00), u11.sub(u01), f.z).div(H));
-                jz.addAssign(uy1.sub(uy0).div(H));
+                jx.addAssign(mix(mix(dx00, dx10, f.y), mix(dx01, dx11, f.y), f.z).div(h));
+                jy.addAssign(mix(u10.sub(u00), u11.sub(u01), f.z).div(h));
+                jz.addAssign(uy1.sub(uy0).div(h));
             });
         }
         // deformed normal ~ (I + J)^-T n ~ n - J^T n

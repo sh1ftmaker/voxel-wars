@@ -2,16 +2,21 @@
  * Soft ground: shared constants, tet tables and the pure zone classifier (runs in src/workers/softZone.js; also
  * importable from node for tests). No DOM, no three.js.
  *
- * A zone is a box of lattice cells of H = 0.5 m (2 voxels), aligned to the global lattice: cell (I, J, K) spans
- * samples [2I, 2I + 2] per axis. Each cell is split into 5 tets (mirrored on odd cells so faces conform, as in
+ * A zone is a box of lattice cells of H = 0.5 m (2 voxels; far zones: 1 m, 4 voxels), aligned to the global lattice
+ * of its spacing: cell (I, J, K) spans samples [spc I, spc I + spc] per axis. Each cell is split into 5 tets (mirrored on odd cells so faces conform, as in
  * worldparty-dmm voxels.js / dmm-js builder.js). Nodes sit on cell corners; a node's state is its displacement u.
  */
-export const H = 0.5;              // lattice spacing (m)
-export const SPC = 2;              // samples per cell edge
+export const H = 0.5;              // lattice spacing (m) of near zones
+export const SPC = 2;              // samples per cell edge of near zones
+/** Far zones (big impacts: blasts, walls shuddering along their length) use 1 m cells: twice the reach for the same
+ *  node count. A zone's spacing is per slot (slotC.y = cell size in metres). */
+export const SPC_FAR = 4;
 export const MAX_ZONES = 4;
-export const NODE_CAP = 6144;      // nodes per zone slot: (nx+1)(ny+1)(nz+1) <= NODE_CAP
-export const CELL_CAP = 2560;      // simulated cells per zone slot (x5 tets)
-export const MAX_DIM = [20, 12, 20]; // max cells per axis
+export const NODE_CAP = 8192;      // nodes per zone slot: (nx+1)(ny+1)(nz+1) <= NODE_CAP
+export const CELL_CAP = 4096;      // simulated cells per zone slot (x5 tets)
+export const MAX_DIM = [20, 12, 20]; // max cells per axis (near zones)
+export const MAX_DIM_FAR = [23, 13, 23]; // (far zones: 24 x 14 x 24 nodes: a tower's height)
+export const maxDim = (spc) => spc === SPC_FAR ? MAX_DIM_FAR : MAX_DIM;
 
 // Corners: 0=(000) 1=(100) 2=(110) 3=(010) 4=(001) 5=(101) 6=(111) 7=(011)
 export const CUBE = [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0], [0, 0, 1], [1, 0, 1], [1, 1, 1], [0, 1, 1]];
@@ -40,14 +45,15 @@ export const F_ACTIVE = 1, F_PINNED = 2;
 /**
  * Classify a zone from a region of samples.
  *   region: { sdf: Int8Array, mat: Uint8Array, lo: [sx, sy, sz] (sample coords of index 0), dims: [nx, ny, nz] }
- *           covering samples [2*(c0-1), 2*(c0+n+1)] per axis (the zone's cells plus a ring of one cell)
+ *           covering samples [spc*(c0-1), spc*(c0+n+1)] per axis (the zone's cells plus a ring of one cell)
+ *   spc: samples per cell edge (SPC, or SPC_FAR for 1 m cells)
  *   c0: first cell (global lattice), n: cells per axis, bedrockY: first sample y that is not bedrock
  *   shell: leave out cells >= ~1 m inside the ground (pinned): the CPU solver simulates the surface skin only
  * Returns { cells: Int32Array (packed i | j<<8 | k<<16 | mat<<24, local cell coords), count,
  *           cellIdx: Int32Array(nodes) local cell index or -1 (indexed like nodes: i + j*NX + k*NX*NY),
  *           flags: Int32Array(nodes) F_ACTIVE | F_PINNED | mat<<8, solidFrac }
  */
-export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shell = false } = {}) {
+export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shell = false, spc = SPC } = {}) {
     const { sdf, mat, lo, dims } = region;
     const [dx, dy] = dims, dxy = dx * dy;
     const MX = n[0] + 2, MY = n[1] + 2, MZ = n[2] + 2; // cells incl. the ring
@@ -55,11 +61,11 @@ export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shel
     // the region is small: ~7k cells)
     const cmin = new Int16Array(MX * MY * MZ), cmat = new Uint8Array(MX * MY * MZ), deep = new Uint8Array(MX * MY * MZ);
     for(let k = 0; k < MZ; k++) for(let j = 0; j < MY; j++) for(let i = 0; i < MX; i++) {
-        // ring cell (i, j, k) = global cell c0 - 1 + (i, j, k): samples from 2*i .. 2*i+2 in the region
+        // ring cell (i, j, k) = global cell c0 - 1 + (i, j, k): samples from spc*i .. spc*i+spc in the region
         let best = 127, bm = 0, worst = -128;
-        for(let c = 0; c <= 2; c++) for(let b = 0; b <= 2; b++) {
-            let o = (2 * i) + (2 * j + b) * dx + (2 * k + c) * dxy;
-            for(let a = 0; a <= 2; a++, o++) { const s = sdf[o]; if(s < best) { best = s; bm = mat[o]; } if(s > worst) worst = s; }
+        for(let c = 0; c <= spc; c++) for(let b = 0; b <= spc; b++) {
+            let o = (spc * i) + (spc * j + b) * dx + (spc * k + c) * dxy;
+            for(let a = 0; a <= spc; a++, o++) { const s = sdf[o]; if(s < best) { best = s; bm = mat[o]; } if(s > worst) worst = s; }
         }
         const ci = i + j * MX + k * MX * MY;
         cmin[ci] = best; cmat[ci] = bm;
@@ -87,7 +93,7 @@ export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shel
         }
     }
     // node materials, pins
-    const bedNode = Math.ceil(bedrockY / SPC) - c0[1]; // local node y below which nodes are bedrock
+    const bedNode = Math.ceil(bedrockY / spc) - c0[1]; // local node y below which nodes are bedrock
     for(let k = 0; k < NZ; k++) for(let j = 0; j < NY; j++) for(let i = 0; i < NX; i++) {
         const ni = i + j * NX + k * NX * NY;
         if(!(flags[ni] & F_ACTIVE)) continue;
@@ -113,17 +119,17 @@ export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shel
  * The plastic bake, pure: new_sdf(x) = old_sdf(x - u(x)) and the material advected the same way, over the samples
  * of a zone.
  *   region: { sdf, mat, lo: [sx, sy, sz], dims } samples around the zone (at least the zone plus the largest |u|)
- *   zone:   { s0: [sx, sy, sz] first sample of the node box (= 2 * c0), n: cells per axis, u: Float32Array of
- *             node displacements (4 floats per node, i + j*NX + k*NX*NY), bedrockY }
+ *   zone:   { s0: [sx, sy, sz] first sample of the node box (= spc * c0), n: cells per axis, u: Float32Array of
+ *             node displacements (4 floats per node, i + j*NX + k*NX*NY), bedrockY, spc (samples per cell, default 2) }
  * Returns { lo: [sx,sy,sz], dims: [ex, ey, ez], sdf: Int8Array, mat: Uint8Array, changed } over the zone's sample box
- * (2n + 1 samples per axis), to be written back into the world.
+ * (spc n + 1 samples per axis), to be written back into the world.
  */
 export function bakeZone(region, zone) {
     const { sdf, mat, lo, dims } = region;
     const [rx, ry, rz] = dims, rxy = rx * ry;
-    const { s0, n, u, bedrockY } = zone;
+    const { s0, n, u, bedrockY } = zone, spc = zone.spc || SPC;
     const NX = n[0] + 1, NY = n[1] + 1;
-    const ex = 2 * n[0] + 1, ey = 2 * n[1] + 1, ez = 2 * n[2] + 1;
+    const ex = spc * n[0] + 1, ey = spc * n[1] + 1, ez = spc * n[2] + 1;
     const out = new Int8Array(ex * ey * ez), omat = new Uint8Array(ex * ey * ez);
     const inv = 1 / 0.25; // samples per metre
     let changed = 0;
@@ -135,9 +141,9 @@ export function bakeZone(region, zone) {
         const o = i + j * ex + k * ex * ey;
         const sx = s0[0] + i, sy = s0[1] + j, sz = s0[2] + k;
         const src = at(sx - lo[0], sy - lo[1], sz - lo[2]);
-        // displacement at this sample: trilinear over the node lattice (2 samples per cell)
-        const gi = Math.min(n[0] - 1, i >> 1), gj = Math.min(n[1] - 1, j >> 1), gk = Math.min(n[2] - 1, k >> 1);
-        const fx = i / 2 - gi, fy = j / 2 - gj, fz = k / 2 - gk;
+        // displacement at this sample: trilinear over the node lattice (spc samples per cell)
+        const gi = Math.min(n[0] - 1, Math.floor(i / spc)), gj = Math.min(n[1] - 1, Math.floor(j / spc)), gk = Math.min(n[2] - 1, Math.floor(k / spc));
+        const fx = i / spc - gi, fy = j / spc - gj, fz = k / spc - gk;
         let ux = 0, uy = 0, uz = 0;
         for(let c = 0; c < 8; c++) {
             const a = c & 1, b = (c >> 1) & 1, d = c >> 2;

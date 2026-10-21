@@ -44,8 +44,25 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
 - **Soft ground solver** (`src/soft`): on WebGPU a compute-shader solver (`SoftSim`); on WebGL2 (or `?softCpu=1`) the
   same lattice solved in a worker (`src/workers/softSim.js`, `src/soft/cpuSolver.js`: 60 Hz, 2 iterations, surface
   skin only) whose displacements reach the vertex stage through a float texture (`SoftSimCPU`). `?tets=1` / F7 draws
-  the zones' tetrahedra. Tests: `tools/test/softcpu.mjs` (node: solver cost and motion), `softview.mjs` (headless
-  WebGL2: screenshots and pixel change of a wake, a blast, `--wall`), `softgame.mjs` (WebGPU path, SwiftShader).
+  the zones' tetrahedra. Zones come in two spacings (per slot: `slotC.y`): near zones (0.5 m cells, ~5 m around:
+  punches, landings, impacts, grabs; plastic dirt keeps dents) and far zones (1 m cells, ~12 m around, standing on the
+  ground under the impact and a tower's height tall; elastic, at most 2: blasts). A blast heaves its far zone and sends
+  rings of upward kicks outward (`blastWave`: ring kicks have an inner radius, `kickC.z`), so a ripple crosses the
+  field and walls shudder along their length. Punches drive the surface in along the swing (`carve(..., { dir })`).
+  The grab tears the ground: `soft.grab` wakes a zone, `pull` drags the lump's nodes toward the hand every frame for
+  0.2-0.6 s (harder matter longer: `Combat.startRip/pullRip/finishRip`, `Arsenal.updateTear`), then the lump comes out
+  as a body and `tear` snaps the rim back. Tests: `tools/test/softcpu.mjs` (node: solver cost and motion; `--far`),
+  `softview.mjs` (headless WebGL2: screenshots and pixel change of a wake, a blast, `--wall`), `softreach.mjs` (punch,
+  blast reach, wall shudder, bridge collapse, grab tear and throw; `--slowtear` for screenshots of the stretch),
+  `softgame.mjs` (WebGPU path, SwiftShader).
+- **Structural support** (`src/voxel/support.js`, run by the terrain worker after every edit): overhangs that cannot
+  carry themselves break off. Cells of 0.5 m; supported = a solid column down to the ground; a hanging cell's lever
+  is its horizontal distance to its support through the overhang; past its material's reach (`SPAN`, calibrated so the
+  intact level stands) the overhang breaks off about a metre from its support and becomes a body (`reply.islands`
+  with `support: true`). Blow out one end of the gorge bridge and it falls in. ~10 ms per edit in the worker. Test:
+  `tools/test/support.mjs`.
+- **Thrown rocks** stay bodies (`userData.thrown`): a hard hit damages whoever it strikes ('slam') and may crack the
+  rock along its soft lattice, never a Voronoi burst.
 - **Meshing**: replies carry the dirty chunks' padded mesher windows (no extraction on the main thread); the mesh
   worker post-processes meshes (`src/voxel/meshPrep.js`: material attributes, bounds, collider octants with hashes), so
   the main thread only wraps arrays in a BufferGeometry and Rapier builds the octant trimeshes (budgeted per frame).

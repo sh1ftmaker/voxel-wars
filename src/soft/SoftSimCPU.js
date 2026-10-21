@@ -4,7 +4,7 @@
  * through a float texture (vertex texture fetch works on WebGL2).
  *
  * Texture: TEX_W texels per row, RGBA32F. Texel g = slot * NODE_CAP + node holds that node's displacement (xyz); the
- * texels after the nodes hold each slot's parameters as the worker last saw them (slotA, slotB: 2 per slot), so the
+ * texels after the nodes hold each slot's parameters as the worker last saw them (slotA, slotB, slotC: 3 per slot), so the
  * displacements and the lattice they belong to always arrive together. A main-thread `live` mask gates each slot as
  * well, so a freed slot stops deforming at once.
  *
@@ -19,7 +19,7 @@ import { MAX_KICKS, P_SLOTA, P_SLOTB, P_SLOTC, P_KICKA, P_KICKB, P_KICKC, PARAMS
 
 const TEX_W = 256;
 const PBASE = MAX_ZONES * NODE_CAP; // first parameter texel
-const TEX_H = Math.ceil((PBASE + 2 * MAX_ZONES) / TEX_W);
+const TEX_H = Math.ceil((PBASE + 3 * MAX_ZONES) / TEX_W);
 
 export class SoftSimCPU {
     constructor(renderer, { iterations = 3, rate = 60 } = {}) {
@@ -29,6 +29,7 @@ export class SoftSimCPU {
         const views = (base, n) => Array.from({ length: n }, (_, i) => new V4(this, (base + i) * 4));
         this.slotA = views(P_SLOTA, MAX_ZONES); this.slotB = views(P_SLOTB, MAX_ZONES); this.slotC = views(P_SLOTC, MAX_ZONES);
         this.kickA = views(P_KICKA, MAX_KICKS); this.kickB = views(P_KICKB, MAX_KICKS); this.kickC = views(P_KICKC, MAX_KICKS);
+        for(const c of this.slotC) { c.y = H; c.z = 1; } // cell size, plasticity until a zone sets its own
         this.u = { dt: { value: 1 / rate } };
         this.rate = rate;
         const size = TEX_W * TEX_H * 4;
@@ -106,8 +107,9 @@ export class SoftSimCPU {
         const wp = modelWorldMatrix.mul(vec4(p, 1)).xyz.toVar();
         const disp = vec3(0).toVar(), jx = vec3(0).toVar(), jy = vec3(0).toVar(), jz = vec3(0).toVar();
         for(let s = 0; s < MAX_ZONES; s++) {
-            const A = fetch(int(PBASE + 2 * s)).toVar(), B = fetch(int(PBASE + 2 * s + 1)).toVar();
-            const gp = wp.sub(A.xyz).div(H).toVar();
+            const A = fetch(int(PBASE + 3 * s)).toVar(), B = fetch(int(PBASE + 3 * s + 1)).toVar();
+            const h = fetch(int(PBASE + 3 * s + 2)).y.max(0.25).toVar();
+            const gp = wp.sub(A.xyz).div(h).toVar();
             const on = A.w.greaterThan(0.5).and(live.shiftRight(s).bitAnd(1).equal(1)).and(skip.shiftRight(s).bitAnd(1).equal(0))
                 .and(gp.x.greaterThanEqual(0)).and(gp.y.greaterThanEqual(0)).and(gp.z.greaterThanEqual(0))
                 .and(gp.x.lessThan(B.x.sub(1))).and(gp.y.lessThan(B.y.sub(1))).and(gp.z.lessThan(B.z.sub(1)));
@@ -126,9 +128,9 @@ export class SoftSimCPU {
                 const uy0 = mix(u00, u10, f.y).toVar(), uy1 = mix(u01, u11, f.y).toVar();
                 disp.addAssign(mix(uy0, uy1, f.z));
                 const dx00 = U[1].sub(U[0]), dx10 = U[3].sub(U[2]), dx01 = U[5].sub(U[4]), dx11 = U[7].sub(U[6]);
-                jx.addAssign(mix(mix(dx00, dx10, f.y), mix(dx01, dx11, f.y), f.z).div(H));
-                jy.addAssign(mix(u10.sub(u00), u11.sub(u01), f.z).div(H));
-                jz.addAssign(uy1.sub(uy0).div(H));
+                jx.addAssign(mix(mix(dx00, dx10, f.y), mix(dx01, dx11, f.y), f.z).div(h));
+                jy.addAssign(mix(u10.sub(u00), u11.sub(u01), f.z).div(h));
+                jz.addAssign(uy1.sub(uy0).div(h));
             });
         }
         const n = normalize(n0.sub(vec3(dot(jx, n0), dot(jy, n0), dot(jz, n0))));

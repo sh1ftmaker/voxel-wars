@@ -8,9 +8,10 @@
  * Messages (`core.handle(msg) -> { reply, transfer }`), every reply carries the changed chunks:
  *   { type: 'init' }                              voxelize Fort War; reply.chunks holds every chunk
  *   { type: 'brush', spec, op, mat, hardness, conn, erode, debris }
- *        applyBrush(brushFromSpec(spec)); with conn (carves) the regions that lost their support are cut out:
- *        reply.result { removed, added, changed, box }, reply.islands [{ grid, prep, dirty }] (become bodies),
- *        reply.dust [{ center, removed }] (islands too small for a body)
+ *        applyBrush(brushFromSpec(spec)); with conn (carves) the regions that lost their support are cut out, and
+ *        (unless support === false) overhangs that can no longer carry themselves break off (src/voxel/support.js):
+ *        reply.result { removed, added, changed, box }, reply.islands [{ grid, prep, dirty, support? }] (become
+ *        bodies), reply.dust [{ center, removed }] (islands too small for a body), reply.supportMs
  *   { type: 'stamp', grid, t, q }                 union a body's grid into the world (islands.stampGrid)
  *   { type: 'samples', patch }                    VoxelWorld.writeSamples (soft-ground bakes)
  *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
@@ -30,6 +31,7 @@ import { VoxelWorld } from './VoxelWorld.js';
 import { voxelize } from './voxelize.js';
 import { brushFromSpec } from './brushes.js';
 import { findIslands, detachIsland, stampGrid, splitGrid, voronoiLabels, gridPrep, carveGrid } from './islands.js';
+import { findUnsupported } from './support.js';
 import { cellSampleLabels } from '../softbody/lattice.js';
 import { Level } from '../level/fortwar.js';
 
@@ -81,20 +83,27 @@ export class TerrainCore {
         const w = this.world, brush = brushFromSpec(msg.spec);
         const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness });
         const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [] };
-        if(msg.conn && msg.op === 'carve' && r.changed) {
-            const t0 = performance.now();
-            const res = findIslands(w, r.box[0], r.box[1], { erode: msg.erode ?? 0, near: brush });
-            for(const isl of res.islands) {
-                const small = isl.count < msg.debris;
+        const detach = (list) => {
+            for(const isl of list) {
+                const small = isl.count < (msg.debris ?? 16);
                 const d = detachIsland(w, isl, { keepGrid: !small });
                 if(!d.count) continue;
                 if(small || !d.grid.count) { reply.dust.push({ center: isl.min.map((v, a) => (v + isl.max[a]) * 0.5 * VOXEL), removed: d.removed }); continue; }
                 const g = d.grid;
                 g.prep = gridPrep(g, 0);
                 transfer.push(g.sdf.buffer, g.mat.buffer);
-                reply.islands.push({ grid: g, dirty: [...d.dirty] });
+                reply.islands.push({ grid: g, dirty: [...d.dirty], support: !!isl.support });
             }
+        };
+        if(msg.conn && msg.op === 'carve' && r.changed) {
+            const t0 = performance.now();
+            detach(findIslands(w, r.box[0], r.box[1], { erode: msg.erode ?? 0, near: brush }).islands);
             reply.islandsMs = performance.now() - t0;
+        }
+        if(msg.support !== false && r.changed) {
+            const sup = findUnsupported(w, r.box[0], r.box[1]);
+            detach(sup.islands);
+            reply.supportMs = sup.ms;
         }
         return reply;
     }

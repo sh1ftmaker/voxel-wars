@@ -161,6 +161,7 @@ export class Fx {
         });
         g.on('explosion', ({ center, radius, kind }) => this.explosion(center, kind === 'rock' ? radius * 0.6 : radius, kind));
         g.on('shatter', ({ point, mat, volume }) => this.burst(point, { count: Math.min(60, 20 + Math.round(volume * 15)), speed: 12, size: 0.16, mats: [mat], up: 6, dust: 6 }));
+        g.on('slam', ({ point, mat }) => this.burst(point, { count: 12, speed: 6, size: 0.12, mats: [mat], up: 4, dust: 5 }));
         g.on('rip', ({ point, mat }) => { if(point) this.burst(point, { count: 14, speed: 5, size: 0.1, mats: [mat], up: 5, dust: 4 }); });
         g.on('punch', ({ point, kind }) => { if(kind === 'prop' || kind === 'actor') this.burst(point, { count: 5, speed: 5, size: 0.06, mats: [kind === 'actor' ? 7 : 10], dust: 1 }); });
         g.on('build', ({ center, size }) => this.burst([center[0], center[1] - size[1] / 2, center[2]], { count: 6, speed: 3, size: 0.08, mats: [8], dust: 6 }));

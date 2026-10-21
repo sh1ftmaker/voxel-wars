@@ -3,7 +3,8 @@
  * with the fire button. Punch (F / middle mouse) and grab (E / right mouse) work whatever tool is selected.
  *
  *   punch   click: bite a rock out of the terrain ahead, knock bodies and enemies
- *   grab    hold: rip a lump of terrain (or a loose body) out and carry it overhead; release: throw (it shatters)
+ *   grab    hold: tear a lump of terrain out (the ground stretches toward the hand, then gives) or grab a loose body,
+ *           and carry it overhead; release: throw (it stays a body, and cracks if it hits hard)
  *   rocket  hold: fire rockets (rocket jump by aiming at your feet)
  *   grenade hold to charge, release to throw
  *   drill   hold: dig a walkable tunnel the way you look
@@ -30,6 +31,7 @@ export class Arsenal {
         this.masonShape = 0;
         this.masonPreview = null;  // { min, max, ok } for the HUD / ghost
         this.grabFrom = null;      // 'fire' or 'grab': which button holds the rock
+        this.tearing = null;       // a lump being torn out of the ground (Combat.startRip)
         this.holdT = 0;
         player.input.onTool((t) => this.select(t));
         // ghost box for the mason
@@ -46,7 +48,7 @@ export class Arsenal {
         if(i === this.index && TOOLS[i] === 'mason') { this.masonShape = (this.masonShape + 1) % MASON_SHAPES.length; this.game.emit('ui', { sound: 'click' }); return; }
         if(i === this.index) return;
         if(this.charging) { this.charging = false; this.charge = 0; }
-        if(this.held && this.grabFrom === 'fire') this.release(false);
+        if((this.held || this.tearing) && this.grabFrom === 'fire') this.release(false);
         this.index = i;
         this.game.emit('tool', { tool: this.tool });
     }
@@ -62,13 +64,13 @@ export class Arsenal {
         if(this.game.over) return;
         const tool = this.tool;
         // universal buttons
-        if(input.down('punch') && this.ready('punch') && !this.held) this.doPunch();
+        if(input.down('punch') && this.ready('punch') && !this.held && !this.tearing) this.doPunch();
         if(input.pressed('grab')) this.grab('grab');
         if(input.released('grab') && this.grabFrom === 'grab') this.release(true);
         // the selected tool on the fire button
         const fireDown = input.down('fire'), firePressed = input.pressed('fire'), fireReleased = input.released('fire');
         switch(tool) {
-            case 'punch': if(fireDown && this.ready('punch') && !this.held) this.doPunch(); break;
+            case 'punch': if(fireDown && this.ready('punch') && !this.held && !this.tearing) this.doPunch(); break;
             case 'grab':
                 if(firePressed) this.grab('fire');
                 if(fireReleased && this.grabFrom === 'fire') this.release(true);
@@ -117,6 +119,7 @@ export class Arsenal {
                 break;
         }
         this.ghost.visible = tool === 'mason' && !!this.masonPreview;
+        if(this.tearing) this.updateTear(dt);
         if(this.held) this.updateHeld(dt);
     }
 
@@ -132,18 +135,43 @@ export class Arsenal {
 
     grab(from) {
         const p = this.player;
-        if(this.held || !this.ready('grab') || p.carrying) return;
-        const prop = this.combat.rip(p, p.eye(), p.aimDir());
+        if(this.held || this.tearing || !this.ready('grab') || p.carrying) return;
+        const r = this.combat.startRip(p, p.eye(), p.aimDir());
         this.use('grab');
-        if(!prop) { this.game.emit('fired', { tool: 'grab', result: 'miss' }); return; }
-        p.held = prop;
+        if(!r) { this.game.emit('fired', { tool: 'grab', result: 'miss' }); return; }
         this.grabFrom = from;
+        if(r.prop) { this.take(r.prop); return; }
+        // the ground: it stretches toward the hand for a moment (harder matter longer), then tears
+        this.tearing = { ...r, age: 0, release: null };
+        p.shake(0.12);
+    }
+    /** A frame of tearing a lump out; at the end it is held (and thrown or dropped at once if the button was let go). */
+    updateTear(dt) {
+        const p = this.player, tr = this.tearing;
+        if(!p.alive) { this.tearing = null; this.grabFrom = null; return; }
+        tr.age += dt;
+        const e = p.eye(), to = [e[0] - Math.sin(p.yaw) * 0.6, e[1] + 1.2, e[2] - Math.cos(p.yaw) * 0.6];
+        const d = [to[0] - tr.center[0], to[1] - tr.center[1], to[2] - tr.center[2]], l = Math.hypot(...d) || 1;
+        const dir = d.map(v => v / l);
+        this.combat.pullRip(tr, dir, dt);
+        p.shake(0.02 * dt * 60);
+        if(tr.age < tr.dur) return;
+        this.tearing = null;
+        const prop = this.combat.finishRip(p, tr, dir);
+        if(!prop) { this.grabFrom = null; this.game.emit('fired', { tool: 'grab', result: 'miss' }); return; }
+        this.take(prop);
+        if(tr.release) this.release(tr.release === 'throw');
+    }
+    take(prop) {
+        const p = this.player;
+        p.held = prop;
         this.holdT = 0;
         this.combat.hold(prop, true);
         p.shake(0.25);
         this.game.emit('fired', { tool: 'grab', result: 'rip' });
     }
     release(throwIt) {
+        if(this.tearing) { this.tearing.release = throwIt ? 'throw' : 'drop'; return; } // as soon as it is out
         const p = this.player, prop = p.held;
         if(!prop) return;
         p.held = null; this.grabFrom = null;
