@@ -15,6 +15,8 @@ export class Actor {
         this.team = team;
         this.name = name;
         this.isPlayer = isPlayer;
+        this.local = true;     // simulated on this client (online: the own player, and the host's bots; src/game/NetGame.js)
+        this.netId = null;     // online: 'p:<client>' or 'b:<team><i>'
         this.spawn = spawn;
         this.body = new CharacterBody(game.ctx, { position: spawn, owner: this });
         game.actorByCollider.set(this.body.collider.handle, this);
@@ -31,6 +33,8 @@ export class Actor {
         this.kills = 0; this.deaths = 0;
         this._ign = new Set();
     }
+    /** A person playing (this client's player, or another client's): bots hurt people less (BOT_DAMAGE_SCALE). */
+    get isHuman() { return this.isPlayer; }
     /** Where it is drawn (bots interpolate between their 30 Hz ticks). */
     get viewCenter() { return this.view ?? this.body.center; }
     /** Collider handles this actor's rays and movement ignore. */

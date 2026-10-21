@@ -499,7 +499,7 @@ export class Sfx {
         game.on('punch', ({ kind, mat, owner, point }) => owner === me() ? this.play('punch', { kind, family: fam(mat) }) : this.at('punch', point, { kind, family: fam(mat) }, 0.05, 40));
         game.on('dig', ({ owner, point, volume }) => { if(owner === me()) { this.play('pick'); } else this.at('pick', point, {}, 0.1, 35); });
         game.on('build', ({ size, owner, center }) => owner === me() ? this.play('build', { size: Math.cbrt(size[0] * size[1] * size[2]) }) : this.at('build', center, {}, 0.1));
-        game.on('rip', ({ mat }) => this.play('rip', { family: fam(mat) }));
+        game.on('rip', ({ mat, point, _net }) => _net ? this.at('rip', point, { family: fam(mat) }, 0.05, 60) : this.play('rip', { family: fam(mat) })); // _net: another player's
         game.on('shatter', ({ point, mat }) => this.at('shatter', point, { family: fam(mat) }, 0, 150));
         game.on('slam', ({ point, mat }) => this.at('shatter', point, { family: fam(mat) }, 0, 150));
         game.on('damage', ({ actor, amount, by }) => {
@@ -510,9 +510,9 @@ export class Sfx {
         game.on('respawn', ({ actor }) => { if(actor === me()) this.play('respawn'); });
         game.on('pickup', ({ actor, from }) => {
             if(actor === me()) this.play('pickup');
-            else { if(from === 'red') this.play('alarm'); else this.play('pickupOther', { friendly: actor.team === 'red' }); }
+            else { if(from === me().team && actor.team !== from) this.play('alarm'); else this.play('pickupOther', { friendly: actor.team === me().team }); }
         });
-        game.on('deposit', ({ actor }) => actor.team === 'red' ? this.play('deposit') : this.play('pickupOther', { friendly: false }));
+        game.on('deposit', ({ actor }) => actor.team === me().team ? this.play('deposit') : this.play('pickupOther', { friendly: false }));
         game.on('step', ({ actor }) => { if(actor === me()) this.play('step'); });
         game.on('land', ({ actor, speed }) => { if(actor === me()) this.play('land', { speed }); });
         game.on('tool', () => this.play('click'));

@@ -86,6 +86,16 @@ export const HUD_CSS = `
 .bz-hud.touch .bz-carry { bottom: 20px; }
 .bz-screen button.bz-bots.small { margin-top: 12px; font-size: 13px; padding: 6px 14px; background: #3a4458; color: #fff; }
 .bz-softinfo { margin-top: 10px; font-size: 12px; opacity: .7; }
+.bz-screen button.bz-online.small { margin-top: 12px; font-size: 13px; padding: 6px 14px; background: #2f6f4f; color: #fff; }
+.bz-roominfo { margin-top: 10px; font-size: 13px; opacity: .85; }
+.bz-roominfo:empty { display: none; }
+.bz-roominfo .red { color: #ff7a6a; } .bz-roominfo .blue { color: #7ab0ff; } .bz-roominfo a { color: #ffd060; }
+.bz-net { position: absolute; right: 10px; top: 44px; font: 600 12px system-ui, sans-serif; padding: 4px 9px; border-radius: 7px; background: rgba(16,20,28,.55); color: #fff; }
+.bz-net:empty { display: none; }
+.bz-net.bad { background: rgba(160,40,30,.75); }
+.bz-names { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.bz-name { position: absolute; left: 0; top: 0; font: 700 12px system-ui, sans-serif; padding: 1px 6px; border-radius: 4px; background: rgba(0,0,0,.45); white-space: nowrap; }
+.bz-name.red { color: #ff8a7a; } .bz-name.blue { color: #8ab8ff; }
 .bz-bots.corner { position: absolute; right: 10px; top: 10px; pointer-events: auto; font: 700 12px system-ui, sans-serif; padding: 5px 9px; border-radius: 7px; border: 0; background: rgba(16,20,28,.6); color: #fff; cursor: pointer; }
 .bz-hud:not(.touch) .bz-bots.corner { display: none; }
 .bz-hud.touch .bz-feed { top: 44px; }

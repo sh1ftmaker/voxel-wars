@@ -6,7 +6,7 @@
 import puppeteer from 'puppeteer-core';
 const base = process.argv[2] || 'http://127.0.0.1:5197/';
 const room = `t${Date.now() % 100000}`;
-const q = `?room=${room}&fly=1&bots=0&music=0`;
+const q = `?room=${room}&local=1&snapEvery=10&fly=1&bots=0&music=0`; // local: tabs of this browser (BroadcastChannel)
 const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new', args: ['--ignore-gpu-blocklist', '--use-angle=vulkan', '--window-size=960,540'] });
 const errors = [];
 let fails = 0;

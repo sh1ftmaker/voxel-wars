@@ -114,7 +114,13 @@ checks repair drift. Steps 1-2 (this) make every terrain change an entry in one 
   (hash check / snapshot point) and `resync`.
 - Transports (`src/net/transports.js`, picked in `src/net/index.js`): `LocalTransport` (single player, synchronous:
   nothing changes), `?loopback=latency,jitter` (in-page fake server through the codec), `?room=name`
-  (`BroadcastChannelTransport`: tabs of one browser; the tab holding the room's Web Lock hosts the sequencer).
+  (`PartyTransport`: a WebSocket to the room server, `server/`, reconnecting; `?server=` picks another server),
+  `?room=name&local=1` (`BroadcastChannelTransport`: tabs of one browser; the tab holding the room's Web Lock hosts
+  the sequencer).
+- Room server (`server/src/index.js`): one PartyServer Durable Object per room runs the same `Sequencer`, relays game
+  messages, persists the log and the host's snapshot in DO storage (a room idle 30 min starts over), elects the
+  oldest client host and passes hosting on when it leaves, rate-limits edits and caps message sizes. A reconnecting
+  client re-joins with the last seq it saw and gets the log after it (or the snapshot).
 - Codec (`src/net/codec.js`): versioned; JSON (doubles round-trip exactly) plus raw typed arrays, deflated when large.
 - Determinism: edits carry everything (brush specs with their seeds, grids, patches, `erode`); the worker's islands,
   collapse and fracture use no clock or `Math.random` (Voronoi sites from `rng(seed)`, seed from the body's id).
@@ -125,13 +131,34 @@ checks repair drift. Steps 1-2 (this) make every terrain change an entry in one 
 - Drift: the host marks a hash check every 3 s when something changed; at that point of the order every client hashes
   its chunks (FNV-1a, cached per chunk version: ~0.1 ms) and compares with the host's; differing chunks are resent
   (`resync`, applied at its own point of the order). Late join: the host snapshots the chunks that differ from the
-  generated level (every 10 s / 48 edits, ~50-120 kB deflated); the sequencer drops the log up to it; a joiner loads
+  generated level (every 30 s / 200 edits, ~100-200 kB deflated); the sequencer drops the log up to it; a joiner loads
   the level, the snapshot, then the log tail (history: no FX, no bodies).
-- Limits now: game state, players and body transforms are not replicated (steps 3-4); no host migration (the next tab
-  would take the lock but has no sequencer state); a background tab gets no animation frames, so a host tab in the
-  background runs no physics (it still sequences, applies edits and makes snapshots).
+- Limits: a background tab gets no animation frames, so a host tab in the background runs no physics or bots (it
+  still sequences, applies edits and makes snapshots); a late joiner does not get the bodies that are loose when it
+  arrives (they appear in the terrain when their owner stamps them).
 - Tests: `tools/test/netlog.mjs` (node: two TerrainCores, codec, snapshot join, resync), `tools/test/netroom.mjs`
-  (browser: two tabs, a late third, drift repair, single player), `tools/test/netperf.mjs` (single-player cost).
+  (browser: two tabs, a late third, drift repair, single player), `tools/test/netperf.mjs` (single-player cost),
+  `tools/test/mp.mjs` (three players through a room server: below).
+
+## Online game (src/game/NetGame.js)
+
+Steps 3-4: everything else in the match, as plain messages (`net.bcast` / `net.direct`, not sequenced). The header of
+`NetGame.js` lists them; in short:
+
+- Every client simulates its own player (the host also its bots) and streams it at 25 Hz; other clients draw it as a
+  `RemoteActor` (`src/game/RemoteActor.js`) 100 ms behind the owner's clock (interpolated), with a kinematic capsule so
+  rays, rockets and bodies hit it, and a name label.
+- The host keeps the roster (teams balanced on join, bots fill both teams), health (damage claims `hit` from whoever's
+  weapon hit; the host answers `hp`, deaths, respawns), the crates (`Crates.authority`), the clock and the score, and
+  sends it all in `game` once a second (the server keeps the last one for late joiners).
+- Rockets and bombs are actions: other clients fly visual copies (`Combat { visual }`); explosions, terrain and damage
+  come from the owner. Effects and sounds of local events are mirrored (`ev`).
+- Bodies have an owner (VoxelBodies `owner`; crates and others: host); owners stream moving bodies at 15 Hz, others
+  steer their copies toward it (`blendBodies`: a spring on velocity, held bodies kinematic). Grabbing claims a body;
+  a thrown one goes back to the host at rest. Lockstep (box3d is deterministic) would need the same inputs at the same
+  ticks on every client and the full physics state for late joiners, so owners stream instead.
+- Host migration: the next client takes over the bots where they stand, orphaned bodies, the crates and the clock.
+- Single player creates no `NetGame` (`game.netGame` is null): every hook is a no-op.
 
 ## Context (src/main.js)
 
