@@ -1,5 +1,5 @@
 /**
- * Structural support: overhangs that cannot carry themselves break off at their roots. Pure (no THREE, no Rapier):
+ * Structural support: overhangs that cannot carry themselves break off at their roots. Pure (no THREE, no physics engine):
  * runs in the terrain worker after a carve, and in Node for tests.
  *
  * Connectivity (src/voxel/islands.js) only frees matter that lost every bond to the ground, so a bridge blown out at

@@ -1,5 +1,5 @@
 /**
- * Connectivity and voxel grids for detached pieces. Pure (no THREE, no Rapier): runs in Node for tests.
+ * Connectivity and voxel grids for detached pieces. Pure (no THREE, no physics engine): runs in Node for tests.
  *
  * Terrain connectivity (`findIslands`): after an edit, flood fill the solid samples around the edit box. A fill is
  * grounded when it reaches the bottom of the world, a side of the world, a uniform solid chunk (8 m of solid rock is
@@ -532,8 +532,8 @@ export function gridBoxes(g, res = 2, shrink = 0.02) {
     return boxes;
 }
 
-/** Most collider boxes for a body: every box is a cuboid-trimesh contact pair against the terrain, the bulk of a
- *  Rapier step with debris about (tools/test/fracturecost.mjs). Detached islands 12, fracture pieces 4 (2 when
+/** Most collider boxes for a body: every box is a box-mesh contact pair against the terrain, the bulk of a
+ *  physics step with debris about (tools/test/fracturecost.mjs). Detached islands 12, fracture pieces 4 (2 when
  *  small, under ~6 m³). */
 export function maxBoxesFor(count, generation = 0) { return generation > 0 ? (count < 400 ? 2 : 4) : 12; }
 /** The collider boxes VoxelBody uses for a grid: the finest resolution (by size) that needs at most `maxBoxes`
@@ -544,7 +544,7 @@ export function colliderBoxes(g, count, generation = 0, maxBoxes = maxBoxesFor(c
     while(boxes.length > maxBoxes && res < 8) boxes = gridBoxes(g, ++res);
     return boxes;
 }
-/** Precomputed body data for a grid (stats and collider boxes), so the main thread only builds the Rapier body. */
+/** Precomputed body data for a grid (stats and collider boxes), so the main thread only builds the physics body. */
 export function gridPrep(g, generation = 0) {
     const stats = gridStats(g);
     return { stats, boxes: colliderBoxes(g, stats.count, generation), generation };

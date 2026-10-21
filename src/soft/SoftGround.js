@@ -341,7 +341,9 @@ export class SoftGround {
     // ------------------------------------------------------------------ sleep, bake
 
     _sleep(z) {
-        if(!z.plastic) { this._free(z); return; }
+        // in a room only the host bakes (its bake is an edit everyone applies): elsewhere the dent springs back
+        const net = this.ctx.net;
+        if(!z.plastic || (net && !net.single && !net.isHost)) { this._free(z); return; }
         z.state = 'frozen';
         this.sim.slotA[z.slot].w = 2; // drawn, no longer simulated
         const nodes = (z.n[0] + 1) * (z.n[1] + 1) * (z.n[2] + 1);

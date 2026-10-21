@@ -39,11 +39,20 @@
  *   - bodies leaving the world are removed; bodies the game removes (physics.removeBody) are forgotten.
  *   - a kinematic body (held by a player) or one with userData.held never settles or fractures; one with
  *     userData.thrown (a thrown rock) only cracks along its soft lattice, it never shatters.
+ *
+ * Net (ctx.net, src/net): every body has `netId` (the same on every client: `${seq}:${island}` for a piece of terrain
+ * that came loose in edit `seq`, `${seq}:r${i}` for a ripped lump, `${parent}.f${i}` / `.c${i}` for fracture and
+ * component pieces) and `owner` (the client that decides about it: the host for what the terrain shed, the ripper
+ * for a lump). Body motion differs between clients (bodies are not stepped in lockstep), so only the owner decides
+ * what depends on it: settling (a 'stamp' edit { id, grid, t, q } in the log: everyone stamps the owner's grid at the owner's pose; other clients
+ * drop their copy of that body) and fracture (a transient 'bsplit' { id, p (body-local), dv, n, minCount, seed,
+ * cells } that the others replay on their copy, seeded alike). Other clients keep simulating their copies until then
+ * (transform streaming comes later) and drop a copy that has been still for NONOWNER_REST s.
  */
 import { VOXEL, CHUNK } from '../config.js';
 import { MATERIALS } from '../voxel/materials.js';
 import { VoxelWorld } from '../voxel/VoxelWorld.js';
-import { sphere, box, rock, specOf } from '../voxel/brushes.js';
+import { sphere, box, rock, specOf, rng } from '../voxel/brushes.js';
 import { stampGrid, findIslands, islandsJob, detachIsland, splitGrid, voronoiLabels, carveGrid, stampJob, liftGrid, gridStats, gridBoxes, gridHullPoints, newGrid, SAMPLE_VOLUME } from '../voxel/islands.js';
 import { PAD } from '../config.js';
 import { VoxelBody } from '../voxel/VoxelBody.js';
@@ -75,6 +84,10 @@ const SHATTER = 8;
 const CRACK_WAIT = 0.4, CRACK_FALLBACK = 1.8, CLEAVE = 3;
 /** Velocity changes (m/s) under this do not shake the soft layer. */
 const SOFT_DV = 1.5;
+/** A body this client does not own that has been still this long is dropped (its owner stamps or dusts it). */
+const NONOWNER_REST = 20;
+/** A number from a body's netId (seeds its fracture alike on every client). */
+const seedOf = (id) => { let h = 0x811c9dc5; for(let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; };
 
 export class VoxelBodies {
     constructor(ctx) {
@@ -97,6 +110,11 @@ export class VoxelBodies {
         this.breaks = new Map();   // VoxelBody -> [point, dv]: fractures waiting for the next frame's budget
         this.stats = { detached: 0, fractured: 0, stamped: 0, pulverized: 0, lastIslandsMs: 0, lastFractureMs: 0, frameMs: 0, frameMsMax: 0, jobs: 0 };
         this.physics.voxelBodies = this;
+        this.net = ctx.net || null;
+        if(this.net) {
+            this.net.on('stamp', (e, m) => this._applyStamp(e, m));
+            this.net.on('bsplit', (e, m) => this._applySplit(e, m));
+        }
         this.soft = new SoftBodies({ material: this.material, params: ctx.params });
         this.soft.onSplit = (vb, split) => this.crack(vb, split);
         // later generations are tougher (as breakDv); pieces too small to fracture only wobble
@@ -139,6 +157,44 @@ export class VoxelBodies {
     }
 
     get count() { return this.list.size; }
+
+    // ------------------------------------------------------------ net: ownership, stamps and splits as edits
+
+    /** Does this client decide about `vb` (settling, fracture)? Always in single player. */
+    isOwner(vb) { const n = this.net; return !n || n.single || vb.owner == null || vb.owner === n.id; }
+    get multi() { return !!this.net && !this.net.single; }
+    byId(id) { for(const vb of this.list) if(vb.netId === id && !vb.dead) return vb; return null; }
+    /** A 'stamp' edit in sequence order: union the owner's grid at the owner's pose; others drop their copy. */
+    _applyStamp(e, { local }) {
+        const p = this.world.remote.stamp(e.grid, e.t, e.q);
+        if(!local && e.id) {
+            for(const vb of [...this.list]) {
+                const id = vb.netId;
+                if(!id || this.isOwner(vb) || vb.stamping) continue;
+                if(id === e.id || e.id.startsWith(id + '.') || id.startsWith(e.id + '.')) { vb.dispose(); this.list.delete(vb); }
+            }
+        }
+        return p;
+    }
+    /** Another client's fracture of a body: replay it on this client's copy (same sites, same piece ids). */
+    _applySplit(e, { local, later = false }) {
+        if(local) return;
+        const st = this.stats.net ||= { splitsIn: 0, replayed: 0, splitsLost: 0 };
+        if(!later) st.splitsIn++;
+        const vb = this.byId(e.id);
+        // a piece this client has not made yet (its parent's split is still being replayed): keep it a while
+        if(!vb || vb.fracturing) { (this.laterSplits ||= new Map()).set(e.id, { e, t: 0 }); return; }
+        if(this.isOwner(vb) || vb.stamping) return;
+        st.replayed++;
+        this.breaks.set(vb, [vb.toWorld(e.p), e.dv, e.cells || null, 0, { n: e.n, minCount: e.minCount, seed: e.seed }]);
+    }
+    _laterSplits(dt) {
+        for(const [id, w] of this.laterSplits) {
+            const vb = this.byId(id);
+            if(vb && !vb.fracturing) { this.laterSplits.delete(id); this._applySplit(w.e, { local: false, later: true }); }
+            else if((w.t += dt) > 5) { this.laterSplits.delete(id); this.stats.net.splitsLost++; }
+        }
+    }
 
     // ------------------------------------------------------------ creation
 
@@ -194,19 +250,37 @@ export class VoxelBodies {
         }
     }
     /** Bodies and dust from a terrain worker reply (TerrainCore 'brush' with conn): islands cut out of the world. */
-    fromWorker(rep, kick = null) {
+    fromWorker(rep, kick = null, { seq = 0, from = null, local = true, lift = false } = {}) {
         const kicks = kick ? [kick] : [];
         if(rep.islandsMs !== undefined) this.stats.lastIslandsMs = rep.islandsMs;
         for(const d of rep.dust || []) this._dust(d.center, d.removed, 'carve');
+        // what the terrain shed belongs to the host
+        const owner = this.net ? this.net.hostId ?? this.net.id : null;
         // one body per budgeted unit (a frame each when several arrive): a body's first contacts cost a physics step
-        for(const isl of rep.islands || []) this.jobs.push({ kind: 'island', isl, kicks });
+        (rep.islands || []).forEach((isl, i) => this.jobs.push({ kind: 'island', isl, kicks, id: `${seq}:${i}`, owner }));
+        // another client's rip: the same lump, from the worker's lift (the ripper made its own from its replica)
+        if(lift && !local && rep.lift) this._liftBodies(rep.lift, `${seq}:r`, from);
+    }
+    /** Bodies for a lifted grid (a rip): its connected pieces, the largest first; crumbs are skipped. */
+    _liftBodies(g, id, owner, userData = {}, waitKeys = null) {
+        const pieces = splitGrid(g).filter(p => p.count > 0);
+        pieces.sort((a, b) => b.count - a.count);
+        const made = [];
+        pieces.forEach((p, i) => {
+            if(p.count < DEBRIS && made.length) return;
+            const o = [(g.offset[0] + p.offset[0]) * VOXEL, (g.offset[1] + p.offset[1]) * VOXEL, (g.offset[2] + p.offset[2]) * VOXEL];
+            const vb = this.add(p, { origin: o, waitKeys, userData: made.length ? {} : userData });
+            vb.netId = `${id}${i}`; vb.owner = owner;
+            made.push(vb);
+        });
+        return made;
     }
     /** A body for an island the terrain worker cut out (dust when far over the body cap). */
     _runIsland(j) {
         if(this.islandFrame === this.frameNo) return WAIT;
         const isl = j.isl;
         if(this.list.size >= this.maxBodies * 2) this._dust(isl.grid.offset.map(v => v * VOXEL), isl.grid.prep.stats.volumes, 'carve');
-        else this._bodyFromIsland(isl, j.kicks);
+        else this._bodyFromIsland(isl, j.kicks, j.id, j.owner);
         this.islandFrame = this.frameNo; // one new body per frame
         return true;
     }
@@ -220,9 +294,10 @@ export class VoxelBodies {
         if(small || !d.grid.count) { const c = isl.min.map((v, a) => (v + isl.max[a]) * 0.5 * VOXEL); this._dust(c, d.removed, 'carve'); return null; }
         return d;
     }
-    _bodyFromIsland(d, kicks) {
+    _bodyFromIsland(d, kicks, id = null, owner = null) {
         const g = d.grid;
         const vb = this.add(g, { origin: [g.offset[0] * VOXEL, g.offset[1] * VOXEL, g.offset[2] * VOXEL], waitKeys: [...d.dirty], prep: g.prep || null });
+        vb.netId = id; vb.owner = owner;
         vb.body.wakeUp();
         this.stats.detached++;
         if(d.collapse) this._hinge(vb, d.collapse);
@@ -253,12 +328,24 @@ export class VoxelBodies {
         this.soft.frame(Math.min(0.1, (t0 - (this.lastFrame ?? t0)) / 1000));
         this.lastFrame = t0;
         this.frameNo = (this.frameNo || 0) + 1;
+        if(this.laterSplits?.size) this._laterSplits(Math.min(0.1, (t0 - (this.lastSplitT ?? t0)) / 1000) || 1 / 60);
+        this.lastSplitT = t0;
         // fractures go first (staged jobs: pieces, then one disabled body per unit, then an atomic swap)
-        for(const [vb, [point, dv, cells, few]] of this.breaks) {
+        for(const [vb, [point, dv, cells, few, forced]] of this.breaks) {
             this.breaks.delete(vb);
             if(vb.dead || vb.fracturing || vb.stamping || !this.list.has(vb) || !vb.body.isDynamic() || (cells && vb.prop.userData.held)) { if(cells) this.soft.gridChanged(vb); continue; }
             vb.fracturing = true;
-            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, few: few || 0, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
+            // how many pieces and the smallest kept: decided here (by the owner) and sent with the split
+            const energy = Math.min(4, dv / this.breakDv(vb));
+            const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
+            const n = forced ? forced.n : few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
+            const minCount = forced ? forced.minCount : this.debrisMin();
+            const seed = forced ? forced.seed : vb.netId ? seedOf(vb.netId) : null;
+            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, few: few || 0, n, minCount, seed, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
+            if(!forced && this.multi && vb.netId) {
+                const c = cells ? { labels: cells.labels, cellOf: cells.cellOf, cs: cells.cs, dims: cells.dims } : null;
+                this.net.submit({ k: 'bsplit', id: vb.netId, p: vb.toLocal(point), dv, n, minCount, seed, cells: c }, { log: false });
+            }
         }
         // jobs run in order; one waiting for the terrain worker (WAIT) lets the next ones run meanwhile
         let first = true, k = 0;
@@ -308,11 +395,8 @@ export class VoxelBodies {
             if(j.asked) return WAIT;
             j.asked = true;
             const g = vb.grid;
-            const energy = Math.min(4, j.dv / this.breakDv(vb));
-            const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
-            const n = j.few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
             const c = j.cells, cells = c ? { labels: c.labels, cellOf: c.cellOf, cs: c.cs, dims: c.dims } : null;
-            remote.split(g, { point: vb.toLocal(j.point), n, cells, minCount: this.debrisMin(), generation: vb.generation + 1 }).then(rep => {
+            remote.split(g, { point: vb.toLocal(j.point), n: j.n, cells, minCount: j.minCount, generation: vb.generation + 1, seed: j.seed }).then(rep => {
                 j.pieces = rep.same ? [g] : rep.pieces;
                 j.dust.set(rep.dust);
             }, () => { j.pieces = []; });
@@ -324,11 +408,8 @@ export class VoxelBodies {
         if(!j.pieces) {
             const g = vb.grid;
             if(this.debug) console.log(`fracture n=${g.count} gen=${vb.generation} age=${vb.age.toFixed(2)} dv=${j.dv.toFixed(1)} break=${this.breakDv(vb).toFixed(1)} mass=${(vb.mass / 1000).toFixed(1)}t`);
-            const energy = Math.min(4, j.dv / this.breakDv(vb));
-            const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
-            const n = j.few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
             const c = j.cells;
-            j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), n), { minCount: this.debrisMin(), dust: j.dust });
+            j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), j.n, j.seed != null ? rng(j.seed) : Math.random), { minCount: j.minCount, dust: j.dust });
             j.sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
             j.held = { ...vb.prop.userData }; delete j.held.voxelBody; delete j.held.ripped;
             j.ms = performance.now() - t0;
@@ -338,6 +419,7 @@ export class VoxelBodies {
             // one piece per unit, parked (disabled, hidden) at the parent's current pose
             const p = j.pieces[j.i++];
             const kid = new VoxelBody(this, p, { origin: vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]), rotation: vb.rotation(), generation: vb.generation + 1, userData: { ...j.held }, waitKeys: vb.waitKeys, sibling: j.sibling, enabled: false, prep: p.prep || null });
+            kid.netId = vb.netId ? `${vb.netId}.f${j.i - 1}` : null; kid.owner = vb.owner;
             j.kids.push({ kid, p });
             j.ms += performance.now() - t0;
             return false;
@@ -390,20 +472,14 @@ export class VoxelBodies {
         const r = remote ? null : this.world.applyBrush(brush, { op: 'carve', hardness: false });
         // with the terrain worker the world is cut a frame or two later (the lump ignores the terrain until then)
         const waitKeys = r ? [...r.dirty] : [...this.world.chunksInSampleBox(brush.min.map(v => Math.floor(v / VOXEL) - 4 - PAD - 1), brush.max.map(v => Math.ceil(v / VOXEL) + 4 + PAD + 1))];
-        const pieces = splitGrid(g).filter(p => p.count > 0);
-        pieces.sort((a, b) => b.count - a.count);
-        let lump = null;
-        for(const p of pieces) {
-            if(p.count < DEBRIS && lump) continue;
-            const o = [(g.offset[0] + p.offset[0]) * VOXEL, (g.offset[1] + p.offset[1]) * VOXEL, (g.offset[2] + p.offset[2]) * VOXEL];
-            const vb = this.add(p, { origin: o, waitKeys, userData: lump ? {} : { ripped: true, ...userData } });
-            if(!lump) lump = vb;
-        }
+        // the ripper's own lump, at once (from its replica); the other clients make theirs from the worker's lift
+        const made = this._liftBodies(g, 'pending:r', this.net ? this.net.id : null, { ripped: true, ...userData }, waitKeys);
+        const lump = made[0] || null;
         if(remote) {
-            const made = [...this.list].filter(vb => vb.waitKeys === waitKeys);
             for(const vb of made) vb.waitRemote = true;
             const release = () => { for(const vb of made) vb.waitRemote = false; };
-            remote.brush(brush, { op: 'carve', hardness: false, conn: true, erode: Math.max(0, this.erode), debris: DEBRIS }).then(rep => { release(); this.fromWorker(rep); }, release);
+            this.ctx.destruction.submit({ k: 'brush', spec: specOf(brush), op: 'carve', mat: 1, hardness: false, conn: true, erode: Math.max(0, this.erode), debris: DEBRIS, lift: true, kind: 'rip', author: userData.author ?? null })
+                .then(rep => { release(); for(const vb of made) vb.netId = vb.netId.replace('pending:', `${rep.seq}:`); }, release);
         }
         else if(r.changed) this.queueConnectivity(r.box[0], r.box[1], brush);
         return lump;
@@ -527,7 +603,7 @@ export class VoxelBodies {
      * Swap a body for pieces of its grid (each with `offset` in the body's grid-local samples). Pieces inherit the
      * body's motion (v + w x r) plus `spread` m/s away from `point`. Tiny pieces are dust. Returns { removed, bodies }.
      */
-    replace(vb, pieces, { point = null, spread = 0, generation = vb.generation }) {
+    replace(vb, pieces, { point = null, spread = 0, generation = vb.generation, tag = 'c' }) {
         const b = vb.body;
         const v = b.linvel(), w = b.angvel(), com = b.worldCom();
         const rot = vb.rotation();
@@ -544,7 +620,7 @@ export class VoxelBodies {
         });
         vb.dispose({ keepMesh: true });
         this.list.delete(vb);
-        for(const { p, st, o } of pieceData) {
+        for(const [idx, { p, st, o }] of pieceData.entries()) {
             if(st.count < this.debrisMin()) { for(let i = 0; i < 256; i++) removed[i] += st.volumes[i]; continue; }
             // centre of mass of the piece in world space
             const rc = rotate(rot, st.com), c = [o[0] + rc[0], o[1] + rc[1], o[2] + rc[2]];
@@ -559,6 +635,7 @@ export class VoxelBodies {
                 for(let a = 0; a < 3; a++) av[a] += (Math.random() - 0.5) * spread * 0.6;
             }
             const kid = this.add(p, { origin: o, rotation: rot, linvel: lv, angvel: av, generation, userData: { ...held }, waitKeys: vb.waitKeys, sibling: pieces.length > 1 ? sibling : 0, prep: p.prep || null });
+            kid.netId = vb.netId ? `${vb.netId}.${tag}${idx}` : null; kid.owner = vb.owner;
             this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
             kids.push(kid);
         }
@@ -579,6 +656,7 @@ export class VoxelBodies {
     /** The soft lattice of `vb` came apart (a SoftBodies split): break the body along it (a 'frac' job). */
     crack(vb, split) {
         if(this.breaks.has(vb) || vb.dead || !this.list.has(vb)) return;
+        if(!this.isOwner(vb)) { this.soft.gridChanged(vb); return; } // its owner decides (a 'bsplit' follows)
         this.stats.cracked = (this.stats.cracked || 0) + 1;
         this.breaks.set(vb, [vb.toWorld(split.at || vb.frame), 0, split]);
     }
@@ -600,7 +678,7 @@ export class VoxelBodies {
         const labels = voronoiLabels(g, vb.toLocal(point), n);
         const dust = new Float64Array(256);
         const pieces = splitGrid(g, labels, { minCount: this.debrisMin(), dust });
-        const { removed } = this.replace(vb, pieces, { point, spread: Math.min(8, 1.5 + dv * 0.15), generation: vb.generation + 1 });
+        const { removed } = this.replace(vb, pieces, { point, spread: Math.min(8, 1.5 + dv * 0.15), generation: vb.generation + 1, tag: 'f' });
         for(let i = 0; i < 256; i++) removed[i] += dust[i];
         this.stats.fractured++;
         this.stats.lastFractureMs = performance.now() - t0;
@@ -656,7 +734,7 @@ export class VoxelBodies {
                     vb.cool = 0.12;
                     this.events.dispatchEvent(new CustomEvent('impact', { detail: { point, speed: dv, mat: vb.mat, prop: vb.prop } }));
                 }
-                if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > brk) {
+                if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > brk && this.isOwner(vb)) {
                     // under SHATTER: let the soft lattice crack it (crack()), with a Voronoi fallback if it holds
                     // (a thrown body always cracks rather than bursting: Combat.throwHeld)
                     const soft = this.soft.enabled && (energy < SHATTER || vb.prop.userData.thrown) && vb.softRec?.state !== 'dead';
@@ -705,6 +783,7 @@ export class VoxelBodies {
                 if(v.x * v.x + v.y * v.y + v.z * v.z < 0.25 && w.x * w.x + w.y * w.y + w.z * w.z < 0.25) vb.still += h;
                 else vb.still = Math.max(0, vb.still - h * 4);
             }
+            if(!this.isOwner(vb)) { if(vb.still > NONOWNER_REST) { vb.dispose(); this.list.delete(vb); } continue; }
             if(vb.still > SETTLE || (vb.age > 25 && vb.still > 0.5)) this.stamp(vb);
         }
         // budget: over the cap, stamp the stillest bodies, then pulverize the smallest moving ones
@@ -735,7 +814,7 @@ export class VoxelBodies {
     /** Union a body into the terrain at its pose (a background job); it is removed once the terrain there has been
      *  remeshed and has its new colliders. */
     stamp(vb) {
-        if(vb.stamping || vb.dead || vb.fracturing) return;
+        if(vb.stamping || vb.dead || vb.fracturing || !this.isOwner(vb)) return;
         this.stats.stamped++;
         this.soft.gridChanged(vb); // stamped as built: no more wobble
         vb.body.setBodyType(BodyType.Fixed, false);
@@ -743,7 +822,10 @@ export class VoxelBodies {
         vb.stampKeys = null;
         const remote = this.world.remote;
         if(remote) {
-            remote.stamp(vb.grid, vb.gridOrigin(), vb.rotation()).then(rep => { vb.stampKeys = rep.dirty; vb.stampT = 0; }, () => { vb.stampKeys = []; vb.stampT = 0; });
+            const g = vb.grid, t = vb.gridOrigin(), q = vb.rotation();
+            const grid = { nx: g.nx, ny: g.ny, nz: g.nz, sdf: g.sdf, mat: g.mat, count: g.count, offset: g.offset };
+            const done = this.net ? this.net.submit({ k: 'stamp', id: vb.netId, grid, t: [...t], q: [...q] }) : remote.stamp(grid, t, q);
+            done.then(rep => { vb.stampKeys = rep.dirty; vb.stampT = 0; }, () => { vb.stampKeys = []; vb.stampT = 0; });
             return;
         }
         this.jobs.push({ kind: 'stamp', vb, gen: stampJob(this.world, vb.grid, vb.gridOrigin(), vb.rotation(), 4096) });

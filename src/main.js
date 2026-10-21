@@ -19,6 +19,7 @@ import { FlyCamera } from './dev/FlyCamera.js';
 import { FortWar } from './game/FortWar.js';
 import { Profiler } from './dev/Profiler.js';
 import { SoftGround } from './soft/SoftGround.js';
+import { createNet } from './net/index.js';
 
 const $ = (id) => document.getElementById(id);
 const status = (s) => { $('loading').textContent = s; };
@@ -46,8 +47,11 @@ const world = new VoxelWorld();
 let t0 = performance.now();
 // the terrain worker (src/voxel/TerrainSync.js) owns the world and its edits; `world` here is its read-only replica
 // (?terrainWorker=0: the same core runs on the main thread)
+let sync = null;
 if(params.get('terrainWorker') === 'sync') voxelize(world, new Level()); // no worker at all: edits on the main thread
-else await new TerrainSync(world, { worker: params.get('terrainWorker') !== '0' }).init();
+else await (sync = new TerrainSync(world, { worker: params.get('terrainWorker') !== '0' })).init();
+// the edit log (src/net): every terrain edit is sequenced and applied in order (single player: synchronously)
+const net = sync ? await createNet(params, sync) : null;
 console.log(`world ready in ${(performance.now() - t0).toFixed(0)} ms`);
 prof.loadMark('world');
 const terrain = new TerrainRenderer(world, scene, camera);
@@ -56,7 +60,7 @@ const physics = await Physics.create({ world, terrain, scene });
 terrain.remeshAll();
 
 const systems = [];
-const ctx = { renderer, scene, camera, sun, env, world, terrain, physics, params, events: new EventTarget(), addSystem: (s, name) => { s.profileName = name || s.constructor.name; systems.push(s); return s; } };
+const ctx = { renderer, scene, camera, sun, env, world, terrain, physics, params, net, events: new EventTarget(), addSystem: (s, name) => { s.profileName = name || s.constructor.name; systems.push(s); return s; } };
 prof.ctx = ctx;
 ctx.destruction = new Destruction(ctx);
 window.ctx = ctx; // for debugging and headless tests
@@ -64,6 +68,7 @@ window.ctx = ctx; // for debugging and headless tests
 // ---- game systems are added here (one line each) ----
 ctx.addSystem(params.get('fly') === '1' ? new FlyCamera(ctx) : new FortWar(ctx), 'game');
 ctx.addSystem(new SoftGround(ctx), 'soft'); // soft ground wake zones (src/soft), ctx.soft
+net?.ready(); // the edit handlers are in: apply the log (a late joiner catches up here)
 
 status('Meshing...');
 while(terrain.pending > 0) await nextFrame();

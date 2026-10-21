@@ -5,7 +5,7 @@
  *
  * Frames: everything is in the body's grid-local metres (sample i at i * VOXEL). The lattice's node (0, 0, 0) is at
  * sample -1 (the mesher's padding ring), node (I, J, K) at sample -1 + cs * (I, J, K). A node's state is its
- * displacement u from that rest point and its velocity v; Rapier owns the rigid motion, so after every substep the
+ * displacement u from that rest point and its velocity v; the physics engine owns the rigid motion, so after every substep the
  * lattice's mean translation, mean velocity and best-fit rotation are removed (the soft layer carries only bending,
  * squash and wobble).
  *

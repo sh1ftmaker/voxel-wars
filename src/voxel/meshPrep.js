@@ -1,6 +1,6 @@
 /**
  * Mesh post-processing that used to run on the main thread, done in the mesh worker (src/workers/mesher.js) right
- * after meshing. Pure (no three.js, no Rapier).
+ * after meshing. Pure (no three.js, no physics engine).
  *
  *   prepMesh(mesh, origin?) adds to a surfaceNets mesh:
  *     matBlend  Float32Array vec3 per vertex (material A, material B, blend), the terrain material's attribute

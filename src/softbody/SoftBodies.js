@@ -1,5 +1,5 @@
 /**
- * Soft debris: detached voxel bodies bend, jiggle and crack. Rapier keeps each body's rigid motion; on top of it a
+ * Soft debris: detached voxel bodies bend, jiggle and crack. box3d keeps each body's rigid motion; on top of it a
  * body-local tet lattice (src/softbody/lattice.js) is simulated in a worker (src/workers/softBody.js) and drawn by
  * displacing the body mesh in the vertex shader (trilinear over the lattice nodes, read from a float texture atlas:
  * works on WebGL2 and WebGPU). Owned by VoxelBodies (bodies.soft).

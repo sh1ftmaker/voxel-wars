@@ -26,13 +26,19 @@
  *   and `result.done` is a Promise of the final result. 'destroyed' and 'detached' fire when the worker answers
  *   (a frame or two later). Without the worker result.done resolves at once to the same object.
  *
+ * Net (src/net): with ctx.net every terrain edit is submitted to the room's edit log and applied when it comes back in
+ *   sequence order (single player: LocalTransport answers synchronously, so nothing changes). The submitter carves
+ *   voxel bodies and pushes physics bodies at once; other clients do that when the edit arrives. Edit kinds handled
+ *   here: 'brush' { spec, op, mat, hardness, conn, erode, debris, lift, kind, impulse, dir, author } and 'samples'
+ *   { patch } (soft-ground bakes, world.applySamples); VoxelBodies handles 'stamp' and 'bsplit'.
+ *
  * Events on ctx.events (CustomEvent, data in e.detail):
  *   'destroyed' { center: [x,y,z], box: [min, max] (metres), removed: Float64Array, volume, author, kind: 'carve'|'blast'|'impact' }
  *   'detached'  { prop, volume, mat }      a piece of terrain broke loose and is now a body
  *   'impact'    { point, speed, mat, prop } a voxel body hit something hard (speed = its velocity change, m/s)
  */
 import { VOXEL } from '../config.js';
-import { rock } from '../voxel/brushes.js';
+import { rock, specOf, brushFromSpec } from '../voxel/brushes.js';
 import * as brushes from '../voxel/brushes.js';
 import { VoxelBodies, DEBRIS } from './VoxelBodies.js';
 
@@ -45,6 +51,50 @@ export class Destruction {
         /** Soft ground (src/soft/SoftGround.js) and other observers: fn({ op, center, size, impulse, kind, changed, box, dir })
          *  after every carve / add (box in metres). */
         this.editHooks = [];
+        const net = ctx.net;
+        if(net) {
+            net.on('brush', (e, meta) => this._applyBrush(e, meta));
+            net.on('samples', (e) => ctx.world.remote.samples(e.patch));
+            ctx.world.applySamples = (patch) => net.submit({ k: 'samples', patch });
+        }
+    }
+    /** Submit a terrain edit to the edit log (or apply it here when there is no net). Resolves to the worker's reply. */
+    submit(e) {
+        const net = this.ctx.net;
+        return net ? net.submit(e) : this._applyBrush(e, { local: true, seq: 0, from: null });
+    }
+    /**
+     * A 'brush' edit in sequence order: the terrain worker applies it (connectivity, structural collapse); islands that
+     * came loose become bodies (ids from the edit's seq), the soft ground hears about it. An edit from another client
+     * also carves this client's voxel bodies, pushes bodies around and emits 'destroyed' (the submitter did that
+     * already). Returns the reply's promise.
+     */
+    _applyBrush(e, { local, seq, from, history = false }) {
+        const { world, physics, events } = this.ctx;
+        const brush = brushFromSpec(e.spec);
+        const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
+        const kick = e.impulse ? { center, radius: Math.max(...brush.max.map((v, i) => v - brush.min[i])) * 0.9, strength: e.impulse } : null;
+        if(history) return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris });
+        if(!local && !e.lift) {
+            if(e.op === 'carve') this.bodies.carve(brush, { hardness: e.hardness });
+            if(kick) physics.explode(kick.center, kick.radius, kick.strength);
+        }
+        return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, lift: e.lift }).then(rep => {
+            rep.seq = seq;
+            this.bodies.fromWorker(rep, kick, { seq, from, local, lift: e.lift });
+            const r = rep.result;
+            const box = [r.box[0].map(x => x * VOXEL), r.box[1].map(x => x * VOXEL)];
+            if(this.editHooks.length && !e.lift) {
+                const size = Math.max(...brush.max.map((x, i) => x - brush.min[i])) / 2;
+                for(const fn of this.editHooks) try { fn({ op: e.op, center, size, impulse: e.impulse || 0, kind: e.kind, changed: r.changed, box, dir: e.dir || null }); } catch(err) { console.error(err); }
+            }
+            if(!local) {
+                let v = 0;
+                for(let i = 0; i < 256; i++) v += r.removed[i];
+                if(v > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box, removed: r.removed, volume: v, author: e.author ?? null, kind: e.kind || 'carve', remote: true } }));
+            }
+            return rep;
+        });
     }
     carve(brush, opts = {}) {
         if(this.ctx.world.remote) return this._carveRemote(brush, opts);
@@ -95,21 +145,15 @@ export class Destruction {
         if(kick) physics.explode(kick.center, kick.radius, kick.strength);
         const result = { removed, volume, added: 0, center, box: [brush.min.map(v => v - 4 * VOXEL), brush.max.map(v => v + 4 * VOXEL)], changed: 0, detached: [], pending: true };
         const bodies = this.bodies;
-        const terrainDone = world.remote.brush(brush, { op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS });
+        const terrainDone = this.submit({ k: 'brush', spec: specOf(brush), op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS, kind, impulse, dir, author });
         result.done = Promise.all([terrainDone, bodyDone]).then(([rep, b]) => {
             if(b) for(let i = 0; i < 256; i++) removed[i] += b.removed[i]; // the bodies' share (carved in the worker too)
             const r = rep.result;
             let v = 0;
             for(let i = 0; i < 256; i++) { removed[i] += r.removed[i]; v += removed[i]; }
             result.volume = v; result.added = r.added; result.changed = r.changed; result.pending = false;
-            const box = result.box = [r.box[0].map(x => x * VOXEL), r.box[1].map(x => x * VOXEL)];
-            // islands that lost their support become bodies, pushed by this blast; tiny ones are dust
-            bodies.fromWorker(rep, kick);
-            if(this.editHooks.length) {
-                const size = Math.max(...brush.max.map((x, i) => x - brush.min[i])) / 2;
-                for(const fn of this.editHooks) try { fn({ op, center, size, impulse, kind, changed: r.changed, box, dir }); } catch(e) { console.error(e); }
-            }
-            if(v > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box, removed, volume: v, author, kind } }));
+            result.box = [r.box[0].map(x => x * VOXEL), r.box[1].map(x => x * VOXEL)];
+            if(v > 0) events.dispatchEvent(new CustomEvent('destroyed', { detail: { center, box: result.box, removed, volume: v, author, kind } }));
             return result;
         });
         return result;

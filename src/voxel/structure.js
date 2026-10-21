@@ -1,7 +1,7 @@
 /**
  * Structural failure: after an edit, find overhangs that are still attached but can no longer carry themselves, so
  * a bridge blown out at one end, an undercut ledge or a cave dug too wide comes down instead of hanging in the air.
- * Pure (no THREE, no Rapier); runs in the terrain worker (TerrainCore.brush) right after findIslands.
+ * Pure (no THREE, no physics engine); runs in the terrain worker (TerrainCore.brush) right after findIslands.
  *
  * Model:
  *   full     a solid sample with solid all the way down to the bedrock in its column: it stands on the ground
