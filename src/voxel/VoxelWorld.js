@@ -14,7 +14,12 @@
  * samples: `writeSamples(patch)` here, `world.applySamples(patch)` on the replica.
  */
 import { VOXEL, CHUNK, SDF_SCALE, SDF_MAX, PAD, WORLD_CHUNKS, BEDROCK_SAMPLES } from '../config.js';
-import { REACH, BEDROCK } from './materials.js';
+import { REACH, BEDROCK, MATERIALS } from './materials.js';
+import { CARVE_AMP, CARVE_STRETCH, CARVE_GRAIN, carveOffset } from './brushes.js';
+
+/** Soils that pile up a rim around a blast crater (applyBrush `rim`). */
+const RIM_SOIL = new Uint8Array(256);
+for(const m of MATERIALS) if(m.fracture === 'crumble' && m.name !== 'Lava') RIM_SOIL[m.id] = 1;
 
 const N = CHUNK, N2 = N * N, N3 = N * N * N;
 const BLOCK_HALF_DIAG = 1.5 * Math.sqrt(3) * VOXEL; // a block of 4 samples spans 3 voxels
@@ -96,6 +101,54 @@ export class VoxelWorld {
         out[0] /= l; out[1] /= l; out[2] /= l;
         return out;
     }
+    /**
+     * A mound of `volume` m³ in a ring around a crater at (cx, cy, cz) of radius R: a raised-cosine bump on the ground
+     * surface of every column in the ring whose top sample is soil (the column's own material: grass stays on top).
+     * Columns whose surface is far above or below the crater centre (walls, cliffs) are left alone. Returns
+     * { added, changed, lo, hi } or null.
+     */
+    _rim(cx, cy, cz, R, volume) {
+        const Rc = R * 1.15, w = Math.max(0.6, R * 0.55);
+        // ring volume of a raised-cosine profile of height H and half width w: 2 pi Rc * w * H
+        const H = Math.min(R * 0.45, 1.1, volume / (2 * Math.PI * Rc * w));
+        if(H < VOXEL * 0.3) return null;
+        const x0 = Math.floor((cx - Rc - w) / VOXEL), x1 = Math.ceil((cx + Rc + w) / VOXEL);
+        const z0 = Math.floor((cz - Rc - w) / VOXEL), z1 = Math.ceil((cz + Rc + w) / VOXEL);
+        const yTop = Math.ceil((cy + R + H) / VOXEL) + 2, yBot = Math.floor((cy - R * 1.2) / VOXEL);
+        const cell = VOXEL ** 3;
+        let added = 0, changed = 0;
+        const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+        const touched = new Set();
+        for(let iz = z0; iz <= z1; iz++) for(let ix = x0; ix <= x1; ix++) {
+            const dr = Math.hypot(ix * VOXEL - cx, iz * VOXEL - cz) - Rc;
+            if(Math.abs(dr) >= w) continue;
+            const h = H * 0.5 * (1 + Math.cos(Math.PI * dr / w));
+            // the column's surface: the first solid sample from the top
+            let iy = yTop;
+            while(iy >= yBot && this.get(ix, iy, iz) >= 0) iy--;
+            if(iy < yBot || iy >= yTop) continue;
+            const m = this.getMat(ix, iy, iz);
+            if(!RIM_SOIL[m]) continue;
+            const s0 = this.get(ix, iy, iz), s1 = this.get(ix, iy + 1, iz);
+            const top = (iy + s0 / (s0 - s1)) * VOXEL; // the zero crossing between the two samples
+            const want = top + h;
+            for(let y = iy + 1; y <= Math.min(yTop + 4, Math.ceil(want / VOXEL) + 4); y++) {
+                if(!this.inWorld(ix, y, iz)) continue;
+                const c = this.chunks.get(chunkKey(Math.floor(ix / N), Math.floor(y / N), Math.floor(iz / N)));
+                const li = (ix - c.cx * N) + (y - c.cy * N) * N + (iz - c.cz * N) * N2;
+                const old = c.sdf ? c.sdf[li] : c.fill;
+                const nv = toStored(y * VOXEL - want);
+                if(nv >= old) continue;
+                c.densify();
+                c.sdf[li] = nv; if(old >= 0) { c.mat[li] = m; if(nv < 0) added += cell; }
+                changed++;
+                if(!touched.has(c)) { touched.add(c); c.version++; }
+                if(ix < lo[0]) lo[0] = ix; if(y < lo[1]) lo[1] = y; if(iz < lo[2]) lo[2] = iz;
+                if(ix > hi[0]) hi[0] = ix; if(y > hi[1]) hi[1] = y; if(iz > hi[2]) hi[2] = iz;
+            }
+        }
+        return changed ? { added, changed, lo, hi } : null;
+    }
     /** Material of the nearest solid sample around a world position. */
     materialAt(x, y, z) {
         const ix = Math.round(x / VOXEL), iy = Math.round(y / VOXEL), iz = Math.round(z / VOXEL);
@@ -137,9 +190,12 @@ export class VoxelWorld {
      *   op 'paint': change the material of solid samples inside the brush to `mat`.
      * Returns { removed: Float64Array(256) m³ per material, added (m³), dirty: Set of chunk keys, box: [min, max] in samples }.
      */
-    applyBrush(brush, { op = 'carve', mat = 1, hardness = true, notify = true } = {}) {
+    applyBrush(brush, { op = 'carve', mat = 1, hardness = true, notify = true, rim = false } = {}) {
         const band = 4; // samples outside the brush whose stored (saturated) distances may still change
-        const lo = brush.min.map(v => Math.floor(v / VOXEL) - band), hi = brush.max.map(v => Math.ceil(v / VOXEL) + band);
+        // material-shaped carving (brushes.js carveOffset / CARVE_STRETCH) and soft materials' reach grow the bite
+        // past the brush's box: cover a little more (the band covers the rest)
+        const grow = op === 'carve' && hardness ? 0.15 : 0;
+        const lo = brush.min.map((v, a) => Math.floor((v - (brush.max[a] - v) * grow * 0.5) / VOXEL) - band), hi = brush.max.map((v, a) => Math.ceil((v + (v - brush.min[a]) * grow * 0.5) / VOXEL) + band);
         for(let a = 0; a < 3; a++) { lo[a] = Math.max(lo[a], this.smin[a]); hi[a] = Math.min(hi[a], this.smax[a] - 1); }
         const removed = new Float64Array(256);
         let added = 0, changed = 0;
@@ -181,10 +237,13 @@ export class VoxelWorld {
             for(let bz = z0; bz <= z1; bz += 4) for(let by = y0; by <= y1; by += 4) for(let bx = x0; bx <= x1; bx += 4) {
             const ex = Math.min(bx + 3, x1), ey = Math.min(by + 3, y1), ez = Math.min(bz + 3, z1);
             // reach range of the samples that could change (carve), or whether any could (add, paint)
-            let rmin = Infinity, rmax = -Infinity;
+            let rmin = Infinity, rmax = -Infinity, amax = 0, stretchy = false;
             if(carve) {
                 if(ey < bedrockTop) continue;
-                if(!sdf) { const r = useReach ? REACH[fillMat] : 1; if(r === 0) continue; rmin = rmax = r; }
+                if(!sdf) {
+                    const r = useReach ? REACH[fillMat] : 1; if(r === 0) continue; rmin = rmax = r;
+                    if(useReach) { amax = CARVE_AMP[fillMat]; stretchy = CARVE_STRETCH[fillMat] !== 1; }
+                }
                 else {
                     for(let iz = bz; iz <= ez; iz++) for(let iy = Math.max(by, bedrockTop); iy <= ey; iy++) {
                         let li = (bx - ox) + (iy - oy) * N + (iz - oz) * N2;
@@ -194,6 +253,7 @@ export class VoxelWorld {
                             if(r === 0) continue;
                             if(r < rmin) rmin = r;
                             if(r > rmax) rmax = r;
+                            if(useReach) { const m = mt[li]; if(CARVE_AMP[m] > amax) amax = CARVE_AMP[m]; if(CARVE_STRETCH[m] !== 1) stretchy = true; }
                         }
                     }
                     if(rmax < 0) continue;
@@ -216,7 +276,8 @@ export class VoxelWorld {
                 let L = Infinity;
                 if(rmin <= 1) { const r = Math.min(rmax, 1); L = Rb >= 0 ? Math.max(low, dsH - 2 * HD - r * Rb) : low; }
                 if(rmax > 1) { const a = Math.max(rmin, 1); L = Math.min(L, a * low - (a - 1) * dsH, rmax * low - (rmax - 1) * dsH); }
-                if(L > SAT) continue;
+                // material offsets move the surface by up to amax; a grain stretch has no cheap bound: evaluate all
+                if(!stretchy && L - amax > SAT) continue;
             }
             // deep inside the brush every rule saturates the same way: no per-sample evaluation there
             const deep = dcH < DEEP;
@@ -230,9 +291,19 @@ export class VoxelWorld {
                     oldMat = sdf ? mt[li] : fillMat;
                     const r = useReach ? REACH[oldMat] : 1;
                     if(r === 0) continue;
-                    if(r >= 1 ? deep : r * dcH + (1 - r) * dsH < DEEP) db = -1e9;
-                    else if(r !== 1) db = d(bcx + (ix * VOXEL - bcx) / r, bcy + (iy * VOXEL - bcy) / r, bcz + (iz * VOXEL - bcz) / r) * r;
-                    else db = d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
+                    const st = useReach ? CARVE_STRETCH[oldMat] : 1;
+                    if(st === 1 && (r >= 1 ? dcH + amax < DEEP : r * dcH + (1 - r) * dsH + amax < DEEP)) db = -1e9;
+                    else {
+                        const px = ix * VOXEL, py = iy * VOXEL, pz = iz * VOXEL;
+                        if(st !== 1) {
+                            // wood: the bite reaches st times further along the grain
+                            const g = CARVE_GRAIN[oldMat], kx = g === 0 ? r * st : r, ky = g === 1 ? r * st : r, kz = g === 2 ? r * st : r;
+                            db = d(bcx + (px - bcx) / kx, bcy + (py - bcy) / ky, bcz + (pz - bcz) / kz) * r;
+                        } else if(r !== 1) db = d(bcx + (px - bcx) / r, bcy + (py - bcy) / r, bcz + (pz - bcz) / r) * r;
+                        else db = d(px, py, pz);
+                        // (only near the surface: deeper or farther the stored value saturates either way)
+                        if(useReach && CARVE_AMP[oldMat] > 0 && db < SAT + CARVE_AMP[oldMat] && db > DEEP - CARVE_AMP[oldMat]) db += carveOffset(oldMat, px, py, pz);
+                    }
                     const s = -toStored(db);
                     if(s <= old) continue;
                     nv = s; nm = oldMat;
@@ -261,6 +332,16 @@ export class VoxelWorld {
             }
             }
             if(chunkChanged) { c.version++; c.tryCollapse(); }
+        }
+        // soils pile part of what a blast threw out into a rim around the crater
+        if(carve && rim && changed) {
+            let soil = 0;
+            for(let i = 0; i < 256; i++) if(RIM_SOIL[i]) soil += removed[i];
+            if(soil > 0.05) {
+                const R = Math.max(...brush.max.map((v, a) => v - brush.min[a])) / 2;
+                const r2 = this._rim(bcx, bcy, bcz, R, soil * 0.45);
+                if(r2) { added += r2.added; changed += r2.changed; for(let a = 0; a < 3; a++) { lo[a] = Math.min(lo[a], r2.lo[a]); hi[a] = Math.max(hi[a], r2.hi[a]); } }
+            }
         }
         // every chunk whose padded mesh window sees a changed sample is dirty
         const dirty = this.chunksInSampleBox(lo.map(v => v - PAD - 1), hi.map(v => v + PAD + 1));

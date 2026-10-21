@@ -6,12 +6,15 @@
  *     matBlend  Float32Array vec3 per vertex (material A, material B, blend), the terrain material's attribute
  *     matF      Float32Array material id A per vertex (the 'mat' attribute)
  *     bounds    Float32Array [minX, minY, minZ, maxX, maxY, maxZ, cx, cy, cz, radius] (bounding box and sphere)
+ *     glassStart (only when the mesh has glass) index count of the opaque triangles: the indices are reordered so
+ *               triangles entirely of glass come last (geometryFromMesh draws them as a second, transparent group)
  *     octants   (when `origin` = the chunk's world position in metres) the chunk's static collider data: 8 slots,
  *               null or { vtx: Float32Array world positions, ind: Uint32Array, hash } (a triangle goes to the
  *               octant of its centroid; Physics.setChunkCollider builds a trimesh per octant and skips octants whose
  *               hash did not change)
  */
 import { CHUNK_M } from '../config.js';
+import { GLASS } from './materials.js';
 
 export function prepMesh(mesh, origin = null) {
     const n = mesh.positions.length / 3;
@@ -19,6 +22,18 @@ export function prepMesh(mesh, origin = null) {
     const m = new Float32Array(n * 3), mf = new Float32Array(n);
     for(let i = 0; i < n; i++) { m[i * 3] = A[i]; m[i * 3 + 1] = B[i]; m[i * 3 + 2] = W ? W[i] : 0; mf[i] = A[i]; }
     mesh.matBlend = m; mesh.matF = mf;
+    // glass triangles last (a second draw group with the glass material); only meshes with glass pay for this
+    let anyGlass = false;
+    for(let i = 0; i < n; i++) if(A[i] === GLASS && B[i] === GLASS) { anyGlass = true; break; }
+    if(anyGlass) {
+        const idx = mesh.indices, nt = idx.length / 3, out = new Uint32Array(idx.length);
+        const isGlass = (t) => { const a = idx[t * 3], b = idx[t * 3 + 1], c = idx[t * 3 + 2]; return A[a] === GLASS && B[a] === GLASS && A[b] === GLASS && B[b] === GLASS && A[c] === GLASS && B[c] === GLASS; };
+        let o = 0;
+        for(let t = 0; t < nt; t++) if(!isGlass(t)) { out[o++] = idx[t * 3]; out[o++] = idx[t * 3 + 1]; out[o++] = idx[t * 3 + 2]; }
+        const gs = o;
+        for(let t = 0; t < nt; t++) if(isGlass(t)) { out[o++] = idx[t * 3]; out[o++] = idx[t * 3 + 1]; out[o++] = idx[t * 3 + 2]; }
+        if(gs < idx.length) { mesh.indices = out; mesh.glassStart = gs; }
+    }
     const p = mesh.positions;
     let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
     for(let i = 0; i < p.length; i += 3) {

@@ -19,7 +19,7 @@ import {
     Fn, If, Loop, Return, instanceIndex, instancedArray, uniform, uniformArray, attribute, modelWorldMatrix,
     float, int, vec3, vec4, cross, dot, length, max, min, mix, sin, cos, abs, select, normalize, clamp, floor,
 } from 'three/tsl';
-import { MATERIALS } from '../voxel/materials.js';
+import { MATERIALS, MAT_SLOTS } from '../voxel/materials.js';
 import { H, MAX_ZONES, NODE_CAP, CELL_CAP, TET_OFF, CORNER_TETS, CORNER_OF, F_ACTIVE, F_PINNED } from './core.js';
 
 const WG = 64;
@@ -77,10 +77,10 @@ export class SoftSim {
         this.goals = instancedArray(NT * 4, 'vec4');
         const v4 = () => new THREE.Vector4();
         const softTable = [], softTable2 = [];
-        for(let m = 0; m < 16; m++) {
+        for(let m = 0; m < MAT_SLOTS; m++) {
             const M = MATERIALS[m] || MATERIALS[1];
             softTable.push(new THREE.Vector4(M.stiffness, M.damping, M.plasticity, M.yield));
-            softTable2.push(new THREE.Vector4(M.softness, M.density / 1000, M.toughness, 0));
+            softTable2.push(new THREE.Vector4(M.softness, M.density / 1000, M.softToughness, 0));
         }
         // per-slot and per-kick parameters live in one small storage buffer (uniform arrays shared between several
         // compute pipelines and the vertex stage do not stay in sync), mirrored on the CPU: slotA, slotB, slotC, kickA..C
@@ -147,7 +147,7 @@ export class SoftSim {
             const B = u.slotB.element(slot);
             const L = latticeOf(local, B);
             const wp = A.xyz.add(vec3(float(L.x), float(L.y), float(L.z)).mul(u.slotC.element(slot).y)).toVar();
-            const soft = u.mat2.element(f.shiftRight(8).bitAnd(15)).x.toVar();
+            const soft = u.mat2.element(f.shiftRight(8).bitAnd(31)).x.toVar();
             const dv = vec3(0).toVar();
             for(let k = 0; k < MAX_KICKS; k++) {
                 const ka = u.kickA.element(k), kb = u.kickB.element(k), kc = u.kickC.element(k);
@@ -177,7 +177,7 @@ export class SoftSim {
                 nPos.element(g).assign(vec4(0)); nPrev.element(g).assign(vec4(0)); nOld.element(g).assign(vec4(0));
                 Return();
             });
-            const M = u.mat.element(f.shiftRight(8).bitAnd(15)).toVar();
+            const M = u.mat.element(f.shiftRight(8).bitAnd(31)).toVar();
             M.z.mulAssign(u.slotC.element(slot).z);
             const p = nPos.element(g).xyz.toVar();
             const damp = M.y.add(u.slotC.element(slot).x);
@@ -210,7 +210,7 @@ export class SoftSim {
             If(A.w.notEqual(1).or(cl.greaterThanEqual(int(B.w))), () => { Return(); });
             const cell = cells.element(slot.mul(CELL_CAP).add(cl)).toVar();
             const ci = cell.bitAnd(255), cj = cell.shiftRight(8).bitAnd(255), ck = cell.shiftRight(16).bitAnd(255);
-            const m = cell.shiftRight(24).bitAnd(15).toVar();
+            const m = cell.shiftRight(24).bitAnd(31).toVar();
             const par = ci.add(cj).add(ck).bitAnd(1).toVar();
             const nx = int(B.x).toVar(), nxy = int(B.x).mul(int(B.y)).toVar();
             const h = u.slotC.element(slot).y.toVar();

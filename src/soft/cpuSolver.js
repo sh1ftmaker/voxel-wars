@@ -11,7 +11,7 @@
  * Parameters arrive as the same packed vec4 array as the GPU parameter buffer (slotA/B/C, kickA/B/C: see SoftSim.js;
  * slotC.y is the slot's cell size in metres, slotC.z its plasticity scale, kickC.z a ring kick's inner radius).
  */
-import { MATERIALS } from '../voxel/materials.js';
+import { MATERIALS, MAT_SLOTS } from '../voxel/materials.js';
 import { H, MAX_ZONES, NODE_CAP, CELL_CAP, TET_OFF, F_ACTIVE, F_PINNED } from './core.js';
 
 export const MAX_KICKS = 4;
@@ -44,10 +44,10 @@ export class CpuSoft {
         this.iterations = iterations;
         this.slots = Array.from({ length: MAX_ZONES }, () => new Slot());
         this.P = new Float32Array(PARAMS * 4);
-        // material tables (16 ids): stiffness (rescaled), damping, plasticity, yield, softness, weight
+        // material tables (MAT_SLOTS ids): stiffness (rescaled), damping, plasticity, yield, softness, weight
         const k = 960 / (rate * iterations);
-        this.mat = new Float32Array(16 * 6);
-        for(let m = 0; m < 16; m++) {
+        this.mat = new Float32Array(MAT_SLOTS * 6);
+        for(let m = 0; m < MAT_SLOTS; m++) {
             const M = MATERIALS[m] || MATERIALS[1];
             this.mat.set([1 - Math.pow(1 - Math.min(0.999, M.stiffness), k), M.damping, M.plasticity, M.yield, M.softness, M.density / 1000], m * 6);
         }
@@ -76,7 +76,7 @@ export class CpuSoft {
         const T = this.tetOff, NXY = NX * NY;
         for(let c = 0, t = 0; c < count; c++) {
             const v = cells[c], i = v & 255, j = (v >> 8) & 255, k = (v >> 16) & 255, par = (i + j + k) & 1;
-            const base = i + j * NX + k * NXY, w = this.mat[((v >> 24) & 15) * 6 + 5];
+            const base = i + j * NX + k * NXY, w = this.mat[((v >> 24) & 31) * 6 + 5];
             for(let l = 0; l < 5; l++, t++) {
                 S.tetX[t] = par * 5 + l;
                 for(let q = 0; q < 4; q++) {
@@ -162,7 +162,7 @@ export class CpuSoft {
                 let vx, vy, vz;
                 if(dl > 0.01) { vx = P[b]; vy = P[b + 1]; vz = P[b + 2]; }
                 else { vx = dx; vy = dy + R * up + 1e-4; vz = dz; const l = Math.hypot(vx, vy, vz); vx /= l; vy /= l; vz /= l; }
-                const g = speed * fall * mat[((S.flags[i] >> 8) & 15) * 6 + 4] * dt;
+                const g = speed * fall * mat[((S.flags[i] >> 8) & 31) * 6 + 4] * dt;
                 S.prev[i * 3] -= vx * g; S.prev[i * 3 + 1] -= vy * g; S.prev[i * 3 + 2] -= vz * g;
             }
         }
@@ -172,7 +172,7 @@ export class CpuSoft {
         const { pos, prev, old, rest, flags, active } = S, mat = this.mat;
         const maxv = MAXV_PER_S * dt;
         for(let j = 0; j < S.nActive; j++) {
-            const i = active[j], o = i * 3, m = ((flags[i] >> 8) & 15) * 6;
+            const i = active[j], o = i * 3, m = ((flags[i] >> 8) & 31) * 6;
             const px = pos[o], py = pos[o + 1], pz = pos[o + 2];
             const damp = Math.max(0, 1 - (mat[m + 1] + extra) * dt);
             let vx = (px - prev[o]) * damp, vy = (py - prev[o + 1]) * damp, vz = (pz - prev[o + 2]) * damp;
@@ -199,7 +199,7 @@ export class CpuSoft {
         sum.fill(0, 0, S.nodes * 3);
         const Pq = this._Pq, Rr = this._Rr;
         for(let c = 0, t = 0; c < S.count; c++) {
-            const m = ((cells[c] >> 24) & 15) * 6, stiff = mat[m], w = mat[m + 5];
+            const m = ((cells[c] >> 24) & 31) * 6, stiff = mat[m], w = mat[m + 5];
             for(let l = 0; l < 5; l++, t++) {
                 const t4 = t * 4, xo = tetX[t] * 12;
                 let cx = 0, cy = 0, cz = 0, rx = 0, ry = 0, rz = 0;

@@ -8,7 +8,7 @@
  * Messages (`core.handle(msg) -> { reply, transfer }`), every reply carries the changed chunks:
  *   { type: 'init' }                              voxelize Fort War; reply.chunks holds every chunk
  *   { type: 'brush', spec, op, mat, hardness, conn, erode, debris }
- *        applyBrush(brushFromSpec(spec)); with conn (carves) the regions that lost their support are cut out:
+ *        applyBrush(brushFromSpec(spec)) (rim: soils pile a crater rim); with conn (carves) the regions that lost their support are cut out:
  *        reply.result { removed, added, changed, box }, reply.islands [{ grid, prep, dirty }] (become bodies),
  *        reply.dust [{ center, removed }] (islands too small for a body); then structural failure
  *        (src/voxel/structure.js, unless collapse: false): overhangs too weak to hold, cut free at their root, also
@@ -102,7 +102,7 @@ export class TerrainCore {
         const w = this.world, brush = brushFromSpec(msg.spec);
         let lift = null;
         if(msg.lift) { lift = liftGrid(w, brush); lift.prep = gridPrep(lift, 0); transfer.push(lift.sdf.buffer, lift.mat.buffer); }
-        const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness });
+        const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness, rim: !!msg.rim });
         const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [], lift };
         const detach = (list) => {
             for(const isl of list) {

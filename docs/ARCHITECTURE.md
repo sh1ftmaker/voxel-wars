@@ -203,5 +203,26 @@ main.js under "game systems are added here", one line each. `ctx.params` holds t
   Detached bodies use the same mesher and material, so they look like the terrain they came from.
 
 ## Material ids
-0 Stone, 1 Dirt, 2 Grass, 3 Sand, 4 Snow, 5 Brick, 6 Metal, 7 Lava, 8 Red Stone, 9 Blue Stone, 10 Wood, 11 Cobble,
-12 Dark Rock, 13 Bedrock (see `src/voxel/materials.js` for hardness, density and textures).
+0 Stone, 1 Dirt, 2 Grass, 3 Sand, 4 Snow, 5 Brick, 6 Metal, 7 Lava, 8 Red Stone, 9 Blue Stone, 10 Wood (grain along
+x), 11 Cobble, 12 Dark Rock, 13 Bedrock, 14 Wood-Y (grain y), 15 Wood-Z (grain z), 16 Glass (see `src/voxel/materials.js`
+for hardness, density and textures). `grainAxis(id)`, `isWood(id)`, `woodWithGrain(axis)`; tables indexed by id have
+`MAT_SLOTS` (32) entries.
+
+### Material behaviour (materials branch)
+- `MATERIALS[id]` carries the fracture schema: `fracture` ('splinter' | 'shatter' | 'bend' | 'crumble' | 'glass' |
+  'none'), `toughness`, `spread`, `grain`, `yieldStrain`, `plastic`, `stiffnessMode`, `piece` [min, max] m, `particle`,
+  `sound`, `fresh` (fresh-break colour). The soft ground's tearing value is `softToughness`.
+- Carving takes the shape of the material (`brushes.js` carveOffset / CARVE_STRETCH, applied in `VoxelWorld.applyBrush`
+  with hardness): faceted stone, brick-shaped steps, rounded cobble, splintered wood stretched 1.8x along its grain;
+  metal and glass get clean holes. Blasts (`rim`) pile a soil rim around craters in dirt, grass, sand and snow. All
+  pure functions of position: every client carves the same. Cost: ~1 ms more per blast in the terrain worker.
+- Destruction emits 'chips' { point, mat, count, volume, dir } when a carve bites into shattering material or glass,
+  and marks a fresh break (`render/terrainMaterial.js` markFresh): carved surfaces are tinted with the material's
+  `fresh` colour for 20 s (per-vertex, ~0.1 ms of render while marks are live).
+- Rendering: wood's plank texture follows its grain; glass-only triangles go last in a mesh (meshPrep `glassStart`)
+  and draw as a second, alpha-blended group (`meshMaterial(base, geometry)`), for chunks and bodies alike. Material
+  tables (tints, props, fresh colours) and fresh marks live in one small float texture (uniform arrays are re-sent with
+  every draw call).
+- Wood built with the mason (kind 'build') takes its grain from the longest side of the box; other adds keep the id
+  they are given. `tools/test/materials.mjs` builds a test wall of every material and blasts it; `freshtint.mjs`
+  checks the tint fades.

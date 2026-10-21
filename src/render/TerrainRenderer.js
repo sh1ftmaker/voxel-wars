@@ -5,7 +5,7 @@
 import * as THREE from 'three/webgpu';
 import { CHUNK_M } from '../config.js';
 import { MeshPool } from '../voxel/MeshPool.js';
-import { createTerrainMaterial } from './terrainMaterial.js';
+import { createTerrainMaterial, meshMaterial } from './terrainMaterial.js';
 import { geometryFromMesh } from './geometry.js';
 
 export class TerrainRenderer {
@@ -59,10 +59,10 @@ export class TerrainRenderer {
             return;
         }
         const g = geometryFromMesh(mesh);
-        if(m) { m.geometry.dispose(); m.geometry = g; }
+        if(m) { m.geometry.dispose(); m.geometry = g; m.material = meshMaterial(this.material, g); }
         else {
             const c = this.world.chunks.get(key);
-            m = new THREE.Mesh(g, this.material);
+            m = new THREE.Mesh(g, meshMaterial(this.material, g));
             m.position.set(c.cx * CHUNK_M, c.cy * CHUNK_M, c.cz * CHUNK_M);
             m.castShadow = true; m.receiveShadow = true;
             m.matrixAutoUpdate = false; m.updateMatrix();

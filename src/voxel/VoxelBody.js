@@ -17,6 +17,7 @@ import { VOXEL } from '../config.js';
 import { MATERIALS } from './materials.js';
 import { gridStats, colliderBoxes, gridHullPoints } from './islands.js';
 import { geometryFromMesh } from '../render/geometry.js';
+import { meshMaterial } from '../render/terrainMaterial.js';
 import { GROUPS_ALL } from '../physics/Physics.js';
 
 
@@ -143,9 +144,9 @@ export class VoxelBody {
             if(this.dead || v !== this.version) return;
             if(!mesh || !mesh.indices.length) { if(this.mesh) this.mesh.visible = false; return; }
             const geo = geometryFromMesh(mesh);
-            if(this.mesh) { this.mesh.geometry.dispose(); this.mesh.geometry = geo; this.mesh.visible = true; }
+            if(this.mesh) { this.mesh.geometry.dispose(); this.mesh.geometry = geo; this.mesh.material = meshMaterial(this.mgr.material, geo); this.mesh.visible = true; }
             else {
-                this.mesh = new THREE.Mesh(geo, this.mgr.material);
+                this.mesh = new THREE.Mesh(geo, meshMaterial(this.mgr.material, geo));
                 this.mesh.position.set(-this.frame[0], -this.frame[1], -this.frame[2]);
                 this.mesh.castShadow = true; this.mesh.receiveShadow = true;
                 this.mesh.userData.voxelBody = this;
