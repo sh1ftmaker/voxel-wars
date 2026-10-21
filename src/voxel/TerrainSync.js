@@ -15,6 +15,9 @@
  *   world.applySamples(patch)                                 the same, the documented entry for src/soft
  *   sync.split(grid, { point, n, cells, minCount, generation }) -> Promise<reply>   fracture / component split (grid copied)
  *   sync.carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness }) -> Promise<reply>   carve a body's grid
+ *   sync.hash(keys?) -> Promise<reply.hashes>               chunk hashes in the worker's current (in-order) state
+ *   sync.chunkData({ keys, modified }) -> Promise<reply.data> chunk contents (resync, late-join snapshots)
+ *   sync.setChunks(data) -> Promise<reply>                    overwrite chunks wholesale
  *   sync.pending                                              requests in flight
  *   sync.stats                                                { requests, lastMs (worker time), maxMs }
  *
@@ -83,16 +86,19 @@ export class TerrainSync {
         console.log(`terrain worker: voxelized in ${rep.ms.toFixed(0)} ms${this.worker ? ' (off the main thread)' : ''}`);
         return rep;
     }
-    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16 } = {}) {
-        return this._send({ type: 'brush', spec: specOf(brush), op, mat, hardness, conn, erode, debris });
+    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16, lift = false } = {}) {
+        return this._send({ type: 'brush', spec: brush.type ? brush : specOf(brush), op, mat, hardness, conn, erode, debris, lift });
     }
+    hash(keys = null) { return this._send({ type: 'hash', keys }).then(r => r.hashes); }
+    chunkData({ keys = null, modified = false } = {}) { return this._send({ type: 'chunks', keys, modified }).then(r => r.data); }
+    setChunks(data) { return this._send({ type: 'setChunks', data }); }
     stamp(grid, t, q) { return this._send({ type: 'stamp', grid: copyGrid(grid), t, q }); }
     samples(patch) { return this._send({ type: 'samples', patch }); }
     carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness = true }) {
         return this._send({ type: 'carveGrid', grid: copyGrid(grid), spec, lmin, lmax, t, m, f, hardness });
     }
-    split(grid, { point = null, n = 0, cells = null, minCount = 0, generation = 0 } = {}) {
-        return this._send({ type: 'split', grid: copyGrid(grid), point, n, cells, minCount, generation });
+    split(grid, { point = null, n = 0, cells = null, minCount = 0, generation = 0, seed = null } = {}) {
+        return this._send({ type: 'split', grid: copyGrid(grid), point, n, cells, minCount, generation, seed });
     }
 }
 

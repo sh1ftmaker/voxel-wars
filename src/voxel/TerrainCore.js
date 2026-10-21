@@ -18,8 +18,16 @@
  *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
  *        point/n: Voronoi fracture (voronoiLabels) else connected components; reply.pieces [grid with .prep],
  *        reply.same (the grid is one piece: nothing to split), reply.dust (Float64Array m³ per material)
+ *        seed: Voronoi sites from rng(seed) (deterministic across clients) instead of Math.random
  *   { type: 'carveGrid', grid, spec, lmin, lmax, t, m, f, hardness }
  *        carve a voxel body's grid (body frame: world = t + M (local - f)); reply { grid, removed, changed }
+ *   brush with lift: true (a rip): before the carve, the matter inside the brush is lifted (islands.liftGrid) and
+ *        returned as reply.lift (a grid with .prep), so every client makes the same lump
+ *   { type: 'hash', keys? }                       reply.hashes [[key, FNV-1a of sdf + mat (or fill)], ...] (all chunks,
+ *        or only `keys`); cached per chunk version, so a check costs only the chunks edited since the last one
+ *   { type: 'chunks', keys?, modified? }          reply.data [{ key, fill, fillMat, sdf?, mat? }] (copies): `keys`, or with
+ *        modified every chunk that differs from the generated level (late-join snapshots, src/net)
+ *   { type: 'setChunks', data }                   overwrite chunks wholesale (resync, snapshots); dirty as an edit
  * Any message may carry `recycle`: [typed arrays] the main thread no longer needs (CHUNK³ chunk arrays, padded
  * windows), transferred back and reused for later replies (no garbage per edit).
  * Every reply: { id, chunks: [{ key, fill, fillMat, version, sdf?, mat? }], dirty: [chunk keys to remesh],
@@ -36,6 +44,9 @@ import { findUnsupported } from './support.js';
 import { cellSampleLabels } from '../softbody/lattice.js';
 import { findCollapses } from './structure.js';
 import { Level } from '../level/fortwar.js';
+import { liftGrid } from './islands.js';
+import { rng } from './brushes.js';
+import { fnv1a } from '../net/codec.js';
 
 export class TerrainCore {
     constructor(world = null) {
@@ -64,6 +75,9 @@ export class TerrainCore {
             case 'samples': { const r = this.world.writeSamples(msg.patch); reply = { result: { changed: r.changed, box: r.box } }; break; }
             case 'split': reply = this.split(msg, transfer); break;
             case 'carveGrid': reply = this.carveGrid(msg, transfer); break;
+            case 'hash': reply = { hashes: this.hashes(msg.keys) }; break;
+            case 'chunks': reply = { data: this.chunkData(msg, transfer) }; break;
+            case 'setChunks': reply = this.setChunks(msg.data); break;
             default: throw new Error(`terrain core: unknown message ${msg.type}`);
         }
         reply.id = msg.id;
@@ -80,13 +94,16 @@ export class TerrainCore {
         for(let k = 0; k < 3; k++) findCollapses(this.world, [-40 + k * 8, -8, -8], [-24 + k * 8, 8, 8]);
         const chunks = [];
         this.sent = new Map();
-        for(const c of this.world.chunks.values()) { chunks.push(this._diff(c)); this.sent.set(c.key, c.version); }
+        this.initVersion = new Map();
+        for(const c of this.world.chunks.values()) { chunks.push(this._diff(c)); this.sent.set(c.key, c.version); this.initVersion.set(c.key, c.version); }
         return { chunks, ms: performance.now() - t0 };
     }
     brush(msg, transfer) {
         const w = this.world, brush = brushFromSpec(msg.spec);
+        let lift = null;
+        if(msg.lift) { lift = liftGrid(w, brush); lift.prep = gridPrep(lift, 0); transfer.push(lift.sdf.buffer, lift.mat.buffer); }
         const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness });
-        const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [] };
+        const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [], lift };
         const detach = (list) => {
             for(const isl of list) {
                 const small = isl.count < (msg.debris ?? 16);
@@ -123,7 +140,7 @@ export class TerrainCore {
         const g = msg.grid;
         const dust = new Float64Array(256);
         const c = msg.cells; // a soft body's crack: labels per lattice cell (src/softbody)
-        const labels = c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : msg.n ? voronoiLabels(g, msg.point, msg.n) : null;
+        const labels = c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : msg.n ? voronoiLabels(g, msg.point, msg.n, msg.seed != null ? rng(msg.seed) : Math.random) : null;
         const pieces = splitGrid(g, labels, { minCount: msg.minCount ?? 0, dust });
         const same = pieces.length === 1 && pieces[0] === g;
         for(const p of pieces) {
@@ -144,6 +161,51 @@ export class TerrainCore {
         const r = carveGrid(g, local, { hardness: msg.hardness });
         transfer.push(g.sdf.buffer, g.mat.buffer);
         return { grid: g, removed: r.removed, changed: r.changed };
+    }
+    /** FNV-1a per chunk over its samples and materials (a uniform chunk: over fill and fillMat), cached by version. */
+    hashes(keys = null) {
+        const cache = this.hashCache ||= new Map(), out = [];
+        const one = new Uint8Array(2);
+        for(const c of keys ? keys.map(k => this.world.chunks.get(k)).filter(Boolean) : this.world.chunks.values()) {
+            let e = cache.get(c.key);
+            if(!e || e.v !== c.version) {
+                let h;
+                if(c.sdf) h = fnv1a(c.mat, fnv1a(new Uint8Array(c.sdf.buffer, c.sdf.byteOffset, c.sdf.byteLength)));
+                else { one[0] = c.fill & 255; one[1] = c.fillMat; h = fnv1a(one); }
+                cache.set(c.key, e = { v: c.version, h });
+            }
+            out.push([c.key, e.h]);
+        }
+        return out;
+    }
+    /** Chunk contents (copies) for snapshots and resyncs: `keys`, or `modified` (every chunk edited since init). */
+    chunkData({ keys = null, modified = false }, transfer) {
+        const list = keys ? keys.map(k => this.world.chunks.get(k)).filter(Boolean)
+            : [...this.world.chunks.values()].filter(c => !modified || this.initVersion?.get(c.key) !== c.version);
+        return list.map(c => {
+            const d = { key: c.key, fill: c.fill, fillMat: c.fillMat, sdf: c.sdf ? c.sdf.slice() : null, mat: c.mat ? c.mat.slice() : null };
+            if(d.sdf) transfer.push(d.sdf.buffer, d.mat.buffer);
+            return d;
+        });
+    }
+    /** Overwrite chunks wholesale (a resync or a late-join snapshot); they go to the replica as dirty chunks. */
+    setChunks(data) {
+        let changed = 0;
+        const dirty = new Set();
+        for(const d of data) {
+            const c = this.world.chunks.get(d.key);
+            if(!c) continue;
+            c.sdf = d.sdf ? Int8Array.from(d.sdf) : null; c.mat = d.mat ? Uint8Array.from(d.mat) : null;
+            c.fill = d.fill; c.fillMat = d.fillMat; c.version++;
+            changed++;
+            // neighbours too: their padded mesher windows read this chunk
+            for(let dz = -1; dz <= 1; dz++) for(let dy = -1; dy <= 1; dy++) for(let dx = -1; dx <= 1; dx++) {
+                const k = `${c.cx + dx},${c.cy + dy},${c.cz + dz}`;
+                if(this.world.chunks.has(k)) dirty.add(k);
+            }
+        }
+        for(const k of dirty) this.dirty.add(k);
+        return { result: { changed, box: [[0, 0, 0], [0, 0, 0]] } };
     }
     /** Chunk contents as a message (copies: the core keeps its own). */
     _diff(c) { return { key: c.key, fill: c.fill, fillMat: c.fillMat, version: c.version, sdf: c.sdf ? this._copy(c.sdf, Int8Array) : null, mat: c.mat ? this._copy(c.mat, Uint8Array) : null }; }

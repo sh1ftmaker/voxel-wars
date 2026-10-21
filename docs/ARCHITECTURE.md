@@ -98,9 +98,41 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   add `soft=0` to the URL there. Tests: `tools/test/terrainsync.mjs`
   (worker protocol), `brushbench.mjs` (edit speed, world hash must match), `fracturecost.mjs` (Rapier debris cost).
 
+## Net: the edit log (src/net)
+
+Multiplayer plan: the room's sequencer orders terrain edits; the host runs physics and game rules; periodic hash
+checks repair drift. Steps 1-2 (this) make every terrain change an entry in one sequenced log:
+
+- `Net` (`src/net/Net.js`, `ctx.net`): local code `submit`s an edit `{ k, ... }`; the transport takes it to the
+  `Sequencer` (`src/net/sequencer.js`, pure: runs in a tab now, in a PartyServer Durable Object later), which numbers
+  it and sends it to everyone; every client applies edits strictly in seq order through its terrain worker. Kinds:
+  `brush` (carve / blast / drill / build / rip with `lift`; islands and structural collapses follow from it
+  deterministically in the worker), `stamp` (settled body: the owner's grid at the owner's pose), `samples`
+  (soft-ground bakes, host only), transient `bsplit` (a body's fracture, replayed seeded on other clients), `mark`
+  (hash check / snapshot point) and `resync`.
+- Transports (`src/net/transports.js`, picked in `src/net/index.js`): `LocalTransport` (single player, synchronous:
+  nothing changes), `?loopback=latency,jitter` (in-page fake server through the codec), `?room=name`
+  (`BroadcastChannelTransport`: tabs of one browser; the tab holding the room's Web Lock hosts the sequencer).
+- Codec (`src/net/codec.js`): versioned; JSON (doubles round-trip exactly) plus raw typed arrays, deflated when large.
+- Determinism: edits carry everything (brush specs with their seeds, grids, patches, `erode`); the worker's islands,
+  collapse and fracture use no clock or `Math.random` (Voronoi sites from `rng(seed)`, seed from the body's id).
+  Body ids are the same everywhere (`seq:island`, `seq:rN`, `parent.fN` / `.cN`); only a body's owner (host for
+  shed terrain, the ripper for a lump) stamps or fractures it. Rapier motion is not deterministic, so other clients
+  keep simulating their copies until the owner's stamp drops them (transform streaming is step 4).
+- Drift: the host marks a hash check every 3 s when something changed; at that point of the order every client hashes
+  its chunks (FNV-1a, cached per chunk version: ~0.1 ms) and compares with the host's; differing chunks are resent
+  (`resync`, applied at its own point of the order). Late join: the host snapshots the chunks that differ from the
+  generated level (every 10 s / 48 edits, ~50-120 kB deflated); the sequencer drops the log up to it; a joiner loads
+  the level, the snapshot, then the log tail (history: no FX, no bodies).
+- Limits now: game state, players and body transforms are not replicated (steps 3-4); no host migration (the next tab
+  would take the lock but has no sequencer state); a background tab gets no animation frames, so a host tab in the
+  background runs no physics (it still sequences, applies edits and makes snapshots).
+- Tests: `tools/test/netlog.mjs` (node: two TerrainCores, codec, snapshot join, resync), `tools/test/netroom.mjs`
+  (browser: two tabs, a late third, drift repair, single player), `tools/test/netperf.mjs` (single-player cost).
+
 ## Context (src/main.js)
 
-`ctx = { renderer, scene, camera, sun, world, terrain, physics, destruction, params, events, addSystem }`.
+`ctx = { renderer, scene, camera, sun, world, terrain, physics, destruction, params, net, events, addSystem }`.
 A system is an object with an optional `update(dt)`, called each frame after `physics.step`. Add yours in
 main.js under "game systems are added here", one line each. `ctx.params` holds the URL query
 (`?fly=1` etc.).

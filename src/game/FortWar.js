@@ -52,6 +52,7 @@ export class FortWar {
         let saved = null; try { saved = localStorage.getItem('bananza.bots'); } catch(e) {}
         this.botCount = q != null ? Math.max(0, Math.min(5, +q || 0)) : 3;
         this.botsOn = q != null ? this.botCount > 0 : saved !== '0';
+        if(ctx.net && !ctx.net.single && !ctx.net.isHost) this.botsOn = false; // in a room the host runs the bots
         if(this.botCount === 0) this.botCount = 3; // turning them on later brings the usual three
         if(this.botsOn) this.spawnBots();
         this.hud = new Hud(this);
