@@ -92,6 +92,33 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   terrain worker's `split` with `cells`); the pieces keep the parent's wobble. Lattices exist only while a body
   wobbles (built at the first kick, asleep when calm). Tests: `tools/test/softbody.mjs` (node: wobble, crack, split),
   `softdebris.mjs` (browser screenshots), `softcrash.mjs`, `softperf.mjs`, `softwgsl.mjs` (WGSL compiles).
+- **Fracture modes per material** (`src/softbody/behaviour.js`, after tetrafract; reads the materials.js schema
+  `fracture, toughness, spread, grain, yieldStrain, plastic, piece, particle` when a material defines `fracture`,
+  else defaults by id): the dominant material of a body picks its mode.
+  - `splinter` (wood 10/14/15, grain x/y/z): the lattice's face thresholds are toughness x (1 +- spread), seeded by
+    the body's netId (same on every client), x 0.35 along the grain and x 3.75 across it, x 0.5 at material joints,
+    so cracks run along the fibres; a hard hit opens up to 3 parallel cracks per substep. The fallback cleave is a
+    Voronoi split stretched along the grain (`voronoiLabels` `aniso`): long pieces either way.
+  - `shatter` (stone, brick, cobble, dark rock): no lattice cracking; over the break threshold it bursts at once into
+    Voronoi pieces whose count comes from the `piece` size range (finer for harder hits, `pieceCount`), densest at
+    the hit. A thrown stone cleaves into 2-3.
+  - `glass` (16): breaks at 0.3x the usual threshold into up to 20 slivers; pieces under 1/12 of the body become
+    particles (dust); no lattice.
+  - `bend` (metal): the lattice is plastic (cells past `yieldStrain` move their rest shape, `plastic` per 1/60 s);
+    a body that calms down bent (> 4 cm) freezes bent and the worker bakes the bend into a new grid
+    (`src/softbody/bake.js`, new_sdf(x) = old_sdf(x - u(x)), grown by a margin); its owner swaps the body for it
+    (`_bake`) and sends a transient `bbake { id, grid }` edit, the others swap their copy too. It tears only past
+    its (high) toughness and never bursts. A body is not stamped while its lattice is drawn (wobbling or frozen bent).
+  - `crumble` (dirt, grass, sand, snow, lava): no lattice; a hard landing (0.6x threshold; sand and snow 0.45x)
+    breaks it at once into 3-8 clods (sand / snow: mostly particles); the owner adds a mound of 70% of the crumbs
+    where it landed (an `add` edit). Clods of the second generation no longer crumble.
+  Events on `ctx.events` (every client, the replayed breaks too), for effects and sound: `fracture { point, mat,
+  mode, pieces, energy, dir }` on every break; `splinters { point, mat, axis (world unit vector of the grain), count,
+  dir }`; `crumble { point, mat, volume }`; `bend { point, mat, amount (m of plastic flow) }` at most every 0.25 s
+  per body; the old `destroyed { kind: 'impact' }` still carries the pulverized volumes. `chips { point, mat, count }`
+  (emitted by carving code) makes up to 3 small local chip bodies that fly out and vanish when still (never stamped,
+  never streamed). Tests: `tools/test/fracmodes.mjs` (node: every mode, grain, bake, determinism, cost),
+  `fracgame.mjs` (browser: wood beam, stone column, metal girder, dirt lump, chips).
 - **Structural collapse** (`src/voxel/structure.js`, in the terrain worker after every carve's islands): matter
   that is still attached but hangs (no solid column under it to the bedrock) is judged per hanging component:
   matter within 1.5 m of its support counts as anchored, and each deeper part fails on bending (weight x lever from

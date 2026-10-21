@@ -97,8 +97,8 @@ export class TerrainSync {
     carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness = true }) {
         return this._send({ type: 'carveGrid', grid: copyGrid(grid), spec, lmin, lmax, t, m, f, hardness });
     }
-    split(grid, { point = null, n = 0, cells = null, minCount = 0, generation = 0, seed = null } = {}) {
-        return this._send({ type: 'split', grid: copyGrid(grid), point, n, cells, minCount, generation, seed });
+    split(grid, { point = null, n = 0, cells = null, minCount = 0, generation = 0, seed = null, aniso = null } = {}) {
+        return this._send({ type: 'split', grid: copyGrid(grid), point, n, cells, minCount, generation, seed, aniso });
     }
 }
 

@@ -15,7 +15,8 @@
  *        in reply.islands with { collapse: { root (m), dir, reason } }; reply.collapseMs, collapseChecked
  *   { type: 'stamp', grid, t, q }                 union a body's grid into the world (islands.stampGrid)
  *   { type: 'samples', patch }                    VoxelWorld.writeSamples (soft-ground bakes)
- *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
+ *   { type: 'split', grid, point?, n?, cells?, minCount, generation, seed?, aniso? }   (cells: { labels, cellOf, cs, dims } of a soft body's crack;
+ *        aniso: per axis Voronoi distance weights, wood's grain)
  *        point/n: Voronoi fracture (voronoiLabels) else connected components; reply.pieces [grid with .prep],
  *        reply.same (the grid is one piece: nothing to split), reply.dust (Float64Array m³ per material)
  *        seed: Voronoi sites from rng(seed) (deterministic across clients) instead of Math.random
@@ -140,7 +141,7 @@ export class TerrainCore {
         const g = msg.grid;
         const dust = new Float64Array(256);
         const c = msg.cells; // a soft body's crack: labels per lattice cell (src/softbody)
-        const labels = c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : msg.n ? voronoiLabels(g, msg.point, msg.n, msg.seed != null ? rng(msg.seed) : Math.random) : null;
+        const labels = c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : msg.n ? voronoiLabels(g, msg.point, msg.n, msg.seed != null ? rng(msg.seed) : Math.random, msg.aniso || null) : null;
         const pieces = splitGrid(g, labels, { minCount: msg.minCount ?? 0, dust });
         const same = pieces.length === 1 && pieces[0] === g;
         for(const p of pieces) {
