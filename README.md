@@ -1,10 +1,10 @@
-# Tetrament Wars
+# Voxel Wars
 
 Fort War ("Undermine") rebuilt on destructible voxel terrain, in the spirit of Donkey Kong Bananza: a sparse signed
 distance voxel world (0.25 m), Surface Nets / dual contouring meshing in workers, Rapier physics with detached
 terrain chunks that fall, shatter and settle back into diggable terrain.
 
-Play: https://sh1ftmaker.github.io/tetrament-wars/
+Play: https://sh1ftmaker.github.io/voxel-wars/
 
 ```
 npm install

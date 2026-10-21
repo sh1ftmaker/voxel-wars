@@ -1,4 +1,4 @@
-# WorldBananza architecture
+# Voxel Wars architecture
 
 This is a rewrite of WorldParty's Fort War ("Undermine") on destructible voxel terrain, in the style of Donkey Kong
 Bananza. It is a single-player demo first; networking comes later. Keep the world **fast, dynamic and fun**.
