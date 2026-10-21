@@ -29,6 +29,9 @@ export class TerrainRenderer {
         });
         world.onChange(({ dirty }) => { for(const k of dirty) this.remesh(k); });
     }
+    /** The shared material for detached bodies (createTerrainMaterial({ local: true })): triplanar in object space,
+     *  so textures stick to a moving piece. One instance for all bodies keeps a single pipeline. */
+    get bodyMaterial() { return this._bodyMaterial ||= createTerrainMaterial({ local: true }); }
     /** Called with (key, geometry | null) after a chunk's mesh changes. */
     onChunkMesh(fn) { this.listeners.push(fn); }
     remeshAll() { for(const k of this.world.chunks.keys()) this.remesh(k); }

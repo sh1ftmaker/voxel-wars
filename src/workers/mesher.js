@@ -5,5 +5,7 @@ import { CHUNK } from '../config.js';
 self.onmessage = (e) => {
     const { id, key, sdf, mat, dims } = e.data;
     const mesh = dims ? surfaceNets(sdf, mat, dims[0], dims[1], dims[2]) : surfaceNets(sdf, mat, CHUNK);
-    self.postMessage({ id, key, mesh, sdf, mat }, [mesh.positions.buffer, mesh.normals.buffer, mesh.materials.buffer, mesh.ao.buffer, mesh.indices.buffer, sdf.buffer, mat.buffer]);
+    const transfer = [sdf.buffer, mat.buffer];
+    for(const v of Object.values(mesh)) if(ArrayBuffer.isView(v)) transfer.push(v.buffer);
+    self.postMessage({ id, key, mesh, sdf, mat }, transfer);
 };

@@ -170,7 +170,7 @@ export class Level {
         let best = null;
         for(const p of prims) {
             if(!this.groups[p.group].add) continue;
-            if(p.d(x, y, z) > 0) continue;
+            if(p.d(x, y, z) > 1e-6) continue; // same inclusive test as voxelize: faces on the lattice read 0 ± rounding
             if(!best || p.group > best.group || (p.group === best.group && p.order > best.order)) best = p;
         }
         return best ? best.mat : DIRT;
