@@ -12,7 +12,11 @@
  *   soft.gridChanged(vb)              its grid was carved: the lattice is rebuilt on the next kick
  *   soft.stop(vb) / soft.release(vb)  body removed (its mesh may still be shown as a ghost) / mesh gone
  *   soft.onSplit = (vb, split) => {}  the lattice came apart along broken faces (VoxelBodies.crack)
+ *   soft.onBend = (vb, amount) => {}  plastic flow this step (m; metal bending), soft.onBake = (vb, grid) => {} a bent
+ *                                     body calmed down: its bend baked into a new grid (offset, prep) to swap in
  *   soft.toughOf = (vb) => scale      toughness scale per body (0: never cracks), read when its lattice is built
+ *   soft.seedOf = (vb) => int         face threshold seed per body (its netId: the same cracks on every client)
+ *   soft.allow = (vb) => bool         may this body have a lattice at all (crumbling and glass ones do not)
  *
  * A lattice exists only while a body wobbles: it is built at the first kick (a frame later), sleeps in the worker
  * when calm (zero cost, displacement 0) and keeps its atlas slot only while awake. `?softDebris=0` turns it off.
@@ -34,7 +38,7 @@ export class SoftBodies {
         this.removals = [];
         this.busy = false;
         this.dt = 0;
-        this.onSplit = null;
+        this.onSplit = null; this.onBend = null; this.onBake = null;
         this.stats = { awake: 0, ms: 0, msMax: 0, mainMs: 0, splits: 0, built: 0, steps: 0 };
         if(!this.enabled) return;
         this.atlas = new Float32Array(W * ROWS * SLOTS * 4);
@@ -96,12 +100,14 @@ export class SoftBodies {
             const g = vb.grid;
             r.state = 'building';
             // copies: the grid stays the body's (carving, stamping)
-            this.worker.postMessage({ op: 'add', id: r.id, tough: this.toughOf ? this.toughOf(vb) : 1, grid: { nx: g.nx, ny: g.ny, nz: g.nz, sdf: g.sdf.slice(), mat: g.mat.slice() } });
+            this.worker.postMessage({ op: 'add', id: r.id, tough: this.toughOf ? this.toughOf(vb) : 1, seed: this.seedOf ? this.seedOf(vb) : 1, gen: vb.generation | 0,
+                grid: { nx: g.nx, ny: g.ny, nz: g.nz, sdf: g.sdf.slice(), mat: g.mat.slice() } });
         }
         return r;
     }
     _kick(vb, k) {
         if(!this.enabled || vb.dead || vb.stamping || vb.prop.userData.held) return;
+        if(this.allow && !vb.softRec && !this.allow(vb)) return;
         const r = this._ensure(vb);
         if(r.state === 'dead') return;
         k.id = r.id;
@@ -185,6 +191,8 @@ export class SoftBodies {
             this.stats.splits++;
             if(this.onSplit && !r.vb.dead) this.onSplit(r.vb, s);
         }
+        for(const b of m.bends || []) { const r = this.recs.get(b.id); if(r && !r.vb.dead && this.onBend) this.onBend(r.vb, b.amount); }
+        for(const b of m.bakes || []) { const r = this.recs.get(b.id); if(r && r.state === 'ready' && !r.vb.dead && this.onBake) this.onBake(r.vb, b.grid, b.maxU); }
         if(m.same) return;
         const t0 = performance.now();
         this.stats.awake = m.ids.length;

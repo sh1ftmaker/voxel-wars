@@ -36,6 +36,15 @@
  *     and removed once the terrain under it has been remeshed: rubble becomes diggable terrain again.
  *   - budget: over maxBodies (48), the stillest bodies are stamped early and small moving ones are pulverized; near
  *     the cap fractures make fewer pieces and more dust.
+ *   - fracture modes per material (src/softbody/behaviour.js, after tetrafract): wood splinters (its lattice cracks
+ *     along the grain into long pieces; the fallback cleave is a Voronoi split stretched along the grain), stone,
+ *     brick and cobble shatter at once into angular pieces sized by the material's `piece` range (finer for harder
+ *     hits), glass bursts on almost any hit into slivers (mostly particles), metal bends (plastic lattice; baked into
+ *     its voxels when it calms down: _bake, a 'bbake' edit for the other clients) and only tears at extreme strain,
+ *     dirt, grass, sand and snow crumble into a few clods on a hard landing and leave a small mound. Events (ctx
+ *     .events): 'fracture' { point, mat, mode, pieces, energy, dir } on every break, 'splinters' { point, mat, axis
+ *     (world), count, dir }, 'crumble' { point, mat, volume }, 'bend' { point, mat, amount } (throttled); 'chips'
+ *     { point, mat, count } (stone carving, Destruction) spawns a few short-lived chip bodies (local, never stamped).
  *   - bodies leaving the world are removed; bodies the game removes (physics.removeBody) are forgotten.
  *   - a kinematic body (held by a player) or one with userData.held never settles or fractures; one with
  *     userData.thrown (a thrown rock) only cracks along its soft lattice, it never shatters.
@@ -60,6 +69,7 @@ import { GRAVITY, BodyType } from './Physics.js';
 import { createTerrainMaterial } from '../render/terrainMaterial.js';
 import { SoftBodies } from '../softbody/SoftBodies.js';
 import { cellSampleLabels } from '../softbody/lattice.js';
+import { behaviour, pieceCount } from '../softbody/behaviour.js';
 
 /** Rotate vector v by quaternion q = [x,y,z,w]. */
 function rotate(q, v) {
@@ -86,6 +96,13 @@ const CRACK_WAIT = 0.4, CRACK_FALLBACK = 1.8, CLEAVE = 3;
 const SOFT_DV = 1.5;
 /** A body this client does not own that has been still this long is dropped (its owner stamps or dusts it). */
 const NONOWNER_REST = 20;
+/** Smallest bodies (samples) that break, per fracture mode (others only wobble). */
+const MIN_BREAK = { splinter: 64, shatter: MIN_FRACTURE, glass: 24, bend: MIN_FRACTURE, crumble: 2 * DEBRIS, none: Infinity };
+/** Break threshold factor per fracture mode (glass goes at a tap, crumbling lumps on a hard landing). */
+const MODE_DV = { splinter: 1, shatter: 1, glass: 0.3, bend: 1.6, crumble: 0.6, none: Infinity };
+const NO_LATTICE = new Set(['crumble', 'glass', 'none']);
+/** Plain grid (no prep) for an edit. */
+const plainGrid = (g) => ({ nx: g.nx, ny: g.ny, nz: g.nz, sdf: g.sdf, mat: g.mat, count: g.count, offset: g.offset });
 /** A number from a body's netId (seeds its fracture alike on every client). */
 const seedOf = (id) => { let h = 0x811c9dc5; for(let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 0x01000193); } return h >>> 0; };
 
@@ -114,11 +131,22 @@ export class VoxelBodies {
         if(this.net) {
             this.net.on('stamp', (e, m) => this._applyStamp(e, m));
             this.net.on('bsplit', (e, m) => this._applySplit(e, m));
+            this.net.on('bbake', (e, m) => this._applyBake(e, m));
         }
         this.soft = new SoftBodies({ material: this.material, params: ctx.params });
         this.soft.onSplit = (vb, split) => this.crack(vb, split);
-        // later generations are tougher (as breakDv); pieces too small to fracture only wobble
-        this.soft.toughOf = (vb) => vb.grid.count >= MIN_FRACTURE ? 1 + 0.4 * vb.generation : 0;
+        this.soft.onBend = (vb, amount) => this._bend(vb, amount);
+        this.soft.onBake = (vb, grid) => this._bake(vb, grid);
+        // only wood (splinter) and metal (bend: tears) crack along the lattice; later generations are tougher (as
+        // breakDv); pieces too small to fracture only wobble
+        this.soft.toughOf = (vb) => {
+            const m = this.modeOf(vb);
+            if(m === 'bend') return 1;
+            return m === 'splinter' && vb.grid.count >= MIN_BREAK.splinter ? 1 + 0.4 * vb.generation : 0;
+        };
+        this.soft.seedOf = (vb) => vb.netId ? seedOf(vb.netId) : 1;
+        this.soft.allow = (vb) => !vb.prop.userData.chip && !NO_LATTICE.has(this.modeOf(vb));
+        this.events.addEventListener('chips', (e) => this._chips(e.detail || {}));
         this.physics.onHit((c1, c2, speed, point) => this._contact(c1, c2, speed, point));
         this.physics.onStep((h) => this._step(h));
         this.physics.onFrame(() => this._frame());
@@ -187,6 +215,13 @@ export class VoxelBodies {
         if(this.isOwner(vb) || vb.stamping) return;
         st.replayed++;
         this.breaks.set(vb, [vb.toWorld(e.p), e.dv, e.cells || null, 0, { n: e.n, minCount: e.minCount, seed: e.seed }]);
+    }
+    /** Another client's bake of a bent body: swap this client's copy for the same grid. */
+    _applyBake(e, { local }) {
+        if(local) return;
+        const vb = this.byId(e.id);
+        if(!vb || this.isOwner(vb) || vb.stamping || vb.fracturing) return;
+        this.replace(vb, [{ ...e.grid }], { tag: 'b', inherit: false });
     }
     _laterSplits(dt) {
         for(const [id, w] of this.laterSplits) {
@@ -337,11 +372,11 @@ export class VoxelBodies {
             vb.fracturing = true;
             // how many pieces and the smallest kept: decided here (by the owner) and sent with the split
             const energy = Math.min(4, dv / this.breakDv(vb));
-            const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
-            const n = forced ? forced.n : few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
-            const minCount = forced ? forced.minCount : this.debrisMin();
+            const P = this.pieceCount(vb, energy, few);
+            const n = forced ? forced.n : P.n;
+            const minCount = forced ? forced.minCount : P.minCount;
             const seed = forced ? forced.seed : vb.netId ? seedOf(vb.netId) : null;
-            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, few: few || 0, n, minCount, seed, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
+            this.jobs.unshift({ kind: 'frac', vb, point, dv, energy, cells, few: few || 0, n, minCount, seed, aniso: P.aniso, mode: P.mode, replay: !!forced, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
             if(!forced && this.multi && vb.netId) {
                 const c = cells ? { labels: cells.labels, cellOf: cells.cellOf, cs: cells.cs, dims: cells.dims } : null;
                 this.net.submit({ k: 'bsplit', id: vb.netId, p: vb.toLocal(point), dv, n, minCount, seed, cells: c }, { log: false });
@@ -396,7 +431,7 @@ export class VoxelBodies {
             j.asked = true;
             const g = vb.grid;
             const c = j.cells, cells = c ? { labels: c.labels, cellOf: c.cellOf, cs: c.cs, dims: c.dims } : null;
-            remote.split(g, { point: vb.toLocal(j.point), n: j.n, cells, minCount: j.minCount, generation: vb.generation + 1, seed: j.seed }).then(rep => {
+            remote.split(g, { point: vb.toLocal(j.point), n: j.n, cells, minCount: j.minCount, generation: vb.generation + 1, seed: j.seed, aniso: j.aniso }).then(rep => {
                 j.pieces = rep.same ? [g] : rep.pieces;
                 j.dust.set(rep.dust);
             }, () => { j.pieces = []; });
@@ -409,7 +444,7 @@ export class VoxelBodies {
             const g = vb.grid;
             if(this.debug) console.log(`fracture n=${g.count} gen=${vb.generation} age=${vb.age.toFixed(2)} dv=${j.dv.toFixed(1)} break=${this.breakDv(vb).toFixed(1)} mass=${(vb.mass / 1000).toFixed(1)}t`);
             const c = j.cells;
-            j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), j.n, j.seed != null ? rng(j.seed) : Math.random), { minCount: j.minCount, dust: j.dust });
+            j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), j.n, j.seed != null ? rng(j.seed) : Math.random, j.aniso), { minCount: j.minCount, dust: j.dust });
             j.sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
             j.held = { ...vb.prop.userData }; delete j.held.voxelBody; delete j.held.ripped;
             j.ms = performance.now() - t0;
@@ -427,7 +462,8 @@ export class VoxelBodies {
         // swap: the pieces take over the parent's motion where it is now, plus a spread away from the hit (a crack:
         // a nudge apart; the pieces keep the parent's wobble)
         const b = vb.body, v = b.linvel(), w = b.angvel(), com = b.worldCom(), rot = vb.rotation();
-        const spread = j.cells ? 0.8 : j.few ? 1.2 : Math.min(8, 1.5 + j.dv * 0.15), point = j.cells ? [com.x, com.y, com.z] : j.point;
+        const crumble = j.mode === 'crumble';
+        const spread = j.cells ? 0.8 : crumble ? 1.6 : j.few ? 1.2 : Math.min(8, 1.5 + j.dv * 0.15), point = j.cells ? [com.x, com.y, com.z] : j.point;
         for(const { kid, p } of j.kids) this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
         for(const { kid, p } of j.kids) {
             const o = vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
@@ -450,8 +486,30 @@ export class VoxelBodies {
         this.stats.fractured++;
         this.stats.lastFractureMs = j.ms + performance.now() - t0; // total over its frames
         if(j.cells) j.dust[vb.mat] += 0.1; // crumbs along the crack
+        this._broke(vb, j, [v.x, v.y, v.z]);
         this._dust(j.point, j.dust, 'impact', vb);
         return true;
+    }
+    /** Events for a break (every client: the owner's and the replayed ones) and a crumbling lump's mound (owner). */
+    _broke(vb, j, vel) {
+        const mode = j.mode || this.modeOf(vb), mat = vb.mat, point = [...j.point];
+        const l = Math.hypot(...vel) || 1, dir = vel.map(x => x / l);
+        let dust = 0; for(let i = 0; i < 256; i++) dust += j.dust[i];
+        const ev = (type, detail) => this.events.dispatchEvent(new CustomEvent(type, { detail }));
+        ev('fracture', { point, mat, mode, pieces: j.kids.length, energy: j.energy ?? 0, dir });
+        if(mode === 'splinter') {
+            const g = behaviour(mat).grain, a = [0, 0, 0]; a[g >= 0 ? g : 0] = 1;
+            const q = vb.rotation(), axis = rotate(q, a);
+            ev('splinters', { point, mat, axis, count: Math.min(40, j.kids.length * 3 + Math.round(dust / 0.004)), dir });
+        } else if(mode === 'crumble') {
+            ev('crumble', { point, mat, volume: vb.volume });
+            // most of what fell apart stays on the ground: a mound where it landed (an edit: every client gets it)
+            const V = dust * 0.7;
+            if(!j.replay && this.isOwner(vb) && V > 0.05 && this.ctx.destruction && this.world.sample(point[0], point[1] - 0.6, point[2]) < 0) {
+                const r = Math.max(0.3, Math.min(1.2, Math.cbrt(3 * V / (2 * Math.PI))));
+                this.ctx.destruction.carve(sphere([point[0], point[1] - r * 0.55, point[2]], r), { op: 'add', mat, kind: 'mound' });
+            }
+        }
     }
     _runStamp(j, end) {
         const vb = j.vb;
@@ -603,7 +661,7 @@ export class VoxelBodies {
      * Swap a body for pieces of its grid (each with `offset` in the body's grid-local samples). Pieces inherit the
      * body's motion (v + w x r) plus `spread` m/s away from `point`. Tiny pieces are dust. Returns { removed, bodies }.
      */
-    replace(vb, pieces, { point = null, spread = 0, generation = vb.generation, tag = 'c' }) {
+    replace(vb, pieces, { point = null, spread = 0, generation = vb.generation, tag = 'c', inherit = true }) {
         const b = vb.body;
         const v = b.linvel(), w = b.angvel(), com = b.worldCom();
         const rot = vb.rotation();
@@ -636,7 +694,7 @@ export class VoxelBodies {
             }
             const kid = this.add(p, { origin: o, rotation: rot, linvel: lv, angvel: av, generation, userData: { ...held }, waitKeys: vb.waitKeys, sibling: pieces.length > 1 ? sibling : 0, prep: p.prep || null });
             kid.netId = vb.netId ? `${vb.netId}.${tag}${idx}` : null; kid.owner = vb.owner;
-            this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
+            if(inherit) this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
             kids.push(kid);
         }
         // keep showing the old mesh until the pieces have theirs (a frame or two)
@@ -665,7 +723,58 @@ export class VoxelBodies {
     breakDv(vb) {
         const hard = MATERIALS[vb.mat]?.hardness ?? 1;
         const massT = Math.max(0.2, vb.mass / 1000);
-        return this.breakScale * 6.5 * Math.sqrt(Math.min(hard, 6)) * Math.pow(massT, -0.12) * (1 + 0.4 * vb.generation);
+        const B = behaviour(vb.mat), f = B.mode === 'crumble' && B.particle === 'puff' ? 0.45 : MODE_DV[B.mode] ?? 1;
+        return this.breakScale * f * 6.5 * Math.sqrt(Math.min(Number.isFinite(hard) ? hard : 6, 6)) * Math.pow(massT, -0.12) * (1 + 0.4 * vb.generation);
+    }
+    /** The fracture mode of a body (its dominant material's). */
+    modeOf(vb) { return behaviour(vb.mat).mode; }
+
+    /** Pieces for a Voronoi break of `vb` hit with `energy` (x its break threshold): behaviour.pieceCount. */
+    pieceCount(vb, energy, few = 0) {
+        const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
+        return pieceCount(behaviour(vb.mat), { volume: vb.volume, count: vb.grid.count, energy, crowd, debrisMin: this.debrisMin(), few });
+    }
+
+    /** Plastic flow on a bending body: 'bend' events, at most every 0.25 s per body. */
+    _bend(vb, amount) {
+        vb.bendAcc = (vb.bendAcc || 0) + amount;
+        const now = performance.now();
+        if(vb.bendAcc < 0.01 || now - (vb.bendT || 0) < 250) return;
+        vb.bendT = now;
+        const c = vb.body.worldCom();
+        this.events.dispatchEvent(new CustomEvent('bend', { detail: { point: [c.x, c.y, c.z], mat: vb.mat, amount: vb.bendAcc } }));
+        vb.bendAcc = 0;
+    }
+    /** A bent body calmed down: swap it for its baked (bent) grid; the owner decides and tells the others. */
+    _bake(vb, grid) {
+        if(!this.isOwner(vb) || vb.dead || vb.stamping || vb.fracturing || !this.list.has(vb) || vb.prop.userData.held || !vb.body.isDynamic()) return;
+        const id = vb.netId;
+        this.replace(vb, [grid], { tag: 'b', inherit: false });
+        this.stats.baked = (this.stats.baked || 0) + 1;
+        if(this.multi && id) this.net.submit({ k: 'bbake', id, grid: plainGrid(grid) }, { log: false });
+    }
+
+    /** A few chip bodies flying out of a stone carve (local and short-lived: never stamped, never streamed). */
+    _chips({ point, mat = 0, count = 0 }) {
+        if(!point || this.pressure() > 0.7) return;
+        const k = Math.min(3, count | 0, this.maxBodies - this.list.size);
+        for(let c = 0; c < k; c++) {
+            const g = newGrid(3, 3, 3), P = 3 + 2 * PAD, PP = P * P;
+            let n = 0;
+            for(let z = 0; z < 3; z++) for(let y = 0; y < 3; y++) for(let x = 0; x < 3; x++) {
+                // a rough little rock: a corner or two knocked off
+                if((x === 0 || x === 2) && (y === 0 || y === 2) && (z === 0 || z === 2) && Math.random() < 0.5) continue;
+                const i = x + PAD + (y + PAD) * P + (z + PAD) * PP;
+                g.sdf[i] = -16; g.mat[i] = mat; n++;
+            }
+            if(n < DEBRIS) continue;
+            g.count = n;
+            const a = Math.random() * Math.PI * 2, sp = 4 + Math.random() * 4;
+            const vb = this.add(g, { origin: [point[0] - 0.375 + Math.cos(a) * 0.3, point[1] - 0.2, point[2] - 0.375 + Math.sin(a) * 0.3], linvel: [Math.cos(a) * sp, 3 + Math.random() * 4, Math.sin(a) * sp],
+                angvel: [(Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12], generation: 3, userData: { chip: true } });
+            vb.owner = this.net ? this.net.id : null;
+            this.stats.chips = (this.stats.chips || 0) + 1;
+        }
     }
 
     fracture(vb, point, dv) {
@@ -728,21 +837,27 @@ export class VoxelBodies {
                 const brk = this.breakDv(vb), energy = dv / brk;
                 // the soft layer: matter away from the contact keeps going (a crack attempt when hit hard enough)
                 const sc = dv / (dvV || 1);
+                const mode = this.modeOf(vb);
                 this.soft.impact(vb, point, [dx * sc, dy * sc, dz * sc], energy > 1 ? energy * 1.3 : 1);
                 if(dv < this.impactDv) continue;
                 if(vb.cool <= 0) {
                     vb.cool = 0.12;
                     this.events.dispatchEvent(new CustomEvent('impact', { detail: { point, speed: dv, mat: vb.mat, prop: vb.prop } }));
                 }
-                if(vb.age > 0.2 && vb.grid.count >= MIN_FRACTURE && dv > brk && this.isOwner(vb)) {
-                    // under SHATTER: let the soft lattice crack it (crack()), with a Voronoi fallback if it holds
-                    // (a thrown body always cracks rather than bursting: Combat.throwHeld)
-                    const soft = this.soft.enabled && (energy < SHATTER || vb.prop.userData.thrown) && vb.softRec?.state !== 'dead';
-                    if(soft) { if(!vb.crackWait || vb.crackWait.dv < dv) vb.crackWait = { t: vb.age, point, dv, energy }; }
-                    else {
-                        // no soft layer (off, or too big for one): cleave into a few pieces; only extreme hits shatter
-                        const q = this.breaks.get(vb);
-                        if(!q || q[1] < dv) this.breaks.set(vb, [point, dv, null, energy < SHATTER ? Math.min(CLEAVE, 2 + Math.floor(energy / 4)) : 0]);
+                const ud = vb.prop.userData;
+                if(vb.age > 0.2 && vb.grid.count >= MIN_BREAK[mode] && dv > brk && this.isOwner(vb) && !ud.chip && !(mode === 'crumble' && vb.generation >= 2)) {
+                    const q = this.breaks.get(vb);
+                    if(mode === 'glass' || mode === 'crumble' || mode === 'shatter') {
+                        // at once: glass and crumbling lumps fall apart, stone bursts into pieces (a thrown stone cleaves
+                        // into a few: it stays a physics object, Combat.throwHeld)
+                        const few = mode === 'shatter' && ud.thrown && energy < SHATTER ? Math.min(CLEAVE, 2 + Math.floor(energy / 4)) : 0;
+                        if(!q || q[1] < dv) this.breaks.set(vb, [point, dv, null, few]);
+                    } else {
+                        // wood and metal: under SHATTER the soft lattice cracks it (crack()); wood falls back to a cleave
+                        // along the grain if it holds, metal never bursts (it bends, or tears along its lattice)
+                        const soft = this.soft.enabled && (energy < SHATTER || ud.thrown || mode === 'bend') && vb.softRec?.state !== 'dead';
+                        if(soft) { if(!vb.crackWait || vb.crackWait.dv < dv) vb.crackWait = { t: vb.age, point, dv, energy }; }
+                        else if(mode !== 'bend' && (!q || q[1] < dv)) this.breaks.set(vb, [point, dv, null, energy < SHATTER ? Math.min(CLEAVE, 2 + Math.floor(energy / 4)) : 0]);
                     }
                 }
             }
@@ -764,7 +879,7 @@ export class VoxelBodies {
             if(cw && vb.age - cw.t > CRACK_WAIT) {
                 vb.crackWait = null;
                 // the lattice held: a hit far over the threshold shatters it after all
-            if(cw.energy >= CRACK_FALLBACK && !vb.prop.userData.thrown && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb))
+            if(cw.energy >= CRACK_FALLBACK && !vb.prop.userData.thrown && this.modeOf(vb) !== 'bend' && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb))
                     this.breaks.set(vb, [cw.point, cw.dv, null, Math.min(CLEAVE, 2 + Math.floor(cw.energy / 4))]);
             }
             const b = vb.body;
@@ -783,13 +898,17 @@ export class VoxelBodies {
                 if(v.x * v.x + v.y * v.y + v.z * v.z < 0.25 && w.x * w.x + w.y * w.y + w.z * w.z < 0.25) vb.still += h;
                 else vb.still = Math.max(0, vb.still - h * 4);
             }
+            if(vb.prop.userData.chip) { if(vb.still > 1.2 || vb.age > 8) { vb.dispose(); this.list.delete(vb); } continue; } // chips just go
             if(!this.isOwner(vb)) { if(vb.still > NONOWNER_REST) { vb.dispose(); this.list.delete(vb); } continue; }
-            if(vb.still > SETTLE || (vb.age > 25 && vb.still > 0.5)) this.stamp(vb);
+            // not while its soft layer is still drawn (wobbling, or frozen bent until its bake swaps it): the stamp is
+            // the unbent grid, it would pop
+            const shown = vb.softRec?.slot >= 0 && vb.age < 25;
+            if(!shown && (vb.still > SETTLE || (vb.age > 25 && vb.still > 0.5))) this.stamp(vb);
         }
         // budget: over the cap, stamp the stillest bodies, then pulverize the smallest moving ones
         let over = Math.round((this.pressure() - 1) * this.maxBodies);
         if(over > 0) {
-            const cands = [...this.list].filter(vb => !vb.stamping && !vb.dead && vb.body.isDynamic() && !vb.prop.userData.held);
+            const cands = [...this.list].filter(vb => !vb.stamping && !vb.dead && vb.body.isDynamic() && !vb.prop.userData.held && !vb.prop.userData.chip);
             cands.sort((a, b) => b.still - a.still);
             for(const vb of cands) { if(over <= 0 || vb.still < 0.3) break; this.stamp(vb); over--; }
             if(over > 0) {
@@ -814,7 +933,7 @@ export class VoxelBodies {
     /** Union a body into the terrain at its pose (a background job); it is removed once the terrain there has been
      *  remeshed and has its new colliders. */
     stamp(vb) {
-        if(vb.stamping || vb.dead || vb.fracturing || !this.isOwner(vb)) return;
+        if(vb.stamping || vb.dead || vb.fracturing || !this.isOwner(vb) || vb.prop.userData.chip) return;
         this.stats.stamped++;
         this.soft.gridChanged(vb); // stamped as built: no more wobble
         vb.body.setBodyType(BodyType.Fixed, false);
@@ -824,7 +943,7 @@ export class VoxelBodies {
         // boxes onto the exact terrain surface (or the other way round) and shift
         const [mn, mx] = vb.worldBox();
         for(const o of this.list) {
-            if(o === vb || o.stamping || o.dead || o.fracturing || !o.body.isDynamic() || o.prop.userData.held || !this.isOwner(o)) continue;
+            if(o === vb || o.stamping || o.dead || o.fracturing || !o.body.isDynamic() || o.prop.userData.held || o.prop.userData.chip || !this.isOwner(o)) continue;
             if(!(o.body.isSleeping() || o.still > 0.3)) continue;
             const [a, b] = o.worldBox();
             if(a[0] < mx[0] + 0.3 && b[0] > mn[0] - 0.3 && a[1] < mx[1] + 0.3 && b[1] > mn[1] - 0.3 && a[2] < mx[2] + 0.3 && b[2] > mn[2] - 0.3) this.stamp(o);

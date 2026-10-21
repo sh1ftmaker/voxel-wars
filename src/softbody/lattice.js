@@ -16,12 +16,23 @@
  *
  * Fracture (DMM-style, on the lattice): every substep each tet's strain |F - R| (deformation gradient minus its
  * rotation) is measured; a face between two solid cells breaks when the larger strain of the two cells exceeds the
- * material's toughness (divided by the body's current `frag`ility, raised by hard impacts, and lowered next to an
+ * face's threshold (divided by the body's current `frag`ility, raised by hard impacts, and lowered next to an
  * already broken face of the same plane: crack tips propagate). Broken faces damage their cells (softer, so strain
  * concentrates along the crack). When the broken faces cut the solid cells into several components the body reports
  * a split: one label per cell (cellSampleLabels turns it into per-sample labels for islands.splitGrid).
+ *
+ * Face thresholds (per material, src/softbody/behaviour.js, as tetrafract builder.js _faceThreshold): toughness x
+ * (1 +- spread), the random part seeded (`seed`: the same thresholds on every client); wood faces across its grain
+ * are 0.35 + 3.4 along^2 times as tough (cracks run along the fibres: long thin pieces, and a hard hit opens several
+ * parallel cracks: splinters); faces between different materials (joints) half as tough.
+ *
+ * Plasticity (bend: metal): cells strained past their yield move the rest shape (`ur`, per node) toward the current
+ * shape, so a bent piece stays bent; each tet's rest edges and inverse then come from the plastic rest shape. When it
+ * calms down bent it freezes (u = ur, `bent`) instead of sleeping: the worker bakes the bend into its voxels.
  */
 import { VOXEL } from '../config.js';
+import { rng } from '../voxel/brushes.js';
+import { behaviour, latticeTough } from './behaviour.js';
 
 const PAD = 2;
 
@@ -63,13 +74,16 @@ ds([1, 2], { stiffness: 0.3, damping: 1.8, gain: 2.0, tough: 0.2 });     // dirt
 ds([3, 4], { stiffness: 0.22, damping: 2.4, gain: 2.12, tough: 0.16 });   // sand, snow
 ds([0, 8, 9, 12], { stiffness: 0.6, damping: 1.4, gain: 1.62, tough: 0.12 }); // stones: stiff, brittle
 ds([5, 11], { stiffness: 0.55, damping: 1.5, gain: 1.69, tough: 0.11 }); // brick, cobble: mortar joints crack
-ds([6], { stiffness: 0.8, damping: 1.0, gain: 1.0, tough: 0.6 });        // metal: rings, hardly breaks
+ds([6], { stiffness: 0.8, damping: 2.2, gain: 1.2, tough: 0.6 });        // metal: rings briefly, bends (plastic), hardly breaks
 ds([7], { stiffness: 0.2, damping: 3, gain: 2.25, tough: 0.4 });          // lava
-ds([10], { stiffness: 0.4, damping: 1.4, gain: 1.88, tough: 0.25 });      // wood: flexes
+ds([10, 14, 15], { stiffness: 0.28, damping: 1.3, gain: 2.0, tough: 0.25 }); // wood: flexes a lot before it splinters
+ds([16], { stiffness: 0.9, damping: 3, gain: 0.3, tough: 0.06 });         // glass: rigid (it shatters, never wobbles)
 ds([13], { stiffness: 0.9, damping: 3, gain: 0.3, tough: 1e9 });         // bedrock
 for(let i = 0; i < 256; i++) DEBRIS_SOFT[i] ||= DEBRIS_SOFT[1];
 
 export const NODE_CAP = 1024;   // nodes per body (the render atlas reserves this many texels per slot)
+/** A body calm with a plastic bend over this (m) freezes bent (and is baked) instead of springing back. */
+const BENT = 0.04;
 export const CELL_CAP = 360;    // solid cells per body (x5 tets)
 const CS_STEPS = [2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32];
 
@@ -165,7 +179,8 @@ export function buildLattice(grid) {
 
 /** A simulated body: the lattice plus state. */
 export class SoftLattice {
-    constructor(lat) {
+    /** seed: face threshold randomness (the body's netId); toughScale: x thresholds (0: never cracks). */
+    constructor(lat, { seed = 1, toughScale = 1 } = {}) {
         Object.assign(this, lat);
         const nn = this.nn, nt = this.ncell * 5;
         this.u = new Float32Array(nn * 3);
@@ -203,6 +218,70 @@ export class SoftLattice {
         let r2 = 0;
         for(const i of this.actList) r2 = Math.max(r2, (this.rest[i * 3] - this.restC[0]) ** 2 + (this.rest[i * 3 + 1] - this.restC[1]) ** 2 + (this.rest[i * 3 + 2] - this.restC[2]) ** 2);
         this.radius = Math.sqrt(r2);
+        this.faceThresholds(seed, toughScale);
+        // plasticity: nodes of cells that yield (bend)
+        let ys = 0, pr = 0, np = 0;
+        const nplast = new Uint8Array(nn);
+        for(let c = 0; c < this.ncell; c++) {
+            const b = behaviour(this.cellMat[c]);
+            if(!(b.plastic > 0)) continue;
+            np++; ys += b.yieldStrain; pr += b.plastic;
+            for(let l = 0; l < 5; l++) for(let k = 0; k < 4; k++) nplast[this.tetN[(c * 5 + l) * 4 + k]] = 1;
+        }
+        this.bent = false; this.frozen = false; this.flow = 0; this.maxUr = 0;
+        if(np) {
+            this.yieldS = ys / np; this.plasticRate = pr / np; this.nplast = nplast;
+            this.ur = new Float32Array(nn * 3);
+            this.nstrain = new Float32Array(nn);
+            this.ptf = new Float64Array(nt * 33); // per tet, laid out as TF (rest from the plastic shape)
+            this.restPlastic();
+        }
+    }
+
+    /** Per face break thresholds (see the header). */
+    faceThresholds(seed, toughScale) {
+        const { faces, cellMat } = this;
+        const nf = faces.length / 3;
+        const thr = this.faceThr = new Float32Array(nf);
+        const rand = rng((seed >>> 0) || 1);
+        let wood = 0;
+        for(let c = 0; c < this.ncell; c++) if(behaviour(cellMat[c]).mode === 'splinter') wood++;
+        this.splinter = wood * 2 > this.ncell;
+        let sum = 0;
+        for(let f = 0; f < nf; f++) {
+            const ma = cellMat[faces[f * 3]], mb = cellMat[faces[f * 3 + 1]], axis = faces[f * 3 + 2];
+            const A = behaviour(ma), B = behaviour(mb);
+            const a = latticeTough(A), b = latticeTough(B);
+            const W = a <= b ? A : B;
+            let t = Math.min(a, b) * (1 + (rand() * 2 - 1) * W.spread);
+            // grain: a face whose normal (axis) runs along the fibres cuts across them
+            const ga = A.grain >= 0 ? (A.grain === axis ? 3.75 : 0.35) : 0, gb = B.grain >= 0 ? (B.grain === axis ? 3.75 : 0.35) : 0;
+            if(ga || gb) t *= ga && gb ? (ga + gb) / 2 : ga || gb;
+            if(ma !== mb) t *= 0.5; // a joint between materials
+            thr[f] = toughScale > 0 ? t * toughScale : Infinity;
+            sum += thr[f];
+        }
+        this.tough = nf ? sum / nf : Infinity;
+    }
+
+    /** Per tet rest data from the plastic rest shape (rest + ur): unit corner offsets for the positions, h Dp^-1,
+     *  and the rest offsets from the rest centroid (/ h), in TF's layout. */
+    restPlastic() {
+        const { ptf, ur, tetN, tetT, h } = this, nt = this.ncell * 5, ih = 1 / h;
+        const r = new Float64Array(12), m = new Array(9);
+        for(let t = 0; t < nt; t++) {
+            const o = t * 33, so = tetT[t] * 33, t4 = t * 4;
+            for(let k = 21; k < 33; k++) ptf[o + k] = TF[so + k];
+            for(let k = 0; k < 4; k++) { const n = tetN[t4 + k] * 3; for(let a = 0; a < 3; a++) r[k * 3 + a] = TF[so + 21 + k * 3 + a] * h + ur[n + a]; }
+            const cx = (r[0] + r[3] + r[6] + r[9]) / 4, cy = (r[1] + r[4] + r[7] + r[10]) / 4, cz = (r[2] + r[5] + r[8] + r[11]) / 4;
+            for(let k = 0; k < 4; k++) { ptf[o + k * 3] = (r[k * 3] - cx) * ih; ptf[o + k * 3 + 1] = (r[k * 3 + 1] - cy) * ih; ptf[o + k * 3 + 2] = (r[k * 3 + 2] - cz) * ih; }
+            // Dp columns: edges 1, 2, 3 from corner 0, over h (F = (Ds / h) (h Dp^-1))
+            m[0] = (r[3] - r[0]) * ih; m[1] = (r[6] - r[0]) * ih; m[2] = (r[9] - r[0]) * ih;
+            m[3] = (r[4] - r[1]) * ih; m[4] = (r[7] - r[1]) * ih; m[5] = (r[10] - r[1]) * ih;
+            m[6] = (r[5] - r[2]) * ih; m[7] = (r[8] - r[2]) * ih; m[8] = (r[11] - r[2]) * ih;
+            const inv = inv3(m);
+            for(let k = 0; k < 9; k++) ptf[o + 12 + k] = inv[k];
+        }
     }
 
     /** Velocity kick (see the header). */
@@ -247,24 +326,25 @@ export class SoftLattice {
             }
         }
         const nt = this.ncell * 5, ih = 1 / h;
+        const plastic = !!this.ptf, T = plastic ? this.ptf : TF;
         let maxS = 0;
         for(let it = 0; it < iters; it++) {
             const last = it === iters - 1;
             if(last) strain.fill(0);
             for(const i of actList) { acc[i * 3] = acc[i * 3 + 1] = acc[i * 3 + 2] = 0; }
             for(let t = 0; t < nt; t++) {
-                const c = (t / 5) | 0, o = tetT[t] * 33;
+                const c = (t / 5) | 0, o = plastic ? t * 33 : tetT[t] * 33;
                 const t4 = t * 4, n0 = tetN[t4] * 3, n1 = tetN[t4 + 1] * 3, n2 = tetN[t4 + 2] * 3, n3 = tetN[t4 + 3] * 3;
                 // positions relative to corner 0's rest point (unit offsets * h + u)
                 const p0x = u[n0], p0y = u[n0 + 1], p0z = u[n0 + 2];
-                const p1x = TF[o + 24] * h + u[n1], p1y = TF[o + 25] * h + u[n1 + 1], p1z = TF[o + 26] * h + u[n1 + 2];
-                const p2x = TF[o + 27] * h + u[n2], p2y = TF[o + 28] * h + u[n2 + 1], p2z = TF[o + 29] * h + u[n2 + 2];
-                const p3x = TF[o + 30] * h + u[n3], p3y = TF[o + 31] * h + u[n3 + 1], p3z = TF[o + 32] * h + u[n3 + 2];
+                const p1x = T[o + 24] * h + u[n1], p1y = T[o + 25] * h + u[n1 + 1], p1z = T[o + 26] * h + u[n1 + 2];
+                const p2x = T[o + 27] * h + u[n2], p2y = T[o + 28] * h + u[n2 + 1], p2z = T[o + 29] * h + u[n2 + 2];
+                const p3x = T[o + 30] * h + u[n3], p3y = T[o + 31] * h + u[n3 + 1], p3z = T[o + 32] * h + u[n3 + 2];
                 // F = Ds Dm^-1 (Dm = unit offsets * h)
                 const d1x = (p1x - p0x) * ih, d1y = (p1y - p0y) * ih, d1z = (p1z - p0z) * ih;
                 const d2x = (p2x - p0x) * ih, d2y = (p2y - p0y) * ih, d2z = (p2z - p0z) * ih;
                 const d3x = (p3x - p0x) * ih, d3y = (p3y - p0y) * ih, d3z = (p3z - p0z) * ih;
-                const m0 = TF[o + 12], m1 = TF[o + 13], m2 = TF[o + 14], m3 = TF[o + 15], m4 = TF[o + 16], m5 = TF[o + 17], m6 = TF[o + 18], m7 = TF[o + 19], m8 = TF[o + 20];
+                const m0 = T[o + 12], m1 = T[o + 13], m2 = T[o + 14], m3 = T[o + 15], m4 = T[o + 16], m5 = T[o + 17], m6 = T[o + 18], m7 = T[o + 19], m8 = T[o + 20];
                 const F00 = d1x * m0 + d2x * m3 + d3x * m6, F01 = d1x * m1 + d2x * m4 + d3x * m7, F02 = d1x * m2 + d2x * m5 + d3x * m8;
                 const F10 = d1y * m0 + d2y * m3 + d3y * m6, F11 = d1y * m1 + d2y * m4 + d3y * m7, F12 = d1y * m2 + d2y * m5 + d3y * m8;
                 const F20 = d1z * m0 + d2z * m3 + d3z * m6, F21 = d1z * m1 + d2z * m4 + d3z * m7, F22 = d1z * m2 + d2z * m5 + d3z * m8;
@@ -298,13 +378,13 @@ export class SoftLattice {
                 // goals: centroid + R (rest offset - rest centroid); corrections scaled by the cell's stiffness
                 const cx = (p0x + p1x + p2x + p3x) * 0.25, cy = (p0y + p1y + p2y + p3y) * 0.25, cz = (p0z + p1z + p2z + p3z) * 0.25;
                 const k = stiff[c] * (1 - 0.85 * damage[c]);
-                let rx = TF[o] * h, ry = TF[o + 1] * h, rz = TF[o + 2] * h;
+                let rx = T[o] * h, ry = T[o + 1] * h, rz = T[o + 2] * h;
                 acc[n0] += (cx + R00 * rx + R01 * ry + R02 * rz - p0x) * k; acc[n0 + 1] += (cy + R10 * rx + R11 * ry + R12 * rz - p0y) * k; acc[n0 + 2] += (cz + R20 * rx + R21 * ry + R22 * rz - p0z) * k;
-                rx = TF[o + 3] * h; ry = TF[o + 4] * h; rz = TF[o + 5] * h;
+                rx = T[o + 3] * h; ry = T[o + 4] * h; rz = T[o + 5] * h;
                 acc[n1] += (cx + R00 * rx + R01 * ry + R02 * rz - p1x) * k; acc[n1 + 1] += (cy + R10 * rx + R11 * ry + R12 * rz - p1y) * k; acc[n1 + 2] += (cz + R20 * rx + R21 * ry + R22 * rz - p1z) * k;
-                rx = TF[o + 6] * h; ry = TF[o + 7] * h; rz = TF[o + 8] * h;
+                rx = T[o + 6] * h; ry = T[o + 7] * h; rz = T[o + 8] * h;
                 acc[n2] += (cx + R00 * rx + R01 * ry + R02 * rz - p2x) * k; acc[n2 + 1] += (cy + R10 * rx + R11 * ry + R12 * rz - p2y) * k; acc[n2 + 2] += (cz + R20 * rx + R21 * ry + R22 * rz - p2z) * k;
-                rx = TF[o + 9] * h; ry = TF[o + 10] * h; rz = TF[o + 11] * h;
+                rx = T[o + 9] * h; ry = T[o + 10] * h; rz = T[o + 11] * h;
                 acc[n3] += (cx + R00 * rx + R01 * ry + R02 * rz - p3x) * k; acc[n3 + 1] += (cy + R10 * rx + R11 * ry + R12 * rz - p3y) * k; acc[n3 + 2] += (cz + R20 * rx + R21 * ry + R22 * rz - p3z) * k;
             }
             // Jacobi: each node moves by the mean of its tets' corrections (x 4: corrections are per tet, a node
@@ -329,7 +409,11 @@ export class SoftLattice {
         }
         this.maxU = mu; this.maxV = mv; this.maxStrain = maxS;
         this.frag = 1 + (this.frag - 1) * Math.exp(-dt / 0.25);
-        if(mu < 0.004 && mv < 0.03) { this.calm += dt; if(this.calm > 0.25) this.sleep(); } else this.calm = 0;
+        if(plastic) this.creep(dt);
+        if(mu < 0.004 + this.maxUr && mv < 0.03) {
+            this.calm += dt;
+            if(this.calm > 0.25) { if(this.maxUr > BENT) this.freeze(); else this.sleep(); }
+        } else this.calm = 0;
         return this.fracture();
     }
 
@@ -342,9 +426,11 @@ export class SoftLattice {
         cx /= na; cy /= na; cz /= na; vx /= na; vy /= na; vz /= na;
         // A = sum (p - c)(r - rc)^T, p = r + u
         let a00 = 0, a01 = 0, a02 = 0, a10 = 0, a11 = 0, a12 = 0, a20 = 0, a21 = 0, a22 = 0;
+        const ur = this.ur; // a bent body: fit against its bent rest shape (else the bend would read as a rotation)
         for(const i of actList) {
-            const rx = rest[i * 3] - restC[0], ry = rest[i * 3 + 1] - restC[1], rz = rest[i * 3 + 2] - restC[2];
+            let rx = rest[i * 3] - restC[0], ry = rest[i * 3 + 1] - restC[1], rz = rest[i * 3 + 2] - restC[2];
             const px = rx + u[i * 3] - cx, py = ry + u[i * 3 + 1] - cy, pz = rz + u[i * 3 + 2] - cz;
+            if(ur) { rx += ur[i * 3]; ry += ur[i * 3 + 1]; rz += ur[i * 3 + 2]; }
             a00 += px * rx; a01 += px * ry; a02 += px * rz; a10 += py * rx; a11 += py * ry; a12 += py * rz; a20 += pz * rx; a21 += pz * ry; a22 += pz * rz;
         }
         let [qx, qy, qz, qw] = this.rq;
@@ -383,7 +469,45 @@ export class SoftLattice {
         this.rq = [0, 0, 0, 1];
     }
 
-    sleep() { this.asleep = true; this.u.fill(0); this.v.fill(0); this.calm = 0; this.frag = 1; }
+    sleep() {
+        this.asleep = true; this.u.fill(0); this.v.fill(0); this.calm = 0; this.frag = 1;
+        if(this.ur && this.maxUr > 0) { this.ur.fill(0); this.maxUr = 0; this.restPlastic(); } // a small bend springs back
+    }
+    /** Calm and bent: hold the bent shape (u = ur), stop simulating; the worker bakes it into the voxels. */
+    freeze() { this.frozen = true; this.bent = true; this.u.set(this.ur); this.v.fill(0); this.calm = 0; }
+
+    /** Plastic flow (bend): nodes of cells strained past yield move their rest shape toward the current shape. */
+    creep(dt) {
+        const { u, ur, nstrain, nplast, strain, tetN, actList } = this, nt = this.ncell * 5;
+        nstrain.fill(0);
+        for(let t = 0; t < nt; t++) { const s = strain[(t / 5) | 0]; for(let k = 0; k < 4; k++) { const n = tetN[t * 4 + k]; if(s > nstrain[n]) nstrain[n] = s; } }
+        const y = this.yieldS, rate = Math.min(1, this.plasticRate * dt * 60);
+        let flow = 0, any = false;
+        for(const i of actList) {
+            const s = nstrain[i];
+            if(!nplast[i] || s <= y) continue;
+            const k = rate * (1 - y / s);
+            for(let a = 0; a < 3; a++) { const j = i * 3 + a, d = (u[j] - ur[j]) * k; ur[j] += d; const ad = Math.abs(d); if(ad > flow) flow = ad; }
+            any = true;
+        }
+        if(!any) return;
+        // keep ur free of translation (the rigid body carries it)
+        let mx = 0, my = 0, mz = 0;
+        for(const i of actList) { mx += ur[i * 3]; my += ur[i * 3 + 1]; mz += ur[i * 3 + 2]; }
+        const na = actList.length; mx /= na; my /= na; mz /= na;
+        let m = 0;
+        const MAXU = Math.min(0.6, this.h * 0.9);
+        for(const i of actList) {
+            for(let a = 0; a < 3; a++) {
+                const j = i * 3 + a;
+                const v = Math.max(-MAXU, Math.min(MAXU, ur[j] - (a === 0 ? mx : a === 1 ? my : mz)));
+                ur[j] = v; if(Math.abs(v) > m) m = Math.abs(v);
+            }
+        }
+        this.maxUr = m;
+        this.flow += flow;
+        this.restPlastic();
+    }
 
     /**
      * Break faces (true when any broke this substep). The most strained face over the threshold starts a crack, which
@@ -391,18 +515,25 @@ export class SoftLattice {
      * pieces break off along the line where the body bent, not as dust. One crack per substep.
      */
     fracture() {
-        const { faces, broken, strain, damage, faceAt, cells, dims } = this;
+        // wood hit hard opens several parallel cracks at once (splinters); everything else one crack per substep
+        const n = this.splinter && this.frag > 1.4 ? 3 : 1;
+        let any = false;
+        for(let k = 0; k < n; k++) { if(!this.crack1()) break; any = true; }
+        return any;
+    }
+    crack1() {
+        const { faces, broken, strain, damage, faceAt, cells, dims, faceThr } = this;
         const nf = broken.length;
-        const thr = this.tough / this.frag;
-        let best = -1, bs = thr;
+        const ifr = 1 / this.frag;
+        let best = -1, bs = 1;
         for(let f = 0; f < nf; f++) {
             if(broken[f]) continue;
-            const s = Math.max(strain[faces[f * 3]], strain[faces[f * 3 + 1]]);
-            if(s > bs) { bs = s; best = f; }
+            const r = Math.max(strain[faces[f * 3]], strain[faces[f * 3 + 1]]) / (faceThr[f] * ifr);
+            if(r > bs) { bs = r; best = f; }
         }
         if(best < 0) return false;
         // run the crack across the plane: faces of the same axis between cells of the same layer, edge-adjacent
-        const run = thr * (this.frag > 1.4 ? 0.12 : 0.3);
+        const run = ifr * (this.frag > 1.4 ? 0.12 : 0.3);
         const axis = faces[best * 3 + 2];
         const [CX, CY] = dims, CXY = CX * CY;
         const stack = [best];
@@ -428,7 +559,7 @@ export class SoftLattice {
                 if(c < 0) continue;
                 const g = faceAt[c * 3 + axis];
                 if(g < 0 || broken[g]) continue;
-                if(Math.max(strain[faces[g * 3]], strain[faces[g * 3 + 1]]) < run) continue;
+                if(Math.max(strain[faces[g * 3]], strain[faces[g * 3 + 1]]) < run * faceThr[g]) continue;
                 broken[g] = 1; stack.push(g);
             }
         }

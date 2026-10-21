@@ -413,8 +413,9 @@ export function splitGrid(g, labels = null, { minCount = 0, dust = null } = {}) 
 /**
  * Voronoi fracture labels: `n` sites among the solid samples, denser around `point` (local metres) so the region
  * that took the hit breaks finer. Returns an Int32Array label per padded index (only solid samples matter).
+ * `aniso` [wx, wy, wz] scales the distance per axis: a small weight stretches the cells along that axis (wood's grain).
  */
-export function voronoiLabels(g, point, n, rand = Math.random) {
+export function voronoiLabels(g, point, n, rand = Math.random, aniso = null) {
     const P = g.nx + 2 * PAD, PP = P * (g.ny + 2 * PAD);
     let ns = 0;
     let buf = new Int32Array(Math.max(g.count, 64));
@@ -446,6 +447,7 @@ export function voronoiLabels(g, point, n, rand = Math.random) {
         // a random anisotropic weight per site gives slabs and shards rather than round cells
         S[k * 6] = x; S[k * 6 + 1] = y; S[k * 6 + 2] = z;
         S[k * 6 + 3] = 0.6 + rand() * 0.8; S[k * 6 + 4] = 0.6 + rand() * 0.8; S[k * 6 + 5] = 0.6 + rand() * 0.8;
+        if(aniso) { S[k * 6 + 3] *= aniso[0]; S[k * 6 + 4] *= aniso[1]; S[k * 6 + 5] *= aniso[2]; }
     }
     for(let s = 0; s < ns; s++) {
         const i = buf[s];
