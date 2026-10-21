@@ -41,6 +41,11 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
 - **Soft ground / other bakes**: `world.applySamples({ lo, dims, sdf, mat })` (sample box, index x + y*nx + z*nx*ny)
   sends the patch to the worker (`VoxelWorld.writeSamples` there); the replica, meshes and colliders follow. Returns
   a Promise of the reply.
+- **Soft ground solver** (`src/soft`): on WebGPU a compute-shader solver (`SoftSim`); on WebGL2 (or `?softCpu=1`) the
+  same lattice solved in a worker (`src/workers/softSim.js`, `src/soft/cpuSolver.js`: 60 Hz, 2 iterations, surface
+  skin only) whose displacements reach the vertex stage through a float texture (`SoftSimCPU`). `?tets=1` / F7 draws
+  the zones' tetrahedra. Tests: `tools/test/softcpu.mjs` (node: solver cost and motion), `softview.mjs` (headless
+  WebGL2: screenshots and pixel change of a wake, a blast, `--wall`), `softgame.mjs` (WebGPU path, SwiftShader).
 - **Meshing**: replies carry the dirty chunks' padded mesher windows (no extraction on the main thread); the mesh
   worker post-processes meshes (`src/voxel/meshPrep.js`: material attributes, bounds, collider octants with hashes), so
   the main thread only wraps arrays in a BufferGeometry and Rapier builds the octant trimeshes (budgeted per frame).

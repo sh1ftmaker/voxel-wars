@@ -91,6 +91,6 @@ renderer.setAnimationLoop((now) => {
     prof.mark('render');
     frames++; fpsT += dt;
     if(fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
-    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size}`;
+    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size} · soft ground: ${ctx.soft?.label ?? 'off'}`;
     prof.frameEnd();
 });

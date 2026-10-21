@@ -36,19 +36,19 @@ for(const m of MATERIALS) REACH[m.id] = m.hardness === Infinity ? 0 : 1 / Math.s
  *  toughness  strain at which the material would tear (reserved for tearing)
  *  damping    1/s velocity loss while wobbling */
 const SOFT = {
-    0:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // stone
-    1:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.1, yield: 0.02, toughness: 0.05, damping: 4.5 }, // dirt
-    2:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.1,  yield: 0.02, toughness: 0.05, damping: 4.5 }, // grass
-    3:  { stiffness: 0.03, softness: 1.6, plasticity: 0.15,  yield: 0.015, toughness: 0.03, damping: 5.5 }, // sand
-    4:  { stiffness: 0.025, softness: 1.7, plasticity: 0.2,  yield: 0.015, toughness: 0.02, damping: 6 },   // snow
-    5:  { stiffness: 0.08,  softness: 1.1,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 2.5 }, // brick
-    6:  { stiffness: 0.12,  softness: 0.8, plasticity: 0,    yield: 0.02, toughness: 0.2,  damping: 1.5 }, // metal
-    7:  { stiffness: 0.02, softness: 1.0,  plasticity: 0,    yield: 0.02, toughness: 0.02, damping: 6 },   // lava
-    8:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // red stone
-    9:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // blue stone
-    10: { stiffness: 0.05, softness: 1.1,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 2 },   // wood
-    11: { stiffness: 0.08, softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 3 },   // cobble
-    12: { stiffness: 0.1,  softness: 0.9, plasticity: 0,    yield: 0.02, toughness: 0.14, damping: 2.5 }, // dark rock
+    0:  { stiffness: 0.09,  softness: 1.7, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 1.3 }, // stone
+    1:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.05, yield: 0.04, toughness: 0.05, damping: 1.8 }, // dirt
+    2:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.05, yield: 0.04, toughness: 0.05, damping: 1.8 }, // grass
+    3:  { stiffness: 0.03, softness: 1.6, plasticity: 0.08, yield: 0.03, toughness: 0.03, damping: 2.4 }, // sand
+    4:  { stiffness: 0.025, softness: 1.7, plasticity: 0.12, yield: 0.03, toughness: 0.02, damping: 2.8 },   // snow
+    5:  { stiffness: 0.08,  softness: 1.7,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 1.3 }, // brick
+    6:  { stiffness: 0.12,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.2,  damping: 0.9 }, // metal
+    7:  { stiffness: 0.02, softness: 1.0,  plasticity: 0,    yield: 0.02, toughness: 0.02, damping: 3 },   // lava
+    8:  { stiffness: 0.09,  softness: 1.7, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 1.3 }, // red stone
+    9:  { stiffness: 0.09,  softness: 1.7, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 1.3 }, // blue stone
+    10: { stiffness: 0.05, softness: 1.6,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 1.1 },   // wood
+    11: { stiffness: 0.08, softness: 1.6, plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 1.5 },   // cobble
+    12: { stiffness: 0.1,  softness: 1.4, plasticity: 0,    yield: 0.02, toughness: 0.14, damping: 1.3 }, // dark rock
     13: { stiffness: 1.0,  softness: 0,    plasticity: 0,    yield: 1,    toughness: 1e9,  damping: 10 },  // bedrock
 };
 for(const m of MATERIALS) Object.assign(m, SOFT[m.id] || SOFT[1]);

@@ -42,26 +42,29 @@ export const F_ACTIVE = 1, F_PINNED = 2;
  *   region: { sdf: Int8Array, mat: Uint8Array, lo: [sx, sy, sz] (sample coords of index 0), dims: [nx, ny, nz] }
  *           covering samples [2*(c0-1), 2*(c0+n+1)] per axis (the zone's cells plus a ring of one cell)
  *   c0: first cell (global lattice), n: cells per axis, bedrockY: first sample y that is not bedrock
+ *   shell: leave out cells >= ~1 m inside the ground (pinned): the CPU solver simulates the surface skin only
  * Returns { cells: Int32Array (packed i | j<<8 | k<<16 | mat<<24, local cell coords), count,
  *           cellIdx: Int32Array(nodes) local cell index or -1 (indexed like nodes: i + j*NX + k*NX*NY),
  *           flags: Int32Array(nodes) F_ACTIVE | F_PINNED | mat<<8, solidFrac }
  */
-export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP) {
+export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP, { shell = false } = {}) {
     const { sdf, mat, lo, dims } = region;
     const [dx, dy] = dims, dxy = dx * dy;
     const MX = n[0] + 2, MY = n[1] + 2, MZ = n[2] + 2; // cells incl. the ring
     // per ring cell: min sample over its 27 samples and the material there (separable min would be faster, but
     // the region is small: ~7k cells)
-    const cmin = new Int16Array(MX * MY * MZ), cmat = new Uint8Array(MX * MY * MZ);
+    const cmin = new Int16Array(MX * MY * MZ), cmat = new Uint8Array(MX * MY * MZ), deep = new Uint8Array(MX * MY * MZ);
     for(let k = 0; k < MZ; k++) for(let j = 0; j < MY; j++) for(let i = 0; i < MX; i++) {
         // ring cell (i, j, k) = global cell c0 - 1 + (i, j, k): samples from 2*i .. 2*i+2 in the region
-        let best = 127, bm = 0;
+        let best = 127, bm = 0, worst = -128;
         for(let c = 0; c <= 2; c++) for(let b = 0; b <= 2; b++) {
             let o = (2 * i) + (2 * j + b) * dx + (2 * k + c) * dxy;
-            for(let a = 0; a <= 2; a++, o++) { const s = sdf[o]; if(s < best) { best = s; bm = mat[o]; } }
+            for(let a = 0; a <= 2; a++, o++) { const s = sdf[o]; if(s < best) { best = s; bm = mat[o]; } if(s > worst) worst = s; }
         }
         const ci = i + j * MX + k * MX * MY;
         cmin[ci] = best; cmat[ci] = bm;
+        // shell: a cell whose samples are all deep (<= -100: >= ~0.8 m inside; voxelize saturates near -115) is rigid ground; its nodes are pinned
+        if(shell && worst <= -100) deep[ci] = 1;
     }
     const NX = n[0] + 1, NY = n[1] + 1, NZ = n[2] + 1;
     const cellIdx = new Int32Array(NX * NY * NZ).fill(-1);
@@ -71,6 +74,7 @@ export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP) {
     for(let k = 0; k < n[2]; k++) for(let j = 0; j < n[1]; j++) for(let i = 0; i < n[0]; i++) {
         const ci = (i + 1) + (j + 1) * MX + (k + 1) * MX * MY;
         if(cmin[ci] >= 0) continue;
+        if(deep[ci]) continue;
         solid++;
         if(count >= cellCap) continue;
         const m = cmat[ci];
@@ -98,6 +102,7 @@ export function classifyZone(region, c0, n, bedrockY, cellCap = CELL_CAP) {
             // a solid cell outside the zone holds the node in place
             if(border && s < 0 && (ri === 0 || rj === 0 || rk === 0 || ri === MX - 1 || rj === MY - 1 || rk === MZ - 1)) pin = true;
             if(s < 0 && cmat[ci] === 13) pin = true; // bedrock
+            if(deep[ci]) pin = true;
         }
         flags[ni] |= (pin ? F_PINNED : 0) | (bm << 8);
     }

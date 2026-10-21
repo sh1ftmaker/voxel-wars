@@ -49,7 +49,8 @@ export class Hud {
         this.markerLayer = el('div', 'bz-markers', root);
         // screens
         this.playEl = el('div', 'bz-screen bz-play', root, `<div class="card"><h1>VOXEL WARS</h1><p>Steal supply crates and bank them in your vault, under your fort. Blue's bots tunnel through everything to do the same.</p>
-            <div class="keys"><b>WASD</b> move · <b>Space</b> jump · <b>Shift</b> sprint<br><b>Click</b> use tool · <b>1-7 / wheel</b> tools<br><b>F</b> punch · hold <b>E / right click</b> rip & throw · <b>M</b> mute</div><button>Click to play</button><div><button class="bz-bots small"></button></div></div>`);
+            <div class="keys"><b>WASD</b> move · <b>Space</b> jump · <b>Shift</b> sprint<br><b>Click</b> use tool · <b>1-7 / wheel</b> tools<br><b>F</b> punch · hold <b>E / right click</b> rip & throw · <b>M</b> mute</div><button>Click to play</button><div><button class="bz-bots small"></button></div><div class="bz-softinfo"></div></div>`);
+        this.softInfo = this.playEl.querySelector('.bz-softinfo');
         this.botsCorner = el('button', 'bz-bots corner', root);
         this.botButtons = [...root.querySelectorAll('.bz-bots')];
         for(const b of this.botButtons) b.addEventListener('click', (e) => { e.stopPropagation(); game.setBots(!game.botsOn); });
@@ -109,6 +110,8 @@ export class Hud {
         const secs = Math.ceil(g.timeLeft);
         if(this.changed('clock', secs)) { this.clockEl.textContent = fmtTime(secs); this.clockEl.classList.toggle('urgent', secs <= 60); }
         const hp = Math.ceil(p.health);
+        const soft = g.ctx.soft;
+        if(soft && this.changed('soft', soft.label)) this.softInfo.textContent = `Soft tetrahedral ground: ${soft.label}${soft.enabled ? ' · F7 shows the tets' : ''}`;
         if(this.changed('hp', hp)) { this.hpFill.style.width = hp + '%'; this.hpText.textContent = hp; this.hpBar.classList.toggle('low', hp < 35); }
         if(this.changed('carry', !!p.carrying)) this.carryEl.classList.toggle('on', !!p.carrying);
         // tools

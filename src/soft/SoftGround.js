@@ -10,7 +10,11 @@
  *
  * Zone lifecycle: building (worker classifies the lattice) -> sim -> [frozen: read back + bake in the worker ->
  * remesh: wait until every chunk mesh in the box has been rebuilt from the baked SDF; those new meshes skip the
- * zone's displacement] -> free. WebGL2 (no compute / no storage buffers in vertex shaders) and `?soft=0`: disabled.
+ * zone's displacement] -> free.
+ *
+ * Backends: WebGPU runs the solver in compute shaders (SoftSim); WebGL2 (no compute, no storage buffers in the vertex
+ * stage) or `?softCpu=1` runs it in a worker and feeds the vertex stage through a float texture (SoftSimCPU).
+ * `?soft=0`: off. `?tets=1` or F7: draw the zones' tetrahedra (TetOverlay). `label`: which one is running.
  *
  * Tuning (ctx.soft): subDt, maxSubsteps, life, settle.
  */
@@ -19,6 +23,8 @@ import { MATERIALS } from '../voxel/materials.js';
 import { enableTerrainDeform } from '../render/terrainMaterial.js';
 import { H, SPC, MAX_ZONES, NODE_CAP, CELL_CAP, MAX_DIM } from './core.js';
 import { SoftSim, MAX_KICKS } from './SoftSim.js';
+import { SoftSimCPU } from './SoftSimCPU.js';
+import { TetOverlay } from './TetOverlay.js';
 import { readRegion, chunkVersions, applyPatch } from './region.js';
 
 const BAKE_MIN = 0.012; // m: smaller final displacements are dropped instead of baked
@@ -34,18 +40,34 @@ export class SoftGround {
         this.subDt = 1 / 240;
         this.maxSubsteps = 4;
         this.acc = 0;
-        this.settle = 0.35;               // s of extra damping before a zone sleeps
+        this.settle = 0.5;                // s of extra damping before a zone sleeps
         this.stats = { zones: 0, built: 0, baked: 0, dispatches: 0, buildMs: 0, cpuMs: 0, cpuMax: 0, lastBake: null };
         ctx.soft = this;
-        const backend = ctx.renderer.backend;
-        if(ctx.params.get('soft') === '0') { console.log('soft ground: off (?soft=0)'); return; }
-        if(!backend?.isWebGPUBackend) { console.log('soft ground: off (needs WebGPU compute)'); return; }
+        this.label = 'off';
+        const backend = ctx.renderer.backend, params = ctx.params;
+        if(params.get('soft') === '0') { this.label = 'off (?soft=0)'; console.log('soft ground: off (?soft=0)'); return; }
+        // GPU compute on WebGPU; elsewhere (WebGL2, or ?softCpu=1) the CPU solver in a worker
+        const gpu = backend?.isWebGPUBackend && params.get('softCpu') !== '1';
         try {
-            this.sim = new SoftSim(ctx.renderer, { iterations: +(ctx.params.get('softIters') || 4) });
+            if(gpu) this.sim = new SoftSim(ctx.renderer, { iterations: +(params.get('softIters') || 4) });
+            else {
+                this.sim = new SoftSimCPU(ctx.renderer, { iterations: +(params.get('softIters') || 2), rate: 60 });
+                this.subDt = 1 / 60; this.maxSubsteps = 2;
+            }
             enableTerrainDeform(ctx.terrain.material, (skip) => this.sim.deformNode(skip));
             this.sim.warmup();
-        } catch(e) { console.error('soft ground: disabled', e); return; }
+        } catch(e) { this.label = 'off (error)'; console.error('soft ground: disabled', e); return; }
+        this.label = gpu ? 'GPU compute' : 'CPU worker';
+        console.log(`soft ground: ${this.label}`);
         this.enabled = true;
+        this.overlay = new TetOverlay(ctx.scene, this.sim);
+        if(params.get('tets') === '1') this.overlay.setVisible(true);
+        addEventListener('keydown', (e) => {
+            if(e.code !== 'F7' || e.repeat) return;
+            e.preventDefault();
+            this.overlay.setVisible(!this.overlay.visible);
+            for(const z of this.zones) if(z.lattice) this.overlay.set(z.slot, z);
+        });
         this.bedrockY = ctx.world.smin[1] + BEDROCK_SAMPLES;
         readRegion(ctx.world, [0, 0, 0], [40, 24, 40]); // warm the JIT: the first wake should not hitch
         this.worker = new Worker(new URL('./softZone.js', import.meta.url), { type: 'module' });
@@ -57,14 +79,14 @@ export class SoftGround {
             const a = e.detail.actor, sp = e.detail.speed;
             if(!a?.body) return;
             const f = a.body.feet;
-            this.wake([f.x, f.y - 0.1, f.z], { speed: Math.min(9, (sp - 10) * 0.45), radius: 1.6 + sp * 0.03, dir: [0, -1, 0] });
+            this.wake([f.x, f.y - 0.1, f.z], { speed: Math.min(11, (sp - 6) * 0.7), radius: 1.8 + sp * 0.05, dir: [0, -1, 0] });
         });
         ctx.events.addEventListener('impact', (e) => {
             const { point, speed, prop } = e.detail;
             if(!point || speed < 4) return;
             if(ctx.world.sample(point[0], point[1], point[2]) > 0.6) return; // body against body, in the air
             const m = prop?.userData?.mass ?? 200;
-            this.wake(point, { speed: Math.min(6, speed * 0.25 * Math.min(2, Math.cbrt(m / 200))), radius: 1.2 + Math.min(1.5, Math.cbrt(m) * 0.08) });
+            this.wake(point, { speed: Math.min(9, speed * 0.4 * Math.min(2, Math.cbrt(m / 200))), radius: 1.4 + Math.min(1.8, Math.cbrt(m) * 0.1) });
         });
         ctx.terrain.onChunkMesh((key, g) => this._onChunkMesh(key, g));
         // before the renderer's listener (which requests the remeshes): which chunks are being meshed right now
@@ -80,8 +102,8 @@ export class SoftGround {
             if(z.state === 'sim' || z.state === 'building') z.refreshAt = 3; // a few frames: the edit may land late
         }
         if(op !== 'carve' || !impulse) return;
-        if(kind === 'blast') this.wake(center, { speed: Math.min(16, 4 + impulse * 0.6), radius: size * 1.9 + 0.8, up: 0.45 });
-        else this.wake(center, { speed: Math.min(8, 2 + impulse * 0.6), radius: size * 2.2 + 0.6, up: 0.1 });
+        if(kind === 'blast') this.wake(center, { speed: Math.min(24, 7 + impulse * 0.9), radius: size * 2.6 + 1.4, up: 0.9 });
+        else this.wake(center, { speed: Math.min(11, 3 + impulse * 0.8), radius: size * 2.4 + 0.8, up: 0.15 });
     }
 
     /** Wake the ground around `point` (m): nodes within `radius` get up to `speed` m/s along `dir` (or radially
@@ -143,7 +165,7 @@ export class SoftGround {
         const z = {
             slot, c0: lo, n, state: 'building', born: performance.now(),
             box: [lo.map(v => v * H), hi.map(v => v * H)], center: [...point],
-            maxLife: Math.min(1.6, 0.8 + speed * 0.07), life: 0, pendingKicks: [kick], plastic: false, refreshAt: -1,
+            maxLife: Math.min(3.2, 1.4 + speed * 0.1), life: 0, pendingKicks: [kick], plastic: false, refreshAt: -1,
         };
         z.life = z.maxLife;
         this.slots[slot] = z;
@@ -174,6 +196,8 @@ export class SoftGround {
             for(let i = 0; i < r.count; i++) if(MATERIALS[(r.cells[i] >>> 24) & 255]?.plasticity > 0) { plastic = true; break; }
             z.plastic = plastic;
             this.sim.upload(z.slot, { n: z.n, flags: r.flags, cellIdx: r.cellIdx, cells: r.cells, count: r.count });
+            z.lattice = { flags: r.flags, cells: r.cells, count: r.count };
+            if(this.overlay.visible) this.overlay.set(z.slot, z);
             const A = this.sim.slotA[z.slot], B = this.sim.slotB[z.slot];
             A.set(z.c0[0] * H, z.c0[1] * H, z.c0[2] * H, 1);
             B.set(z.n[0] + 1, z.n[1] + 1, z.n[2] + 1, r.count);
@@ -185,7 +209,7 @@ export class SoftGround {
                 z.pendingKicks = [];
             }
         });
-        this.worker.postMessage({ op: 'classify', id, region, c0: z.c0, n: z.n, bedrockY: this.bedrockY }, [region.sdf.buffer, region.mat.buffer]);
+        this.worker.postMessage({ op: 'classify', id, region, c0: z.c0, n: z.n, bedrockY: this.bedrockY, shell: !!this.sim.cpu }, [region.sdf.buffer, region.mat.buffer]);
     }
 
     // ------------------------------------------------------------------ frame
@@ -313,6 +337,7 @@ export class SoftGround {
             this.sim.slotC[z.slot].x = 0;
         }
         for(const g of z.tagged || []) g.userData.softSkip &= ~(1 << z.slot);
+        if(this.slots[z.slot] === null) this.overlay.clear(z.slot);
         z.job = 0; z.state = 'free';
     }
 }

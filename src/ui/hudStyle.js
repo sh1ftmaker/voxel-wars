@@ -85,6 +85,7 @@ export const HUD_CSS = `
 .bz-hud.touch .bz-feed { top: 50px; }
 .bz-hud.touch .bz-carry { bottom: 20px; }
 .bz-screen button.bz-bots.small { margin-top: 12px; font-size: 13px; padding: 6px 14px; background: #3a4458; color: #fff; }
+.bz-softinfo { margin-top: 10px; font-size: 12px; opacity: .7; }
 .bz-bots.corner { position: absolute; right: 10px; top: 10px; pointer-events: auto; font: 700 12px system-ui, sans-serif; padding: 5px 9px; border-radius: 7px; border: 0; background: rgba(16,20,28,.6); color: #fff; cursor: pointer; }
 .bz-hud:not(.touch) .bz-bots.corner { display: none; }
 .bz-hud.touch .bz-feed { top: 44px; }

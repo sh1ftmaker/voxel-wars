@@ -20,14 +20,14 @@ import { MATERIALS } from '../voxel/materials.js';
 import { H, MAX_ZONES, NODE_CAP, CELL_CAP, TET_OFF, CORNER_TETS, CORNER_OF, F_ACTIVE, F_PINNED } from './core.js';
 
 const WG = 64;
-const MAXU = 0.7;      // m: clamp on a node's displacement
+const MAXU = 0.9;      // m: clamp on a node's displacement
 const MAXV = 0.06;     // m per substep: clamp on a node's speed
 export const MAX_KICKS = 4;
 const P_SLOTA = 0, P_SLOTB = MAX_ZONES, P_SLOTC = 2 * MAX_ZONES, P_KICKA = 3 * MAX_ZONES, P_KICKB = P_KICKA + MAX_KICKS,
     P_KICKC = P_KICKB + MAX_KICKS, PARAMS = P_KICKC + MAX_KICKS;
 
 /** A vec4 view into the CPU mirror of the parameter buffer (writes mark it for upload). */
-class V4 {
+export class V4 {
     constructor(sim, o) { this.sim = sim; this.o = o; }
     set(x, y, z, w) { const a = this.sim.P, o = this.o; a[o] = x; a[o + 1] = y; a[o + 2] = z; a[o + 3] = w; this.sim.dirty = true; return this; }
     get x() { return this.sim.P[this.o]; } set x(v) { this.sim.P[this.o] = v; this.sim.dirty = true; }

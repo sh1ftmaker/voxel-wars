@@ -9,7 +9,7 @@ const webgl = args.includes('--webgl');
 const scenario = args.includes('--scenario') ? args[args.indexOf('--scenario') + 1] : 'blast';
 const url = args.find(a => a.startsWith('http')) || 'http://127.0.0.1:5180/?fly=1&bots=0';
 const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new',
-    args: [...(webgl ? [] : (process.env.SOFT_ARGS ? process.env.SOFT_ARGS.split(' ') : ['--enable-unsafe-webgpu', '--enable-features=Vulkan,WebGPU'])), '--ignore-gpu-blocklist', '--window-size=960,540'] });
+    args: [...(webgl ? ['--use-angle=vulkan'] : (process.env.SOFT_ARGS ? process.env.SOFT_ARGS.split(' ') : ['--enable-unsafe-webgpu', '--enable-features=Vulkan,WebGPU'])), '--ignore-gpu-blocklist', '--window-size=960,540'] });
 const page = await browser.newPage();
 await page.setViewport({ width: 960, height: 540 });
 page.on('console', m => { const t = m.text(); if(!/GPU stall|powerPreference/.test(t)) console.log('[console]', m.type(), t.slice(0, 400)); });

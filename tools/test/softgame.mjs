@@ -15,7 +15,7 @@ const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', he
 const page = await browser.newPage();
 page.on('console', m => { const t = m.text(); if(!/GPU stall|404|Failed to load/.test(t)) console.log('[console]', m.type(), t.slice(0, 300)); });
 page.on('pageerror', e => console.log('[pageerror]', e.message));
-await page.goto('http://127.0.0.1:5180/dist/test.html').catch(() => {}); // a 404 page under /dist: workers resolve
+await page.goto(`http://127.0.0.1:${process.env.PORT || 5180}/dist/test.html`).catch(() => {}); // a 404 page under /dist: workers resolve
 await page.addScriptTag({ content: fs.readFileSync(path.join(dir, 'page.js'), 'utf8'), type: 'module' });
 await page.waitForFunction(() => window.setup, { timeout: 30000 });
 console.log('setup', JSON.stringify(await page.evaluate((o) => window.setup(o), opts)));
@@ -34,7 +34,7 @@ for(const step of opts.steps || [2, 4, 6, 10, 20, 30, 40, 60, 80]) {
     await save(String(f).padStart(3, '0'));
 }
 // wait for the bake and remesh
-for(let i = 0; i < 20; i++) {
+for(let i = 0; i < 60; i++) {
     const r = await page.evaluate(() => window.frame(3));
     if(!r.zones.length) { console.log('settled', JSON.stringify(r)); break; }
     if(i % 4 === 0) console.log('waiting', JSON.stringify(r));
