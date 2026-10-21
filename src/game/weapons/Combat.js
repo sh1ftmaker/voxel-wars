@@ -301,7 +301,9 @@ export class Combat {
         const b = prop.body, ov = owner.body.vel;
         b.setBullet(true); // fast: continuous collision against other bodies too
         b.setLinvel({ x: dir[0] * speed + ov.x * 0.5, y: dir[1] * speed + 3, z: dir[2] * speed + ov.z * 0.5 }, true);
-        b.setAngvel({ x: Math.random() * 10 - 5, y: Math.random() * 10 - 5, z: Math.random() * 10 - 5 }, true);
+        // a forward end-over-end tumble (up x dir) with a little wobble, not a random spin on every axis
+        const h = Math.hypot(dir[0], dir[2]) || 1, spin = 3 + Math.random() * 2, j = () => Math.random() - 0.5;
+        b.setAngvel({ x: dir[2] / h * spin + j(), y: j(), z: -dir[0] / h * spin + j() }, true);
         owner?.ignoreTemp?.(prop.collider.handle, 0.35);
         // VoxelBodies: a thrown body cracks along its soft lattice when it hits hard, it never bursts into rubble
         prop.userData.thrown = true;

@@ -83,6 +83,9 @@ API void bw_world_create(float gx, float gy, float gz, float hitThreshold) {
     b3WorldDef def = b3DefaultWorldDef();
     def.gravity = (b3Vec3){ gx, gy, gz };
     def.hitEventThreshold = hitThreshold;
+    // no gyroscopic torque: an oblong piece spinning about its middle axis would flip over and over (Dzhanibekov);
+    // physically right, but reads as a wrong centre of gravity in play (Rapier never had it)
+    def.isotropicInertiaTolerance = 1e9f;
     world = b3CreateWorld(&def);
     hasWorld = 1;
     memset(bs, 0, sizeof(bs)); memset(ss, 0, sizeof(ss));
