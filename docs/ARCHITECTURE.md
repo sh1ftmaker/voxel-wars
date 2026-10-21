@@ -65,13 +65,15 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   rock along its soft lattice, never a Voronoi burst.
 - **Meshing**: replies carry the dirty chunks' padded mesher windows (no extraction on the main thread); the mesh
   worker post-processes meshes (`src/voxel/meshPrep.js`: material attributes, bounds, collider octants with hashes), so
-  the main thread only wraps arrays in a BufferGeometry and Rapier builds the octant trimeshes (budgeted per frame).
+  the main thread only wraps arrays in a BufferGeometry and box3d builds the octant meshes (budgeted per frame).
 - **Brushes are data**: brushes from `brushes.js` carry a `spec` (`brushFromSpec`) and a `radius`; a hand-made
   `{ min, max, d }` brush still works (sampled into a grid brush, `gridBrush`). `ctx.destruction.brushes` exposes them.
-- **Physics**: Rapier stays on the main thread (the character controller needs synchronous queries). Its wasm is
-  warmed up at load (`Physics.warmup`), the solver runs 2 iterations, voxel bodies use few collider boxes
-  (`islands.maxBoxesFor`), and new island bodies are created one per frame.
-- **Soft debris** (`src/softbody/`, `src/workers/softBody.js`; `bodies.soft`, `?softDebris=0` turns it off): Rapier
+- **Physics**: box3d (wasm, single-threaded; `src/physics/box3d/B3.js` over `tools/box3d/bind.c`, built to
+  `vendor/box3d/` by `tools/box3d/build.sh` from a pinned commit) stays on the main thread (the character mover needs
+  synchronous queries). Its wasm is warmed up at load (`Physics.warmup`), steps run 4 substeps at 60 Hz, voxel bodies
+  use few collider boxes (`islands.maxBoxesFor`), and new island bodies are created one per frame. Handles are checked
+  in C, so a call on a removed body is a no-op; nothing calls back into JS during a step.
+- **Soft debris** (`src/softbody/`, `src/workers/softBody.js`; `bodies.soft`, `?softDebris=0` turns it off): box3d
   keeps each voxel body rigid; on top of it a body-local tet lattice (0.5 m cells, coarser for big bodies, 5 tets per
   cell, shape matching at 60 Hz in one worker for all bodies) bends and jiggles from impacts and blast kicks, and the
   body mesh is displaced in the vertex shader from a float texture atlas (WebGL2 and WebGPU). Hits between the break
@@ -96,7 +98,7 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its
   WebGPU device breaks shortly after load (then buffer creation fails); with soft ground on it is lost entirely, so
   add `soft=0` to the URL there. Tests: `tools/test/terrainsync.mjs`
-  (worker protocol), `brushbench.mjs` (edit speed, world hash must match), `fracturecost.mjs` (Rapier debris cost).
+  (worker protocol), `brushbench.mjs` (edit speed, world hash must match), `fracturecost.mjs` and `colliders.mjs` (physics debris cost).
 
 ## Net: the edit log (src/net)
 
@@ -117,7 +119,8 @@ checks repair drift. Steps 1-2 (this) make every terrain change an entry in one 
 - Determinism: edits carry everything (brush specs with their seeds, grids, patches, `erode`); the worker's islands,
   collapse and fracture use no clock or `Math.random` (Voronoi sites from `rng(seed)`, seed from the body's id).
   Body ids are the same everywhere (`seq:island`, `seq:rN`, `parent.fN` / `.cN`); only a body's owner (host for
-  shed terrain, the ripper for a lump) stamps or fractures it. Rapier motion is not deterministic, so other clients
+  shed terrain, the ripper for a lump) stamps or fractures it. Body motion is not stepped in lockstep yet (box3d itself is
+  deterministic across platforms for the same call sequence), so other clients
   keep simulating their copies until the owner's stamp drops them (transform streaming is step 4).
 - Drift: the host marks a hash check every 3 s when something changed; at that point of the order every client hashes
   its chunks (FNV-1a, cached per chunk version: ~0.1 ms) and compares with the host's; differing chunks are resent
@@ -156,9 +159,11 @@ main.js under "game systems are added here", one line each. `ctx.params` holds t
   - `detached` `{ prop, volume, mat }`: a terrain piece became a body
   - `impact` `{ point, speed, mat, prop }`: a body hit something hard (physics emits it; FX and SFX listen)
   - game events (`score`, `pickup`, `damage`, ...) are defined by the game agent in `src/game/`.
-- **Physics** (`src/physics/Physics.js`, Rapier 0.21): `addBody`, `removeBody`, `raycast`, `explode`, `propOf`,
-  `onStep`, `R` (the RAPIER module) and `rw` (the RAPIER.World). Gravity is 30 m/s². Terrain is one trimesh
-  collider per chunk, rebuilt from every new chunk mesh (`terrain.onChunkMesh`).
+- **Physics** (`src/physics/Physics.js`, box3d): `addBody`, `removeBody`, `raycast`, `explode`, `propOf`,
+  `onStep`, `onHit` (hit events: approach speed and point), `createBody`, `b3` (the B3World) and `BodyType`. Gravity
+  is 30 m/s². Terrain is one triangle mesh per chunk octant, rebuilt from every new chunk mesh
+  (`terrain.onChunkMesh`). Players and bots move with box3d's capsule mover (`B3World.move`: collide, solve planes,
+  cast) in `src/game/CharacterBody.js`, with ground snapping, a step-up over ledges and a mantle hop.
 - **Rendering**: `TerrainRenderer` (chunk meshes), `geometryFromMesh(mesh)` and `createTerrainMaterial()`.
   Detached bodies use the same mesher and material, so they look like the terrain they came from.
 

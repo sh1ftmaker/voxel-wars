@@ -7,7 +7,6 @@
     "build": "node tools/build.mjs"
   },
   "dependencies": {
-    "@dimforge/rapier3d-compat": "^0.21.0",
     "esbuild": "^0.25.6",
     "three": "^0.186.1"
   },

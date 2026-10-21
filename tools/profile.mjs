@@ -7,7 +7,7 @@
  *   - the frame interval (requestAnimationFrame delta; with a real GPU this includes GPU waits)
  *   - main-thread CPU: every requestAnimationFrame callback plus every worker message handler since the last frame
  *     (both are wrapped before the page loads), which is what the game's own code costs
- *   - a breakdown by section (destruction.carve, world.applyBrush, physics.step, rw.step, colliders, voxel body jobs,
+ *   - a breakdown by section (destruction.carve, world.applyBrush, physics.step, b3.step, colliders, voxel body jobs,
  *     terrain mesh uploads, systems, render), wrapped on the live objects after loading
  * and reports p50 / p99 / max of each, the worst frames with their breakdown, long tasks, JS heap growth, and with
  * --cpu the hottest functions (self time) from a CPU profile; --who NAME also prints NAME's callers.
@@ -73,7 +73,7 @@ const res = await page.evaluate(async (seconds, scenario) => {
     wrap(ctx.world, 'applyBrush');
     if(ctx.world.remote) { wrap(ctx.world.remote, '_reply', 'terrainReply'); wrap(ctx.world, 'notify', 'terrainNotify'); }
     wrap(ctx.physics, 'step', 'physics.step');
-    wrap(ctx.physics.rw, 'step', 'rapier.step');
+    wrap(ctx.physics.b3, 'step', 'b3.step');
     wrap(ctx.physics, 'setChunkCollider', 'colliders');
     const vbs = ctx.destruction.bodies;
     wrap(vbs, '_frame', 'bodyJobs');
@@ -102,7 +102,7 @@ const res = await page.evaluate(async (seconds, scenario) => {
         const tick = (now) => {
             // the previous frame's totals (this callback runs once per frame)
             let awake = 0; for(const pr of ctx.physics.props) if(!pr.removed && pr.body.isDynamic?.() && !pr.body.isSleeping()) awake++;
-            frames.push({ dt: now - last, cpu: P.acc, sec: P.sec, bodies: ctx.physics.props.size, awake, cols: ctx.physics.rw.colliders.len() });
+            frames.push({ dt: now - last, cpu: P.acc, sec: P.sec, bodies: ctx.physics.props.size, awake, cols: ctx.physics.b3.colliders.size });
             P.acc = 0; P.sec = {};
             last = now;
             const t = (now - t0) / 1000;

@@ -297,7 +297,7 @@ API int bw_shape_capsule(int body, float halfHeight, float r, float density, flo
 /** Convex hull of points (xyz f32, body-local). -1 when no hull can be made. */
 API int bw_shape_hull(int body, float* pts, int n, float density, float friction, float restitution, uint32_t cat, uint32_t mask, int hitEvents, int updateMass) {
     int b = bslot(body); if(b < 0 || n < 4) return -1;
-    b3HullData* hull = b3CreateHull((b3Vec3*)pts, n, 64);
+    b3HullData* hull = b3CreateHull((b3Vec3*)pts, n, 40); // more vertices can exceed the 256 half-edge limit
     if(!hull) return -1;
     b3ShapeDef sd = shapeDef(density, friction, restitution, cat, mask, hitEvents, updateMass);
     // the hull is copied into the world's hull database: ours can go now

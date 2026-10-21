@@ -56,7 +56,7 @@ import { sphere, box, rock, specOf, rng } from '../voxel/brushes.js';
 import { stampGrid, findIslands, islandsJob, detachIsland, splitGrid, voronoiLabels, carveGrid, stampJob, liftGrid, gridStats, gridBoxes, gridHullPoints, newGrid, SAMPLE_VOLUME } from '../voxel/islands.js';
 import { PAD } from '../config.js';
 import { VoxelBody } from '../voxel/VoxelBody.js';
-import { GRAVITY } from './Physics.js';
+import { GRAVITY, BodyType } from './Physics.js';
 import { createTerrainMaterial } from '../render/terrainMaterial.js';
 import { SoftBodies } from '../softbody/SoftBodies.js';
 import { cellSampleLabels } from '../softbody/lattice.js';

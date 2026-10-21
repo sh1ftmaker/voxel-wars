@@ -36,3 +36,9 @@ Build artifacts stay outside the repo (the scratchpad).
 **Size.** The box3d wasm is 505 KB (199 KB gzipped). Rapier compat is 4.3 MB (1.65 MB gzipped), because its wasm is inlined as base64.
 
 **Threads.** The wasm build needs pthreads and SharedArrayBuffer, so cross-origin isolation, which GitHub Pages does not provide. The numbers above are single-threaded.
+
+## After the port
+
+The game now runs on box3d (`src/physics/box3d/`, built by `tools/box3d/build.sh`), and Rapier is no longer a
+dependency. `run.mjs` and `churn.mjs` still compare against it: install it for a rerun with
+`npm i --no-save @dimforge/rapier3d-compat@0.21`.
