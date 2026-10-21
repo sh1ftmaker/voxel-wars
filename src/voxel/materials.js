@@ -26,3 +26,29 @@ for(let i = 0; i < MATERIALS.length; i++) if(!MATERIALS[i]) def(i, { ...MATERIAL
 /** Carving reach multiplier per material id (1/sqrt(hardness)), as a typed array for hot loops. */
 export const REACH = new Float32Array(256).fill(1);
 for(const m of MATERIALS) REACH[m.id] = m.hardness === Infinity ? 0 : 1 / Math.sqrt(m.hardness);
+
+/** Soft ground (src/soft): how a material responds when an impact wakes it into a simulated zone.
+ *  stiffness  0..1 shape-matching pull toward the rest shape per solver iteration (low = jelly, slow wobble; with
+ *             the default 4 iterations x 240 Hz substeps, 0.05 wobbles at ~3 Hz, 0.3 is a stiff ~10 Hz buzz)
+ *  softness   gain on the velocity an impact injects (high = deforms further)
+ *  plasticity 0..1 how fast the rest shape follows a deformation past `yield` metres (per 1/60 s; 0 = elastic,
+ *             springs back; > 0 keeps the dent / mound, which is baked into the SDF when the zone settles)
+ *  toughness  strain at which the material would tear (reserved for tearing)
+ *  damping    1/s velocity loss while wobbling */
+const SOFT = {
+    0:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // stone
+    1:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.1, yield: 0.02, toughness: 0.05, damping: 4.5 }, // dirt
+    2:  { stiffness: 0.045, softness: 1.5,  plasticity: 0.1,  yield: 0.02, toughness: 0.05, damping: 4.5 }, // grass
+    3:  { stiffness: 0.03, softness: 1.6, plasticity: 0.15,  yield: 0.015, toughness: 0.03, damping: 5.5 }, // sand
+    4:  { stiffness: 0.025, softness: 1.7, plasticity: 0.2,  yield: 0.015, toughness: 0.02, damping: 6 },   // snow
+    5:  { stiffness: 0.08,  softness: 1.1,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 2.5 }, // brick
+    6:  { stiffness: 0.12,  softness: 0.8, plasticity: 0,    yield: 0.02, toughness: 0.2,  damping: 1.5 }, // metal
+    7:  { stiffness: 0.02, softness: 1.0,  plasticity: 0,    yield: 0.02, toughness: 0.02, damping: 6 },   // lava
+    8:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // red stone
+    9:  { stiffness: 0.09,  softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.10, damping: 2.5 }, // blue stone
+    10: { stiffness: 0.05, softness: 1.1,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 2 },   // wood
+    11: { stiffness: 0.08, softness: 1.1, plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 3 },   // cobble
+    12: { stiffness: 0.1,  softness: 0.9, plasticity: 0,    yield: 0.02, toughness: 0.14, damping: 2.5 }, // dark rock
+    13: { stiffness: 1.0,  softness: 0,    plasticity: 0,    yield: 1,    toughness: 1e9,  damping: 10 },  // bedrock
+};
+for(const m of MATERIALS) Object.assign(m, SOFT[m.id] || SOFT[1]);

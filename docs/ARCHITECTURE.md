@@ -13,7 +13,8 @@ the console. `window.ctx` is exposed for tests. `node tools/test/bench.mjs` benc
   signed distance (`SDF_SCALE` units per voxel, negative = solid) plus a Uint8 material id (`voxel/materials.js`).
   A uniform chunk has `sdf === null`. API: `get/getMat(ix,iy,iz)`, `sample(x,y,z)` (metres, trilinear),
   `normal`, `materialAt`, `raycast(o, d, max)`, `applyBrush(brush, {op:'carve'|'add'|'paint', mat, hardness})`,
-  `extractPadded`, `onChange(fn)`. The world is 160 x 32 x 80 m (chunks x -10..9, y -2..1, z -5..4), with
+  `extractPadded`, `onChange(fn)`, `writeSamples(patch)`, `setChunks(list)` / `notify(result)` (replica updates);
+  `world.remote` / `world.applySamples(patch)` when the terrain worker runs (see below). The world is 160 x 32 x 80 m (chunks x -10..9, y -2..1, z -5..4), with
   unbreakable bedrock at the bottom.
 - `brushes.js`: `{min, max, d(x,y,z)}` brushes: `sphere`, `capsule`, `box`, `rock` (faceted crater), `translated`.
 - `surfaceNets.js`: a pure mesher over a padded grid of any size, `(nx+2*PAD) x (ny+2*PAD) x (nz+2*PAD)`. It
@@ -22,6 +23,38 @@ the console. `window.ctx` is exposed for tests. `node tools/test/bench.mjs` benc
   `meshGrid(sdf, mat, dims) -> Promise<mesh>`.
 - `voxelize.js`: fills a world from an SDF. `src/level/fortwar.js` is Twin Forts as an SDF (`Level`, plus `GAME`
   with team spawns and vaults).
+
+## Terrain worker and the frame budget (perf)
+
+Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on game, physics or terrain work.
+
+- **The terrain worker owns the world.** `src/workers/terrain.js` runs `TerrainCore` (`src/voxel/TerrainCore.js`,
+  pure, also runs in Node): startup voxelization, every brush edit, connectivity and detaching islands, stamping
+  rubble back, sample patches, fracture / component splits and body-grid carves. The main thread's `ctx.world` is a
+  **read-only replica** (`src/voxel/TerrainSync.js`, `world.remote`), updated from the chunk arrays each reply
+  carries (arrays are transferred and recycled), so `sample`, `raycast`, `normal`, `materialAt`, `get` stay
+  synchronous. Never write `ctx.world` on the main thread; go through `ctx.destruction` or `world.applySamples`.
+- **Edits are asynchronous.** `destruction.carve/blast` return at once with a provisional result (`pending: true`,
+  volume of the voxel bodies only) and `result.done`, a Promise of the final result; 'destroyed' / 'detached' and
+  `destruction.editHooks` fire when the worker answers (a frame or two later). Without the worker (`?terrainWorker=0`
+  runs the same core in-process; `?terrainWorker=sync` is the old synchronous main-thread path) `done` resolves at once.
+- **Soft ground / other bakes**: `world.applySamples({ lo, dims, sdf, mat })` (sample box, index x + y*nx + z*nx*ny)
+  sends the patch to the worker (`VoxelWorld.writeSamples` there); the replica, meshes and colliders follow. Returns
+  a Promise of the reply.
+- **Meshing**: replies carry the dirty chunks' padded mesher windows (no extraction on the main thread); the mesh
+  worker post-processes meshes (`src/voxel/meshPrep.js`: material attributes, bounds, collider octants with hashes), so
+  the main thread only wraps arrays in a BufferGeometry and Rapier builds the octant trimeshes (budgeted per frame).
+- **Brushes are data**: brushes from `brushes.js` carry a `spec` (`brushFromSpec`) and a `radius`; a hand-made
+  `{ min, max, d }` brush still works (sampled into a grid brush, `gridBrush`). `ctx.destruction.brushes` exposes them.
+- **Physics**: Rapier stays on the main thread (the character controller needs synchronous queries). Its wasm is
+  warmed up at load (`Physics.warmup`), the solver runs 2 iterations, voxel bodies use few collider boxes
+  (`islands.maxBoxesFor`), and new island bodies are created one per frame.
+- **Profiling**: `node tools/profile.mjs "<url>" <seconds> --scenario idle|blasts|topple|dig|game [--cpu] [--under fn]`
+  reports frame interval and main-thread CPU per frame (p50/p99/max) with a per-section breakdown. Headless Chromium
+  uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its
+  WebGPU device breaks shortly after load (then buffer creation fails); with soft ground on it is lost entirely, so
+  add `soft=0` to the URL there. Tests: `tools/test/terrainsync.mjs`
+  (worker protocol), `brushbench.mjs` (edit speed, world hash must match), `fracturecost.mjs` (Rapier debris cost).
 
 ## Context (src/main.js)
 

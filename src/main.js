@@ -9,6 +9,7 @@
 import * as THREE from 'three/webgpu';
 import { VoxelWorld } from './voxel/VoxelWorld.js';
 import { voxelize } from './voxel/voxelize.js';
+import { TerrainSync } from './voxel/TerrainSync.js';
 import { Level } from './level/fortwar.js';
 import { TerrainRenderer } from './render/TerrainRenderer.js';
 import { Environment, configureRenderer } from './render/Environment.js';
@@ -17,6 +18,7 @@ import { Destruction } from './physics/Destruction.js';
 import { FlyCamera } from './dev/FlyCamera.js';
 import { FortWar } from './game/FortWar.js';
 import { Profiler } from './dev/Profiler.js';
+import { SoftGround } from './soft/SoftGround.js';
 
 const $ = (id) => document.getElementById(id);
 const status = (s) => { $('loading').textContent = s; };
@@ -42,8 +44,11 @@ status('Building the world...');
 await nextFrame();
 const world = new VoxelWorld();
 let t0 = performance.now();
-voxelize(world, new Level());
-console.log(`voxelized in ${(performance.now() - t0).toFixed(0)} ms`);
+// the terrain worker (src/voxel/TerrainSync.js) owns the world and its edits; `world` here is its read-only replica
+// (?terrainWorker=0: the same core runs on the main thread)
+if(params.get('terrainWorker') === 'sync') voxelize(world, new Level()); // no worker at all: edits on the main thread
+else await new TerrainSync(world, { worker: params.get('terrainWorker') !== '0' }).init();
+console.log(`world ready in ${(performance.now() - t0).toFixed(0)} ms`);
 prof.loadMark('world');
 const terrain = new TerrainRenderer(world, scene, camera);
 status('Starting physics...');
@@ -58,6 +63,7 @@ window.ctx = ctx; // for debugging and headless tests
 
 // ---- game systems are added here (one line each) ----
 ctx.addSystem(params.get('fly') === '1' ? new FlyCamera(ctx) : new FortWar(ctx), 'game');
+ctx.addSystem(new SoftGround(ctx), 'soft'); // soft ground wake zones (src/soft), ctx.soft
 
 status('Meshing...');
 while(terrain.pending > 0) await nextFrame();

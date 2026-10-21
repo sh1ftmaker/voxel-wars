@@ -6,7 +6,7 @@
  * creation (`frame`, grid-local), so body.translation() is the middle of the piece (holding and throwing code can
  * treat it like any prop): world = T + R * (local - frame).
  *
- * Collider: a compound of at most 24 greedily merged boxes (at 1, 2, ... samples per cell, tightened to the solid
+ * Collider: a compound of at most 12 (fracture pieces 2-4, islands.maxBoxesFor) greedily merged boxes (at 1, 2, ... samples per cell, tightened to the solid
  * samples): concave pieces keep their shape, and cuboid-trimesh contacts are Rapier's cheapest (convex hulls cost ~3x
  * more per settling body; Rapier's voxel shape does not collide with trimeshes at all). Mass from material densities; CCD on.
  *
@@ -15,12 +15,10 @@
 import * as THREE from 'three/webgpu';
 import { VOXEL } from '../config.js';
 import { MATERIALS } from './materials.js';
-import { gridStats, gridBoxes, gridHullPoints } from './islands.js';
+import { gridStats, colliderBoxes, gridHullPoints } from './islands.js';
 import { geometryFromMesh } from '../render/geometry.js';
 import { GROUPS_ALL } from '../physics/Physics.js';
 
-/** Most boxes in a compound before the box resolution coarsens. */
-const MAX_BOXES = 24;
 
 const _q = new THREE.Quaternion(), _v = new THREE.Vector3();
 
@@ -28,9 +26,10 @@ export class VoxelBody {
     /**
      * @param mgr VoxelBodies
      * @param grid islands.js Grid
-     * @param opts { origin: world position of grid-local 0 (metres), rotation [x,y,z,w], linvel, angvel, generation, userData }
+     * @param opts { origin: world position of grid-local 0 (metres), rotation [x,y,z,w], linvel, angvel, generation, userData,
+     *              prep: islands.gridPrep(grid, generation) when already computed (e.g. by the terrain worker) }
      */
-    constructor(mgr, grid, { origin, rotation = [0, 0, 0, 1], linvel = [0, 0, 0], angvel = [0, 0, 0], generation = 0, userData = {}, waitKeys = null, sibling = 0, enabled = true }) {
+    constructor(mgr, grid, { origin, rotation = [0, 0, 0, 1], linvel = [0, 0, 0], angvel = [0, 0, 0], generation = 0, userData = {}, waitKeys = null, sibling = 0, enabled = true, prep = null }) {
         this.mgr = mgr;
         // pieces of one fracture ignore each other for a moment (their shapes overlap a little at the cracks)
         this.sibling = sibling;
@@ -45,7 +44,8 @@ export class VoxelBody {
         this.cool = 0;    // impact event cooldown
         this.version = 0; // mesh requests
         this.dead = false;
-        this.stats = gridStats(grid);
+        this.stats = prep?.stats || gridStats(grid);
+        if(prep?.stats) grid.count = prep.stats.count;
         this.frame = this.stats.com.slice();
         const { physics } = mgr;
         const R = physics.R;
@@ -67,7 +67,7 @@ export class VoxelBody {
         this.mesh = null;
         this.prop = physics.addProp({ body, colliders: [], mesh: this.group, userData: { ...userData, voxelBody: this } });
         this.updateUserData();
-        this.buildColliders();
+        this.buildColliders(prep && prep.generation === generation ? prep.boxes : null);
         this.meshed = this.remesh();
     }
 
@@ -80,8 +80,8 @@ export class VoxelBody {
         u.mat = this.stats.mat; u.volume = this.stats.volume; u.mass = this.stats.mass;
     }
 
-    /** Rebuild the collider(s) from the grid (after carving). */
-    buildColliders() {
+    /** Rebuild the collider(s) from the grid (after carving). `boxes`: islands.colliderBoxes(grid, ...) if known. */
+    buildColliders(boxes = null) {
         const { physics } = this.mgr;
         const R = physics.R;
         const g = this.grid, st = this.stats, f = this.frame;
@@ -90,10 +90,7 @@ export class VoxelBody {
         // boxes: Rapier's cuboid-triangle contacts are the cheapest against the terrain trimeshes (25 settling
         // pieces: ~1 ms per step as boxes, ~3.5 ms as convex hulls; tools/test/restcost.mjs)
         // fracture pieces are roughly convex: a few boxes do; big detached islands keep more of their shape
-        const maxBoxes = this.generation > 0 ? 8 : MAX_BOXES;
-        let res = st.count > 6000 ? 3 : st.count > 150 ? 2 : 1;
-        let boxes = gridBoxes(g, res);
-        while(boxes.length > maxBoxes && res < 8) boxes = gridBoxes(g, ++res);
+        boxes ||= colliderBoxes(g, st.count, this.generation);
         if(boxes.length) {
             let vol = 0;
             for(const b of boxes) vol += b.h[0] * b.h[1] * b.h[2];

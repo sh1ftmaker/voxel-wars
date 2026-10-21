@@ -8,13 +8,16 @@
  *
  * Every edit goes through `applyBrush`, which returns what changed (removed/added volume per material, dirty chunks,
  * the box it touched) and notifies `onChange` listeners, so renderers, colliders and connectivity can follow.
+ *
+ * In the game the authoritative world lives in the terrain worker (src/voxel/TerrainCore.js); the main thread's
+ * instance is a read-only replica kept in step by TerrainSync (`world.remote`, `setChunks`, `notify`). Patches of
+ * samples: `writeSamples(patch)` here, `world.applySamples(patch)` on the replica.
  */
 import { VOXEL, CHUNK, SDF_SCALE, SDF_MAX, PAD, WORLD_CHUNKS, BEDROCK_SAMPLES } from '../config.js';
 import { REACH, BEDROCK } from './materials.js';
 
 const N = CHUNK, N2 = N * N, N3 = N * N * N;
 const BLOCK_HALF_DIAG = 1.5 * Math.sqrt(3) * VOXEL; // a block of 4 samples spans 3 voxels
-const REACH_MAX = REACH.reduce((a, r) => Math.max(a, r), 0); // the softest material's reach
 export const toStored = (d) => { const v = Math.round(d / VOXEL * SDF_SCALE); return v > SDF_MAX ? SDF_MAX : v < -SDF_MAX ? -SDF_MAX : v; };
 export const toMetres = (s) => s * VOXEL / SDF_SCALE;
 export const chunkKey = (cx, cy, cz) => `${cx},${cy},${cz}`;
@@ -144,63 +147,117 @@ export class VoxelWorld {
         const bedrockTop = this.smin[1] + BEDROCK_SAMPLES;
         const touched = new Set();
         const bcx = (brush.min[0] + brush.max[0]) / 2, bcy = (brush.min[1] + brush.max[1]) / 2, bcz = (brush.min[2] + brush.max[2]) / 2;
-        // Block skipping (below): a sample cannot change when its distance is past the saturated band (4 voxels) for
-        // carve / add, or outside for paint. With hardness, a soft material (reach r > 1) grows the brush about its
-        // centre: r * d(c + (p - c) / r) >= r * d(p) - (r - 1) * |p - c| (Lipschitz), checked at r = 1 and r = REACH_MAX.
-        const SAT = 4 * VOXEL * 1.01;
-        const soft = op === 'carve' && hardness && REACH_MAX > 1;
+        const carve = op === 'carve', add = op === 'add', paint = op === 'paint';
+        const useReach = carve && hardness;
+        const Rb = typeof brush.radius === 'number' ? brush.radius : -1;
+        const d = brush.d;
+        // Block skipping. A sample cannot change when its distance is past the saturated band (4 voxels) for carve /
+        // add, or outside for paint. Brushes are convex and contain their centre c. With hardness, a material of reach
+        // r scales the brush about c: the sample's distance is r * d(c + (p - c) / r), bounded over a block by
+        //   r >= 1:  >= r * d(p) - (r - 1) * |p - c|            (Lipschitz), and <= d(p) (convexity)
+        //   r <= 1:  >= d(p) (convexity), >= |p - c| - r * radius (brush.radius, when given)
+        //            <= r * d(p) + (1 - r) * |p - c|            (Lipschitz)
+        // with the block's centre values widened by its half diagonal. The reach range [rmin, rmax] is that of the
+        // block's samples that could change at all (a saturated air sample never changes under carve). Skipped and
+        // shortcut samples are exactly those whose result is already decided, so the output is the same as evaluating
+        // every sample.
+        const SAT = 4 * VOXEL * 1.01, DEEP = -SAT - VOXEL;
         if(lo[0] > hi[0] || lo[1] > hi[1] || lo[2] > hi[2]) return { removed, added, changed, dirty: touched, box: [lo, hi] };
+        const HD = BLOCK_HALF_DIAG;
         for(let cz = Math.floor(lo[2] / N); cz <= Math.floor(hi[2] / N); cz++)
         for(let cy = Math.floor(lo[1] / N); cy <= Math.floor(hi[1] / N); cy++)
         for(let cx = Math.floor(lo[0] / N); cx <= Math.floor(hi[0] / N); cx++) {
             const c = this.chunk(cx, cy, cz);
             if(!c) continue;
             // a uniform chunk the brush cannot change stays uniform
-            if(c.uniform && ((op === 'carve' && c.fill === SDF_MAX) || (op === 'add' && c.fill === -SDF_MAX) || (op === 'paint' && (c.fill > 0 || c.fillMat === mat)))) continue;
+            if(c.uniform && ((carve && c.fill === SDF_MAX) || (add && c.fill === -SDF_MAX) || (paint && (c.fill > 0 || c.fillMat === mat)))) continue;
             const x0 = Math.max(lo[0], cx * N), x1 = Math.min(hi[0], cx * N + N - 1);
             const y0 = Math.max(lo[1], cy * N), y1 = Math.min(hi[1], cy * N + N - 1);
             const z0 = Math.max(lo[2], cz * N), z1 = Math.min(hi[2], cz * N + N - 1);
+            const ox = cx * N, oy = cy * N, oz = cz * N;
+            let sdf = c.sdf, mt = c.mat;
+            const fill = c.fill, fillMat = c.fillMat;
             let chunkChanged = false;
-            // blocks of 4³ samples the brush cannot reach are skipped (brush distances are Lipschitz, so the centre's
-            // distance minus the block's half diagonal bounds every sample's; beyond the saturated band nothing changes)
             for(let bz = z0; bz <= z1; bz += 4) for(let by = y0; by <= y1; by += 4) for(let bx = x0; bx <= x1; bx += 4) {
             const ex = Math.min(bx + 3, x1), ey = Math.min(by + 3, y1), ez = Math.min(bz + 3, z1);
-            const qx = (bx + ex) * 0.5 * VOXEL, qy = (by + ey) * 0.5 * VOXEL, qz = (bz + ez) * 0.5 * VOXEL;
-            const dc = brush.d(qx, qy, qz), low = dc - BLOCK_HALF_DIAG;
-            if(op === 'paint' ? low > 0 : low > SAT && (!soft || REACH_MAX * low - (REACH_MAX - 1) * (Math.hypot(qx - bcx, qy - bcy, qz - bcz) + BLOCK_HALF_DIAG) > SAT)) continue;
-            // a block deep inside saturates every rule the same way: skip evaluating the brush per sample there
-            // (a material with reach r != 1 re-evaluates the brush below anyway)
-            const deep = dc + BLOCK_HALF_DIAG < -SAT - VOXEL;
-            for(let iz = bz; iz <= ez; iz++) for(let iy = by; iy <= ey; iy++) for(let ix = bx; ix <= ex; ix++) {
-                const li = (ix - cx * N) + (iy - cy * N) * N + (iz - cz * N) * N2;
-                const old = c.sdf ? c.sdf[li] : c.fill;
-                const oldMat = c.sdf ? c.mat[li] : c.fillMat;
-                let nv = old, nm = oldMat, db;
-                if(op === 'carve') {
-                    if(iy < bedrockTop) continue;
-                    const r = hardness ? REACH[oldMat] : 1;
-                    if(r === 0) continue;
-                    // reach r: the brush shrinks (or grows) about its centre by r in this material. Deep in a block
-                    // (and for r >= 1, whose scaled point lies further inside a convex brush) everything saturates.
-                    if(deep && r >= 1) db = -1e9;
-                    else if(r !== 1) db = brush.d(bcx + (ix * VOXEL - bcx) / r, bcy + (iy * VOXEL - bcy) / r, bcz + (iz * VOXEL - bcz) / r) * r;
-                    else db = brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
-                    const s = -toStored(db);
-                    if(s > old) nv = s;
-                } else if(op === 'add') {
-                    db = deep ? -1e9 : brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
-                    const s = toStored(db);
-                    if(s < old) { nv = s; if(db < VOXEL || old >= 0) nm = mat; }
-                } else if(op === 'paint') {
-                    db = deep ? -1e9 : brush.d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
-                    if(db < 0 && old < 0 && oldMat !== mat) nm = mat;
+            // reach range of the samples that could change (carve), or whether any could (add, paint)
+            let rmin = Infinity, rmax = -Infinity;
+            if(carve) {
+                if(ey < bedrockTop) continue;
+                if(!sdf) { const r = useReach ? REACH[fillMat] : 1; if(r === 0) continue; rmin = rmax = r; }
+                else {
+                    for(let iz = bz; iz <= ez; iz++) for(let iy = Math.max(by, bedrockTop); iy <= ey; iy++) {
+                        let li = (bx - ox) + (iy - oy) * N + (iz - oz) * N2;
+                        for(let ix = bx; ix <= ex; ix++, li++) {
+                            if(sdf[li] === SDF_MAX) continue;
+                            const r = useReach ? REACH[mt[li]] : 1;
+                            if(r === 0) continue;
+                            if(r < rmin) rmin = r;
+                            if(r > rmax) rmax = r;
+                        }
+                    }
+                    if(rmax < 0) continue;
                 }
-                if(nv === old && nm === oldMat) continue;
-                if(!c.sdf) c.densify();
-                c.sdf[li] = nv; c.mat[li] = nm;
+            } else if(sdf) {
+                let any = false;
+                for(let iz = bz; iz <= ez && !any; iz++) for(let iy = by; iy <= ey && !any; iy++) {
+                    let li = (bx - ox) + (iy - oy) * N + (iz - oz) * N2;
+                    for(let ix = bx; ix <= ex; ix++, li++) if(add ? sdf[li] !== -SDF_MAX : (sdf[li] < 0 && mt[li] !== mat)) { any = true; break; }
+                }
+                if(!any) continue;
+            }
+            const qx = (bx + ex) * 0.5 * VOXEL, qy = (by + ey) * 0.5 * VOXEL, qz = (bz + ez) * 0.5 * VOXEL;
+            const dc = d(qx, qy, qz), low = dc - HD;
+            const dsH = Math.hypot(qx - bcx, qy - bcy, qz - bcz) + HD, dcH = dc + HD;
+            if(paint) { if(low > 0) continue; }
+            else if(!carve || !useReach) { if(low > SAT) continue; }
+            else {
+                // lower bound of the scaled distance over the block's samples and their reach range
+                let L = Infinity;
+                if(rmin <= 1) { const r = Math.min(rmax, 1); L = Rb >= 0 ? Math.max(low, dsH - 2 * HD - r * Rb) : low; }
+                if(rmax > 1) { const a = Math.max(rmin, 1); L = Math.min(L, a * low - (a - 1) * dsH, rmax * low - (rmax - 1) * dsH); }
+                if(L > SAT) continue;
+            }
+            // deep inside the brush every rule saturates the same way: no per-sample evaluation there
+            const deep = dcH < DEEP;
+            for(let iz = bz; iz <= ez; iz++) for(let iy = by; iy <= ey; iy++) {
+                let li = (bx - ox) + (iy - oy) * N + (iz - oz) * N2;
+                for(let ix = bx; ix <= ex; ix++, li++) {
+                const old = sdf ? sdf[li] : fill;
+                let nv = old, nm, oldMat, db;
+                if(carve) {
+                    if(old === SDF_MAX || iy < bedrockTop) continue; // saturated air only gets more distant: never changes
+                    oldMat = sdf ? mt[li] : fillMat;
+                    const r = useReach ? REACH[oldMat] : 1;
+                    if(r === 0) continue;
+                    if(r >= 1 ? deep : r * dcH + (1 - r) * dsH < DEEP) db = -1e9;
+                    else if(r !== 1) db = d(bcx + (ix * VOXEL - bcx) / r, bcy + (iy * VOXEL - bcy) / r, bcz + (iz * VOXEL - bcz) / r) * r;
+                    else db = d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
+                    const s = -toStored(db);
+                    if(s <= old) continue;
+                    nv = s; nm = oldMat;
+                } else if(add) {
+                    if(old === -SDF_MAX) continue;
+                    oldMat = sdf ? mt[li] : fillMat;
+                    db = deep ? -1e9 : d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
+                    const s = toStored(db);
+                    if(s >= old) continue;
+                    nv = s; nm = (db < VOXEL || old >= 0) ? mat : oldMat;
+                    if(nv === old && nm === oldMat) continue;
+                } else {
+                    if(old >= 0) continue;
+                    oldMat = sdf ? mt[li] : fillMat;
+                    if(oldMat === mat) continue;
+                    db = deep ? -1e9 : d(ix * VOXEL, iy * VOXEL, iz * VOXEL);
+                    if(!(db < 0)) continue;
+                    nm = mat;
+                }
+                if(!sdf) { c.densify(); sdf = c.sdf; mt = c.mat; }
+                sdf[li] = nv; mt[li] = nm;
                 if(old < 0 && nv >= 0) removed[oldMat] += cell;
                 else if(old >= 0 && nv < 0) added += cell;
                 changed++; chunkChanged = true;
+                }
             }
             }
             if(chunkChanged) { c.version++; c.tryCollapse(); }
@@ -211,6 +268,55 @@ export class VoxelWorld {
         if(changed && notify) for(const fn of this.listeners) fn(result);
         return result;
     }
+
+    /**
+     * Write a patch of samples { lo: [x,y,z] (samples), dims: [nx,ny,nz], sdf: Int8Array, mat: Uint8Array } (index
+     * x + y*nx + z*nx*ny) into the world (e.g. a soft-ground bake). Samples outside the world are ignored; the
+     * material of air samples only changes with their distance. Notifies listeners. Returns { changed, dirty, box }.
+     * (On the main thread's replica, use `world.applySamples(patch)`: the terrain worker owns the edits.)
+     */
+    writeSamples(patch, { notify = true } = {}) {
+        const { lo, dims, sdf, mat } = patch;
+        const hi = [lo[0] + dims[0] - 1, lo[1] + dims[1] - 1, lo[2] + dims[2] - 1];
+        const dirty = this.chunksInSampleBox(lo.map(v => v - PAD - 1), hi.map(v => v + PAD + 1));
+        const dx = dims[0], dxy = dims[0] * dims[1];
+        let changed = 0;
+        for(let cz = Math.floor(lo[2] / N); cz <= Math.floor(hi[2] / N); cz++)
+        for(let cy = Math.floor(lo[1] / N); cy <= Math.floor(hi[1] / N); cy++)
+        for(let cx = Math.floor(lo[0] / N); cx <= Math.floor(hi[0] / N); cx++) {
+            const c = this.chunk(cx, cy, cz);
+            if(!c) continue;
+            const x0 = Math.max(lo[0], cx * N), x1 = Math.min(hi[0], cx * N + N - 1);
+            const y0 = Math.max(lo[1], cy * N), y1 = Math.min(hi[1], cy * N + N - 1);
+            const z0 = Math.max(lo[2], cz * N), z1 = Math.min(hi[2], cz * N + N - 1);
+            let any = false;
+            for(let z = z0; z <= z1; z++) for(let y = y0; y <= y1; y++) for(let x = x0; x <= x1; x++) {
+                const o = (x - lo[0]) + (y - lo[1]) * dx + (z - lo[2]) * dxy;
+                const li = (x - cx * N) + (y - cy * N) * N + (z - cz * N) * N2;
+                const old = c.sdf ? c.sdf[li] : c.fill, om = c.sdf ? c.mat[li] : c.fillMat;
+                if(old === sdf[o] && (om === mat[o] || old >= 0)) continue;
+                if(!c.sdf) c.densify();
+                c.sdf[li] = sdf[o]; c.mat[li] = mat[o]; any = true; changed++;
+            }
+            if(any) { c.version++; c.tryCollapse(); }
+        }
+        const result = { removed: new Float64Array(256), added: 0, changed, dirty, box: [[...lo], hi], kind: 'soft' };
+        if(changed && notify) for(const fn of this.listeners) fn(result);
+        return result;
+    }
+
+    /** Replace chunks' contents wholesale ({ key, fill, fillMat, version, sdf?, mat? }, arrays taken over, not
+     *  copied): how the main thread's replica follows the terrain worker. No notification (the caller notifies). */
+    setChunks(list) {
+        for(const d of list) {
+            const c = this.chunks.get(d.key);
+            if(!c) continue;
+            c.sdf = d.sdf || null; c.mat = d.mat || null;
+            c.fill = d.fill; c.fillMat = d.fillMat; c.version = d.version;
+        }
+    }
+    /** Notify the change listeners of an edit made elsewhere (e.g. by the terrain worker). */
+    notify(result) { for(const fn of this.listeners) fn(result); }
 
     /** Keys of the existing chunks overlapping a box of samples (inclusive). */
     chunksInSampleBox(lo, hi) {

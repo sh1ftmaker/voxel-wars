@@ -183,7 +183,8 @@ export class Combat {
         const c = [p[0] + dir[0] * 0.35, p[1] + dir[1] * 0.35, p[2] + dir[2] * 0.35];
         const mat = this.ctx.world.materialAt(p[0] + dir[0] * 0.1, p[1] + dir[1] * 0.1, p[2] + dir[2] * 0.1);
         const res = this.ctx.destruction.carve(rock(c, def.radius, this.seed++), { author: owner?.name ?? null, impulse: 5, kind: 'carve' });
-        owner?.addStone?.(res.volume);
+        // the terrain edit runs in the terrain worker: the stone counts once it is done
+        res.done.then(r => owner?.addStone?.(r.volume));
         this.game.emit('punch', { point: p, kind: 'terrain', owner, mat, volume: res.volume });
         return 'terrain';
     }
@@ -194,10 +195,11 @@ export class Combat {
         const a = [f.x, f.y + r - def.sink, f.z];
         const b = [a[0] + dir[0] * def.reach, a[1] + dir[1] * def.reach, a[2] + dir[2] * def.reach];
         const res = this.ctx.destruction.carve(capsule(a, b, r), { author: owner?.name ?? null, kind: 'carve' });
-        owner?.addStone?.(res.volume);
+        // (asynchronous with the terrain worker: the volume is known a frame or two later; bots read the last dig's)
+        if(owner) res.done.then(r => { owner.addStone?.(r.volume); owner.lastDigVolume = r.volume; });
         const front = [a[0] + dir[0] * (def.reach + r * 0.8), a[1] + dir[1] * (def.reach + r * 0.8), a[2] + dir[2] * (def.reach + r * 0.8)];
         this.game.emit('dig', { point: front, volume: res.volume, owner });
-        return res.volume;
+        return res.pending ? (owner?.lastDigVolume ?? 1) : res.volume;
     }
 
     // ---- mason ----

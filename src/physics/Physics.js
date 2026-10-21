@@ -46,7 +46,44 @@ export const GROUPS_ALL = 0xffffffff;
 export class Physics {
     static async create(ctx) {
         await RAPIER.init();
+        Physics.warmup();
         return new Physics(ctx);
+    }
+    /**
+     * Run Rapier's contact code once on a scratch world: the browser compiles wasm functions lazily, so the first
+     * compound body landing on the terrain trimeshes in play cost a ~12 ms step (compiling cuboid-trimesh manifolds,
+     * CCD, contact force events). Here it costs ~20 ms during loading instead.
+     */
+    static warmup() {
+        const t0 = performance.now();
+        const R = RAPIER, rw = new R.World({ x: 0, y: -GRAVITY, z: 0 });
+        rw.timestep = STEP;
+        const q = new R.EventQueue(true);
+        // a bumpy 8 x 8 m trimesh floor
+        const n = 9, v = new Float32Array(n * n * 3), idx = [];
+        for(let z = 0; z < n; z++) for(let x = 0; x < n; x++) { const i = (x + z * n) * 3; v[i] = x - 4; v[i + 1] = ((x * 7 + z * 3) % 5) * 0.08; v[i + 2] = z - 4; }
+        for(let z = 0; z < n - 1; z++) for(let x = 0; x < n - 1; x++) { const a = x + z * n; idx.push(a, a + n, a + 1, a + 1, a + n, a + n + 1); }
+        rw.createCollider(R.ColliderDesc.trimesh(v, new Uint32Array(idx)).setCollisionGroups(GROUPS_TERRAIN));
+        const bodies = [];
+        for(let k = 0; k < 4; k++) {
+            const b = rw.createRigidBody(R.RigidBodyDesc.dynamic().setTranslation(-2 + k * 1.3, 1.2 + k * 0.4, 0).setCcdEnabled(k !== 3).setLinvel(0, -12, 0).setAngvel({ x: 1, y: 2, z: 0.5 }));
+            const ev = (d) => d.setActiveEvents(R.ActiveEvents.CONTACT_FORCE_EVENTS).setContactForceEventThreshold(10).setCollisionGroups(GROUPS_ALL);
+            if(k === 0) for(let i = 0; i < 4; i++) rw.createCollider(ev(R.ColliderDesc.cuboid(0.3, 0.2, 0.25).setTranslation(i * 0.3 - 0.45, (i & 1) * 0.3, 0)), b);
+            else if(k === 1) rw.createCollider(ev(R.ColliderDesc.convexHull(new Float32Array([0, 0, 0, 0.6, 0, 0, 0, 0.6, 0, 0, 0, 0.6, 0.5, 0.5, 0.5]))), b);
+            else if(k === 2) rw.createCollider(ev(R.ColliderDesc.ball(0.35)), b);
+            else rw.createCollider(ev(R.ColliderDesc.capsule(0.4, 0.3)), b);
+            bodies.push(b);
+        }
+        for(let i = 0; i < 45; i++) {
+            rw.step(q);
+            q.drainContactForceEvents(e => { e.totalForceMagnitude(); e.maxForceDirection(); });
+            if(i === 20) for(const b of bodies) { b.setLinvel({ x: 3, y: 6, z: -2 }, true); for(let c = 0; c < b.numColliders(); c++) b.collider(c).setCollisionGroups(GROUPS_NO_TERRAIN); }
+            if(i === 30) for(const b of bodies) for(let c = 0; c < b.numColliders(); c++) b.collider(c).setCollisionGroups(GROUPS_ALL);
+        }
+        const ray = new R.Ray({ x: 0, y: 5, z: 0 }, { x: 0, y: -1, z: 0 });
+        rw.castRayAndGetNormal(ray, 10, true);
+        q.free(); rw.free();
+        Physics.warmupMs = performance.now() - t0;
     }
     constructor({ world, terrain, scene }) {
         this.R = RAPIER;
@@ -54,6 +91,9 @@ export class Physics {
         this.scene = scene;
         this.rw = new RAPIER.World({ x: 0, y: -GRAVITY, z: 0 });
         this.rw.timestep = STEP;
+        // 2 solver iterations instead of Rapier's 4: debris resting on the terrain trimeshes is most of a step's cost and
+        // settles as well (tools/test/fracturecost.mjs: ~40% cheaper steps)
+        this.rw.integrationParameters.numSolverIterations = 2;
         this.terrainColliders = new Map(); // chunk key -> 8 octant slots { hash, collider } | null
         this.terrainBody = this.rw.createRigidBody(RAPIER.RigidBodyDesc.fixed());
         this.props = new Set();
@@ -87,6 +127,19 @@ export class Physics {
         const changed = [];
         if(!geometry) {
             for(let o = 0; o < 8; o++) if(slots[o]) { this.rw.removeCollider(slots[o].collider, false); slots[o] = null; changed.push(o); }
+        } else if(geometry.userData?.octants) {
+            // octant arrays and hashes made by the mesh worker (src/voxel/meshPrep.js): only the Rapier builds here
+            const octs = geometry.userData.octants;
+            for(let o = 0; o < 8; o++) {
+                const old = slots[o], d = octs[o];
+                if(!d) { if(old) { this.rw.removeCollider(old.collider, false); slots[o] = null; changed.push(o); } continue; }
+                if(old && old.hash === d.hash) continue;
+                if(old) this.rw.removeCollider(old.collider, false);
+                const desc = RAPIER.ColliderDesc.trimesh(d.vtx, d.ind).setFriction(0.9).setCollisionGroups(GROUPS_TERRAIN);
+                slots[o] = { hash: d.hash, collider: this.rw.createCollider(desc) };
+                changed.push(o);
+                if(o < 7 && performance.now() > deadline) { this.pendingColliders.set(key, geometry); break; }
+            }
         } else {
             const pos = geometry.attributes.position.array, idx = geometry.index.array;
             const nt = idx.length / 3, nv = pos.length / 3;

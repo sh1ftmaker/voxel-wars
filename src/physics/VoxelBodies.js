@@ -6,7 +6,9 @@
  *        unsupported regions become bodies over the next frames ('detached' events); kick { center, radius,
  *        strength } is the blast's push, applied to them when they appear
  *   bodies.detachAround(lo, hi, brush?) -> { bodies, removed, volume, ms }   the same, synchronously (tests, tools)
- *   bodies.carve(brush, { hardness }) -> { removed, volume }                       apply a carve to overlapping bodies
+ *   bodies.carve(brush, { hardness }) -> { removed, volume, done }                 apply a carve to overlapping bodies
+ *        (with the terrain worker the grids are carved there: removed / volume arrive with `done`, a Promise of
+ *        { removed, volume }, or null when no body was touched)
  *   bodies.rip(brush) -> VoxelBody | null                                          tear a lump out of the world
  *   bodies.fracture(vb, point, dv)                                                 break a body (Voronoi pieces)
  *   bodies.list                                                                    the live VoxelBody set
@@ -31,7 +33,7 @@
 import { VOXEL, CHUNK } from '../config.js';
 import { MATERIALS } from '../voxel/materials.js';
 import { VoxelWorld } from '../voxel/VoxelWorld.js';
-import { sphere, box, rock } from '../voxel/brushes.js';
+import { sphere, box, rock, specOf } from '../voxel/brushes.js';
 import { stampGrid, findIslands, islandsJob, detachIsland, splitGrid, voronoiLabels, carveGrid, stampJob, liftGrid, gridStats, gridBoxes, gridHullPoints, newGrid, SAMPLE_VOLUME } from '../voxel/islands.js';
 import { PAD } from '../config.js';
 import { VoxelBody } from '../voxel/VoxelBody.js';
@@ -49,6 +51,8 @@ function rotate(q, v) {
 export const DEBRIS = 16;
 const MAX_BODIES = 48;
 const SETTLE = 2;
+/** A budgeted job waiting for the terrain worker's answer. */
+const WAIT = 'wait';
 /** Bodies smaller than this never fracture (≈ 1.9 m³). */
 const MIN_FRACTURE = 120;
 
@@ -165,6 +169,23 @@ export class VoxelBodies {
             this.events.dispatchEvent(new CustomEvent('detached', { detail: { prop: vb.prop, volume: vb.volume, mat: vb.mat } }));
         }
     }
+    /** Bodies and dust from a terrain worker reply (TerrainCore 'brush' with conn): islands cut out of the world. */
+    fromWorker(rep, kick = null) {
+        const kicks = kick ? [kick] : [];
+        if(rep.islandsMs !== undefined) this.stats.lastIslandsMs = rep.islandsMs;
+        for(const d of rep.dust || []) this._dust(d.center, d.removed, 'carve');
+        // one body per budgeted unit (a frame each when several arrive): a body's first contacts cost a Rapier step
+        for(const isl of rep.islands || []) this.jobs.push({ kind: 'island', isl, kicks });
+    }
+    /** A body for an island the terrain worker cut out (dust when far over the body cap). */
+    _runIsland(j) {
+        if(this.islandFrame === this.frameNo) return WAIT;
+        const isl = j.isl;
+        if(this.list.size >= this.maxBodies * 2) this._dust(isl.grid.offset.map(v => v * VOXEL), isl.grid.prep.stats.volumes, 'carve');
+        else this._bodyFromIsland(isl, j.kicks);
+        this.islandFrame = this.frameNo; // one new body per frame
+        return true;
+    }
     /** Detach one island found by a background job: a body, or dust if tiny. */
     _detachOne(isl, kicks) { const d = this._cutIsland(isl); if(d) this._bodyFromIsland(d, kicks); }
     /** Remove an island from the world; tiny ones are dust (returns null), others return { grid, dirty }. */
@@ -177,7 +198,7 @@ export class VoxelBodies {
     }
     _bodyFromIsland(d, kicks) {
         const g = d.grid;
-        const vb = this.add(g, { origin: [g.offset[0] * VOXEL, g.offset[1] * VOXEL, g.offset[2] * VOXEL], waitKeys: [...d.dirty] });
+        const vb = this.add(g, { origin: [g.offset[0] * VOXEL, g.offset[1] * VOXEL, g.offset[2] * VOXEL], waitKeys: [...d.dirty], prep: g.prep || null });
         vb.body.wakeUp();
         this.stats.detached++;
         for(const k of kicks) vb.explode(k.center, k.radius, k.strength);
@@ -188,6 +209,7 @@ export class VoxelBodies {
 
     _frame() {
         const t0 = performance.now(), end = t0 + this.budgetMs;
+        this.frameNo = (this.frameNo || 0) + 1;
         // fractures go first (staged jobs: pieces, then one disabled body per unit, then an atomic swap)
         for(const [vb, [point, dv]] of this.breaks) {
             this.breaks.delete(vb);
@@ -195,11 +217,13 @@ export class VoxelBodies {
             vb.fracturing = true;
             this.jobs.unshift({ kind: 'frac', vb, point, dv, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
         }
-        let first = true;
-        while(this.jobs.length && (first || performance.now() < end)) {
+        // jobs run in order; one waiting for the terrain worker (WAIT) lets the next ones run meanwhile
+        let first = true, k = 0;
+        while(k < this.jobs.length && (first || performance.now() < end)) {
             first = false;
-            const j = this.jobs[0];
-            const done = j.kind === 'conn' ? this._runConn(j, end) : j.kind === 'stamp' ? this._runStamp(j, end) : j.kind === 'frac' ? this._runFracture(j) : (this._rebody(j.vb), true);
+            const j = this.jobs[k];
+            const done = j.kind === 'conn' ? this._runConn(j, end) : j.kind === 'stamp' ? this._runStamp(j, end) : j.kind === 'frac' ? this._runFracture(j) : j.kind === 'island' ? this._runIsland(j) : this._rebody(j.vb);
+            if(done === WAIT) { k++; first = true; continue; }
             if(done) this.jobs.splice(this.jobs.indexOf(j), 1);
         }
         const ms = performance.now() - t0;
@@ -234,6 +258,24 @@ export class VoxelBodies {
             return true;
         }
         const t0 = performance.now();
+        const remote = this.world.remote;
+        if(!j.pieces && remote) {
+            // the Voronoi split runs in the terrain worker; pieces come back with their stats and collider boxes
+            if(j.asked) return WAIT;
+            j.asked = true;
+            const g = vb.grid;
+            const energy = Math.min(4, j.dv / this.breakDv(vb));
+            const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
+            const n = Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
+            remote.split(g, { point: vb.toLocal(j.point), n, minCount: this.debrisMin(), generation: vb.generation + 1 }).then(rep => {
+                j.pieces = rep.same ? [g] : rep.pieces;
+                j.dust.set(rep.dust);
+            }, () => { j.pieces = []; });
+            j.sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
+            j.held = { ...vb.prop.userData }; delete j.held.voxelBody; delete j.held.ripped;
+            j.ms = performance.now() - t0;
+            return WAIT;
+        }
         if(!j.pieces) {
             const g = vb.grid;
             if(this.debug) console.log(`fracture n=${g.count} gen=${vb.generation} age=${vb.age.toFixed(2)} dv=${j.dv.toFixed(1)} break=${this.breakDv(vb).toFixed(1)} mass=${(vb.mass / 1000).toFixed(1)}t`);
@@ -249,7 +291,7 @@ export class VoxelBodies {
         if(j.i < j.pieces.length) {
             // one piece per unit, parked (disabled, hidden) at the parent's current pose
             const p = j.pieces[j.i++];
-            const kid = new VoxelBody(this, p, { origin: vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]), rotation: vb.rotation(), generation: vb.generation + 1, userData: { ...j.held }, waitKeys: vb.waitKeys, sibling: j.sibling, enabled: false });
+            const kid = new VoxelBody(this, p, { origin: vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]), rotation: vb.rotation(), generation: vb.generation + 1, userData: { ...j.held }, waitKeys: vb.waitKeys, sibling: j.sibling, enabled: false, prep: p.prep || null });
             j.kids.push({ kid, p });
             j.ms += performance.now() - t0;
             return false;
@@ -295,8 +337,10 @@ export class VoxelBodies {
     rip(brush, userData = {}) {
         const g = liftGrid(this.world, brush);
         if(g.count < DEBRIS) return null;
-        const r = this.world.applyBrush(brush, { op: 'carve', hardness: false });
-        const waitKeys = [...r.dirty];
+        const remote = this.world.remote;
+        const r = remote ? null : this.world.applyBrush(brush, { op: 'carve', hardness: false });
+        // with the terrain worker the world is cut a frame or two later (the lump ignores the terrain until then)
+        const waitKeys = r ? [...r.dirty] : [...this.world.chunksInSampleBox(brush.min.map(v => Math.floor(v / VOXEL) - 4 - PAD - 1), brush.max.map(v => Math.ceil(v / VOXEL) + 4 + PAD + 1))];
         const pieces = splitGrid(g).filter(p => p.count > 0);
         pieces.sort((a, b) => b.count - a.count);
         let lump = null;
@@ -306,7 +350,13 @@ export class VoxelBodies {
             const vb = this.add(p, { origin: o, waitKeys, userData: lump ? {} : { ripped: true, ...userData } });
             if(!lump) lump = vb;
         }
-        if(r.changed) this.queueConnectivity(r.box[0], r.box[1], brush);
+        if(remote) {
+            const made = [...this.list].filter(vb => vb.waitKeys === waitKeys);
+            for(const vb of made) vb.waitRemote = true;
+            const release = () => { for(const vb of made) vb.waitRemote = false; };
+            remote.brush(brush, { op: 'carve', hardness: false, conn: true, erode: Math.max(0, this.erode), debris: DEBRIS }).then(rep => { release(); this.fromWorker(rep); }, release);
+        }
+        else if(r.changed) this.queueConnectivity(r.box[0], r.box[1], brush);
         return lump;
     }
 
@@ -316,6 +366,7 @@ export class VoxelBodies {
     carve(brush, { hardness = true } = {}) {
         const removed = new Float64Array(256);
         let volume = 0;
+        const pending = [];
         for(const vb of [...this.list]) {
             if(vb.dead || vb.stamping) continue;
             const [mn, mx] = vb.worldBox();
@@ -332,6 +383,23 @@ export class VoxelBodies {
             const m00 = 1 - 2 * (qy * qy + qz * qz), m01 = 2 * (qx * qy - qz * qw), m02 = 2 * (qx * qz + qy * qw);
             const m10 = 2 * (qx * qy + qz * qw), m11 = 1 - 2 * (qx * qx + qz * qz), m12 = 2 * (qy * qz - qx * qw);
             const m20 = 2 * (qx * qz - qy * qw), m21 = 2 * (qy * qz + qx * qw), m22 = 1 - 2 * (qx * qx + qy * qy);
+            const remote = this.world.remote;
+            if(remote) {
+                // carved in the terrain worker; edits of one body are chained so each starts from the last one's grid
+                const spec = specOf(brush), tt = [t.x, t.y, t.z], M = [m00, m01, m02, m10, m11, m12, m20, m21, m22], ff = [...f];
+                const p = (vb.gridOp || Promise.resolve()).then(() => {
+                    if(vb.dead || vb.stamping) return null;
+                    return remote.carveGrid(vb.grid, spec, { lmin, lmax, t: tt, m: M, f: ff, hardness }).then(rep => {
+                        if(vb.dead || vb.stamping || !rep.changed) return null;
+                        vb.grid = rep.grid;
+                        this._carved(vb);
+                        return rep.removed;
+                    });
+                }).catch(() => null);
+                vb.gridOp = p;
+                pending.push(p);
+                continue;
+            }
             const local = { min: lmin, max: lmax, d: (x, y, z) => {
                 const lx = x - f[0], ly = y - f[1], lz = z - f[2];
                 return brush.d(t.x + m00 * lx + m01 * ly + m02 * lz, t.y + m10 * lx + m11 * ly + m12 * lz, t.z + m20 * lx + m21 * ly + m22 * lz);
@@ -339,17 +407,29 @@ export class VoxelBodies {
             const r = carveGrid(vb.grid, local, { hardness });
             if(!r.changed) continue;
             for(let i = 0; i < 256; i++) { removed[i] += r.removed[i]; volume += r.removed[i]; }
-            vb.remesh(); // the look updates at once; the shape (split, colliders) in a budgeted job
-            vb.body.wakeUp();
-            vb.still = 0;
-            if(!vb.rebody) { vb.rebody = true; this.jobs.unshift({ kind: 'rebody', vb }); }
+            this._carved(vb);
         }
-        return { removed, volume };
+        // with the worker: removed / volume are 0 here, `done` resolves to the full { removed, volume }
+        const done = pending.length ? Promise.all(pending).then(list => {
+            for(const rm of list) if(rm) for(let i = 0; i < 256; i++) { removed[i] += rm[i]; volume += rm[i]; }
+            return { removed, volume };
+        }) : null;
+        return { removed, volume, done };
+    }
+    /** A body's grid was carved: remesh at once, the shape (split, colliders) in a budgeted job. */
+    _carved(vb) {
+        vb.carves = (vb.carves || 0) + 1;
+        vb.remesh();
+        vb.body.wakeUp();
+        vb.still = 0;
+        if(!vb.rebody) { vb.rebody = true; this.jobs.unshift({ kind: 'rebody', vb }); }
     }
     /** After carving: split a body cut in two, or rebuild its colliders. */
     _rebody(vb) {
+        const remote = this.world.remote;
+        if(remote) return this._rebodyRemote(vb, remote);
         vb.rebody = false;
-        if(vb.dead || vb.stamping || !this.list.has(vb)) return;
+        if(vb.dead || vb.stamping || !this.list.has(vb)) return true;
         const dust = new Float64Array(256);
         const t = vb.body.translation(); // before replace() removes the body: reading a removed body panics Rapier
         const pieces = splitGrid(vb.grid, null, { minCount: DEBRIS, dust });
@@ -362,6 +442,35 @@ export class VoxelBodies {
             for(let i = 0; i < 256; i++) dust[i] += r.removed[i];
         }
         this._dust([t.x, t.y, t.z], dust, 'carve', vb);
+        return true;
+    }
+    /** _rebody with the component split in the terrain worker (a job: WAIT until the answer is in). */
+    _rebodyRemote(vb, remote) {
+        const j = vb.rebodyJob ||= { asked: false, rep: null, v: 0 };
+        if(vb.dead || vb.stamping || !this.list.has(vb)) { vb.rebody = false; vb.rebodyJob = null; return true; }
+        if(!j.asked) {
+            j.asked = true; j.v = vb.carves || 0;
+            remote.split(vb.grid, { minCount: DEBRIS, generation: vb.generation }).then(rep => { j.rep = rep; }, () => { j.rep = { same: true, prep: null, dust: new Float64Array(256) }; });
+            return WAIT;
+        }
+        if(!j.rep) return WAIT;
+        vb.rebodyJob = null;
+        // carved again meanwhile: split the newer grid instead
+        if((vb.carves || 0) !== j.v) { vb.rebodyJob = null; return this._rebodyRemote(vb, remote); }
+        vb.rebody = false;
+        const rep = j.rep, dust = rep.dust;
+        const t = vb.body.translation();
+        if(rep.same) {
+            vb.stats = rep.prep?.stats || gridStats(vb.grid);
+            vb.grid.count = vb.stats.count;
+            vb.updateUserData();
+            vb.buildColliders(rep.prep && rep.prep.generation === vb.generation ? rep.prep.boxes : null);
+        } else {
+            const r = this.replace(vb, rep.pieces, {});
+            for(let i = 0; i < 256; i++) dust[i] += r.removed[i];
+        }
+        this._dust([t.x, t.y, t.z], dust, 'carve', vb);
+        return true;
     }
 
     /**
@@ -378,7 +487,7 @@ export class VoxelBodies {
         const kids = [];
         const sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
         const pieceData = pieces.map(p => {
-            const st = gridStats(p);
+            const st = p.prep?.stats || gridStats(p);
             // world origin of the piece's local 0 (same rotation as the parent)
             const o = vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
             return { p, st, o };
@@ -399,7 +508,7 @@ export class VoxelBodies {
                 lv[0] += dx * k; lv[1] += dy * k + spread * 0.25; lv[2] += dz * k;
                 for(let a = 0; a < 3; a++) av[a] += (Math.random() - 0.5) * spread * 0.6;
             }
-            const kid = this.add(p, { origin: o, rotation: rot, linvel: lv, angvel: av, generation, userData: { ...held }, waitKeys: vb.waitKeys, sibling: pieces.length > 1 ? sibling : 0 });
+            const kid = this.add(p, { origin: o, rotation: rot, linvel: lv, angvel: av, generation, userData: { ...held }, waitKeys: vb.waitKeys, sibling: pieces.length > 1 ? sibling : 0, prep: p.prep || null });
             kids.push(kid);
         }
         // keep showing the old mesh until the pieces have theirs (a frame or two)
@@ -513,7 +622,7 @@ export class VoxelBodies {
             if(vb.waitKeys) {
                 vb.waitT += h;
                 const pool = this.pool;
-                if(vb.waitT > 1.5 || !vb.waitKeys.some(k => pool.queue.has(k) || pool.inflight.has(k) || this.physics.colliderPending(k))) vb.touchTerrain();
+                if(vb.waitT > 1.5 || (!vb.waitRemote && !vb.waitKeys.some(k => pool.queue.has(k) || pool.inflight.has(k) || this.physics.colliderPending(k)))) vb.touchTerrain();
             }
             if(vb.stamping) { if(vb.stampKeys) this._finishStamp(vb, h); continue; }
             const b = vb.body;
@@ -567,6 +676,11 @@ export class VoxelBodies {
         vb.body.setBodyType(this.physics.R.RigidBodyType.Fixed, false);
         vb.stamping = true;
         vb.stampKeys = null;
+        const remote = this.world.remote;
+        if(remote) {
+            remote.stamp(vb.grid, vb.gridOrigin(), vb.rotation()).then(rep => { vb.stampKeys = rep.dirty; vb.stampT = 0; }, () => { vb.stampKeys = []; vb.stampT = 0; });
+            return;
+        }
         this.jobs.push({ kind: 'stamp', vb, gen: stampJob(this.world, vb.grid, vb.gridOrigin(), vb.rotation(), 4096) });
     }
     _finishStamp(vb, h) {

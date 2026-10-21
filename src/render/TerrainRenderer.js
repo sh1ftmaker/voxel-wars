@@ -27,7 +27,8 @@ export class TerrainRenderer {
                 return Math.hypot((c.cx + 0.5) * CHUNK_M - p.x, (c.cy + 0.5) * CHUNK_M - p.y, (c.cz + 0.5) * CHUNK_M - p.z);
             },
         });
-        world.onChange(({ dirty }) => { for(const k of dirty) this.remesh(k); });
+        // edits from the terrain worker come with the dirty chunks' padded windows (no extraction on this thread)
+        world.onChange(({ dirty, windows }) => { for(const k of dirty) { const w = windows?.get(k); if(w) this.remeshWindow(k, w); else this.remesh(k); } });
     }
     /** The shared material for detached bodies (createTerrainMaterial({ local: true })): triplanar in object space,
      *  so textures stick to a moving piece. One instance for all bodies keeps a single pipeline. */
@@ -39,6 +40,15 @@ export class TerrainRenderer {
         const c = this.world.chunks.get(key);
         if(!c) return;
         this.pool.request(key, (sdf, mat) => this.world.extractPadded(c.cx, c.cy, c.cz, sdf, mat));
+    }
+    /** Remesh a chunk from a ready padded window { sdf, mat } ({ empty: true }: nothing to mesh). */
+    remeshWindow(key, w) {
+        this.pool.request(key, (sdf, mat) => {
+            if(w.empty) return false;
+            sdf.set(w.sdf); mat.set(w.mat);
+            this.world.remote?.recycle(w.sdf, w.mat); w.sdf = w.mat = null; w.empty = true; // (a window is used once)
+            return true;
+        });
     }
     get pending() { return this.pool.pending; }
     _apply(key, mesh) {

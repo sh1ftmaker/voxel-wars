@@ -40,7 +40,9 @@ export class CharacterBody {
         this.cc.setCharacterMass(90);
         this.cc.setSlideEnabled(true);
         this.ignore = new Set();  // collider handles the controller passes through (a carried crate, a held rock)
-        this.filter = (c) => !this.ignore.has(c.handle) && !c.isSensor();
+        // (sensors are excluded by QueryFilterFlags.EXCLUDE_SENSORS: calling c.isSensor() here re-enters Rapier
+        // while it is borrowed, which throws every time and cost the bots up to ~10 ms a frame)
+        this.filter = (c) => !this.ignore.has(c.handle);
         this._n = [0, 0, 0];
         this._desired = { x: 0, y: 0, z: 0 }; this._moved = { x: 0, y: 0, z: 0 };
     }
@@ -113,9 +115,15 @@ export class CharacterBody {
         // colliders, and Rapier's controller catches on the seams between them and on small ledges the voxel surface
         // leaves (its autostep needs a clean step); lifting over them keeps walking smooth up any walkable slope.
         const want = Math.hypot(desired.x, desired.z);
-        if((this.grounded || ground) && want > 1e-4 && Math.hypot(m.x, m.z) < want * 0.6) {
+        // (a failed retry is not repeated from the same spot for a moment: pushing against a wall would otherwise cost
+        // four controller queries a frame, a few ms per bot at high frame rates)
+        const sf = this._stepFail;
+        const retry = !sf || sf.t <= 0 || Math.abs(sf.x - this.center.x) + Math.abs(sf.z - this.center.z) > 0.05 || (sf.dx * desired.x + sf.dz * desired.z) <= 0;
+        if(sf) sf.t -= dt;
+        if(retry && (this.grounded || ground) && want > 1e-4 && Math.hypot(m.x, m.z) < want * 0.6) {
             const r = this._stepUp(desired);
-            if(r) { m = r; ground = true; }
+            if(r) { m = r; ground = true; this._stepFail = null; }
+            else this._stepFail = { t: 0.1, x: this.center.x, z: this.center.z, dx: desired.x, dz: desired.z };
         }
         const wasGrounded = this.grounded;
         this.grounded = ground && v.y <= 0.5;

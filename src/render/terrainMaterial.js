@@ -8,23 +8,52 @@
  *  createTerrainMaterial({ local: true }) detached bodies: triplanar in object space, so the texture rides along
  *                                         with a moving, rotating piece (build its geometry with geometryFromMesh). */
 import * as THREE from 'three/webgpu';
-import { attribute, uniformArray, texture, positionWorld, positionLocal, normalWorld, normalLocal, float, vec3, mix, clamp, dot, select } from 'three/tsl';
+import { attribute, uniformArray, texture, positionWorld, positionLocal, normalWorld, normalLocal, float, vec3, mix, clamp, dot, select, uniform, varying, Fn } from 'three/tsl';
 import { terrainTextures } from './TerrainTextures.js';
 
 const LUMA = vec3(0.2126, 0.7152, 0.0722);
 let tables = null;
 
 export function createTerrainMaterial({ local = false } = {}) {
-    const tt = terrainTextures();
-    tables ||= { tints: uniformArray(tt.tints, 'color'), props: uniformArray(tt.props, 'vec4') };
     const mat = new THREE.MeshStandardNodeMaterial({ roughness: 0.88, metalness: 0 });
     // terrain is closed solid: cast shadows with front faces (back faces leak light at the foot of walls)
     mat.shadowSide = THREE.FrontSide;
+    buildTerrainNodes(mat, { local });
+    return mat;
+}
+
+/**
+ * Soft ground (src/soft): deform chunk meshes in the vertex stage. `deform(skip)` (called inside the vertex
+ * Fn) returns TSL { position (local), normal (local), rest (world position before deformation) }; `skip` is a
+ * per-object int uniform (bits from `object.geometry.userData.softSkip`) that the deform provider may use to leave
+ * meshes out. Textures follow the rest position, so they ride along with the wobble. WebGPU only: do not call
+ * this on the WebGL2 backend (storage buffers in the vertex stage).
+ */
+export function enableTerrainDeform(mat, deform) {
+    buildTerrainNodes(mat, { local: false, deform });
+    mat.needsUpdate = true;
+}
+
+function buildTerrainNodes(mat, { local, deform = null }) {
+    const tt = terrainTextures();
+    tables ||= { tints: uniformArray(tt.tints, 'color'), props: uniformArray(tt.props, 'vec4') };
+    let pWorld = positionWorld, nWorld = normalWorld;
+    if(deform) {
+        const skip = uniform(0, 'int').onObjectUpdate(({ object }) => object.geometry?.userData.softSkip | 0);
+        const vRest = varying(vec3(0), 'vSoftRest');
+        mat.positionNode = Fn(() => {
+            const d = deform(skip);
+            vRest.assign(d.rest);
+            normalLocal.assign(d.normal);
+            return d.position;
+        })();
+        pWorld = vRest;
+    } else mat.positionNode = null;
     const mb = attribute('matBlend', 'vec3');
     const ia = mb.x.add(0.5).toInt(), ib = mb.y.add(0.5).toInt();
     const pa = tables.props.element(ia), pb = tables.props.element(ib);
-    const p = local ? positionLocal : positionWorld;
-    const nAbs = (local ? normalLocal : normalWorld).abs();
+    const p = local ? positionLocal : pWorld;
+    const nAbs = (local ? normalLocal : nWorld).abs();
     const n4 = nAbs.mul(nAbs).mul(nAbs).mul(nAbs);
     const w = n4.div(n4.x.add(n4.y).add(n4.z).max(1e-5));
     const tri = (props) => {
@@ -50,7 +79,6 @@ export function createTerrainMaterial({ local = false } = {}) {
     mat.emissiveNode = albedo.mul(glow.mul(2.5));
     mat.userData.terrainSpace = local ? 'local' : 'world';
     mat.userData.textures = tt;
-    return mat;
 }
 
 /** Resolves when the terrain textures have loaded (the material shows flat material colours until then). */

@@ -1,0 +1,20 @@
+/** Headless WebGPU check of the soft ground solver alone: node tools/test/softsim.mjs '{"speed":8}' */
+import puppeteer from 'puppeteer-core';
+import { build } from 'esbuild';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'softsim-'));
+await build({ entryPoints: ['tools/test/softSimPage.js'], bundle: true, format: 'esm', outfile: path.join(dir, 'page.js'), logLevel: 'error' });
+const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new', args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan,WebGPU'] });
+const page = await browser.newPage();
+page.on('console', m => console.log('[console]', m.type(), m.text().slice(0, 300)));
+page.on('pageerror', e => console.log('[pageerror]', e.message));
+await page.goto('http://127.0.0.1:5180/favicon.ico').catch(() => {});
+await page.addScriptTag({ content: fs.readFileSync(path.join(dir, 'page.js'), 'utf8'), type: 'module' });
+await page.waitForFunction(() => window.runTest, { timeout: 30000 });
+const r = await page.evaluate((o) => window.runTest(o), JSON.parse(process.argv[2] || '{}'));
+console.log(r.log.join('\n'));
+for(const s of r.series) console.log(JSON.stringify(s));
+console.log('cpu/frame ms', r.cpuPerFrame, 'wall/frame ms (swiftshader)', r.wallPerFrame);
+await browser.close();
