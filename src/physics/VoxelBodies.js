@@ -351,6 +351,7 @@ export class VoxelBodies {
         vb.rebody = false;
         if(vb.dead || vb.stamping || !this.list.has(vb)) return;
         const dust = new Float64Array(256);
+        const t = vb.body.translation(); // before replace() removes the body: reading a removed body panics Rapier
         const pieces = splitGrid(vb.grid, null, { minCount: DEBRIS, dust });
         if(pieces.length === 1 && pieces[0] === vb.grid) {
             vb.stats = gridStats(vb.grid);
@@ -360,7 +361,6 @@ export class VoxelBodies {
             const r = this.replace(vb, pieces, {});
             for(let i = 0; i < 256; i++) dust[i] += r.removed[i];
         }
-        const t = vb.body.translation();
         this._dust([t.x, t.y, t.z], dust, 'carve', vb);
     }
 
@@ -465,7 +465,8 @@ export class VoxelBodies {
     }
     _contactPoint(vb, c, o) {
         let p = null;
-        try {
+        // a collider removed since the step would panic inside Rapier (not catchable: it poisons the whole module)
+        if(c?.isValid() && o?.isValid()) try {
             this.physics.rw.contactPair(c, o, (m) => {
                 if(p) return;
                 if(m.numSolverContacts() > 0) { const s = m.solverContactPoint(0); p = [s.x, s.y, s.z]; }

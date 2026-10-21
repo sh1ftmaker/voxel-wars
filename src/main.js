@@ -60,12 +60,14 @@ physics.flushColliders(); // terrain colliders are otherwise built a few per fra
 $('loading').style.display = 'none';
 
 const timer = new THREE.Timer();
+const loggedErrors = new Set();
 let frames = 0, fpsT = 0, fps = 0;
 renderer.setAnimationLoop((now) => {
     timer.update(now);
     const dt = Math.min(timer.getDelta(), 0.1);
     physics.step(dt);
-    for(const s of systems) s.update?.(dt);
+    // one failing system must not stop the game: log each distinct error once and keep running
+    for(const s of systems) try { s.update?.(dt); } catch(e) { if(!loggedErrors.has(e.message)) { loggedErrors.add(e.message); console.error(e); } }
     env.update(); // after the camera moved: sky dome and shadow box follow it
     renderer.render(scene, camera);
     frames++; fpsT += dt;

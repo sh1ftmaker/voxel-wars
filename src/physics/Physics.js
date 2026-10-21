@@ -33,6 +33,8 @@
 import RAPIER from '@dimforge/rapier3d-compat';
 import { CHUNK_M } from '../config.js';
 
+const REMOVED_BODY = new Proxy({}, { get: (_, k) => k === 'isValid' ? () => false : k === 'handle' ? -1 : () => { throw new Error(`physics: ${String(k)}() on a removed body`); } });
+
 export const GRAVITY = 30; // m/s²: real gravity reads as slow motion at this scale (WorldParty's DEFAULT_BODY_GRAVITY)
 export const STEP = 1 / 60;
 /** Collision groups ((memberships << 16) | filter): terrain colliders are in group 0; GROUPS_NO_TERRAIN collides
@@ -189,6 +191,11 @@ export class Physics {
         if(prop.collider) this.byCollider.delete(prop.collider.handle);
         this.rw.removeRigidBody(prop.body);
         if(prop.mesh) prop.mesh.removeFromParent();
+        // any later use of the removed body would be a Rust panic that poisons Rapier for good ("recursive use of an
+        // object" on every step after it); make it an ordinary, catchable JS error instead
+        prop.removed = true;
+        prop.body = REMOVED_BODY;
+        if(prop.collider) prop.collider = REMOVED_BODY;
     }
     propOf(collider) { return collider ? this.byCollider.get(collider.handle) || null : null; }
 
@@ -243,7 +250,8 @@ export class Physics {
             if(this.contactListeners.length) this.eventQueue.drainContactForceEvents(e => {
                 const c1 = this.rw.getCollider(e.collider1()), c2 = this.rw.getCollider(e.collider2());
                 const f = e.totalForceMagnitude(), d = e.maxForceDirection();
-                for(const fn of this.contactListeners) fn(c1, c2, f, d);
+                // a throw inside Rapier's drain callback would leave the event queue borrowed and fail every later step
+                for(const fn of this.contactListeners) try { fn(c1, c2, f, d); } catch(err) { console.error(err); }
             });
             else this.eventQueue.clear();
             for(const fn of this.stepListeners) fn(STEP);
