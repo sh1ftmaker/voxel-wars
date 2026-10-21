@@ -7,13 +7,14 @@
  *  has none, its tint maps the layer's mean colour onto the material colour; otherwise the tint is white. One shared
  *  instance (`terrainTextures()`), so every terrain and body material samples the same GPU texture. */
 import * as THREE from 'three/webgpu';
-import { MATERIALS } from '../voxel/materials.js';
+import { MATERIALS, MAT_SLOTS } from '../voxel/materials.js';
 import { isMobile } from './device.js';
 
 const FLAT = 0.55; // the flat layer's grey (sRGB 0..1)
 /** How far a texture used by one material is pulled towards the material's palette hue (0 = the texture as is):
  *  the grass photo is a dry yellow-green, and the cliff photo is orange where the palette wants grey stone. */
 const HUE_TINT = { Grass: 0.6, Stone: 0.6, Dirt: 0.25 };
+const tintKey = (m) => m.name.replace(/ \([YZ]\)$/, ''); // 'Wood (Y)' tints as 'Wood'
 
 class TerrainTextures {
     constructor() {
@@ -30,7 +31,7 @@ class TerrainTextures {
         this.texture.generateMipmaps = true;
         this.texture.anisotropy = isMobile ? 2 : 8;
         this.texture.needsUpdate = true;
-        this.count = Math.max(16, MATERIALS.length);
+        this.count = Math.max(MAT_SLOTS, MATERIALS.length);
         this.tints = [];
         this.props = [];
         for(let i = 0; i < this.count; i++) {
@@ -71,11 +72,13 @@ class TerrainTextures {
         this.texture.image = { data, width: S, height: S, depth: this.depth };
         this.texture.needsUpdate = true;
         const users = new Map();
-        for(const m of MATERIALS) if(m.texture) users.set(m.texture, (users.get(m.texture) || 0) + 1);
+        // materials sharing a texture and a colour (wood with its three grain axes) count as one user
+        const seen = new Set();
+        for(const m of MATERIALS) if(m.texture && !seen.has(m.texture + m.color)) { seen.add(m.texture + m.color); users.set(m.texture, (users.get(m.texture) || 0) + 1); }
         for(let i = 0; i < this.count; i++) {
             const m = MATERIALS[i] || MATERIALS[1];
             const layer = this.props[i].x;
-            const amount = m.texture && users.get(m.texture) === 1 ? (HUE_TINT[m.name] || 0) : 1;
+            const amount = m.texture && users.get(m.texture) === 1 ? (HUE_TINT[tintKey(m)] || 0) : 1;
             if(amount === 0) { this.tints[i].setRGB(1, 1, 1); continue; }
             // the material's hue at the geometric mean of its own and the texture's brightness
             const c = new THREE.Color(m.color), mean = means[layer];
