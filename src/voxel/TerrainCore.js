@@ -13,7 +13,7 @@
  *        reply.dust [{ center, removed }] (islands too small for a body)
  *   { type: 'stamp', grid, t, q }                 union a body's grid into the world (islands.stampGrid)
  *   { type: 'samples', patch }                    VoxelWorld.writeSamples (soft-ground bakes)
- *   { type: 'split', grid, point?, n?, minCount, generation }
+ *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
  *        point/n: Voronoi fracture (voronoiLabels) else connected components; reply.pieces [grid with .prep],
  *        reply.same (the grid is one piece: nothing to split), reply.dust (Float64Array m³ per material)
  *   { type: 'carveGrid', grid, spec, lmin, lmax, t, m, f, hardness }
@@ -30,6 +30,7 @@ import { VoxelWorld } from './VoxelWorld.js';
 import { voxelize } from './voxelize.js';
 import { brushFromSpec } from './brushes.js';
 import { findIslands, detachIsland, stampGrid, splitGrid, voronoiLabels, gridPrep, carveGrid } from './islands.js';
+import { cellSampleLabels } from '../softbody/lattice.js';
 import { Level } from '../level/fortwar.js';
 
 export class TerrainCore {
@@ -100,7 +101,8 @@ export class TerrainCore {
     split(msg, transfer) {
         const g = msg.grid;
         const dust = new Float64Array(256);
-        const labels = msg.n ? voronoiLabels(g, msg.point, msg.n) : null;
+        const c = msg.cells; // a soft body's crack: labels per lattice cell (src/softbody)
+        const labels = c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : msg.n ? voronoiLabels(g, msg.point, msg.n) : null;
         const pieces = splitGrid(g, labels, { minCount: msg.minCount ?? 0, dust });
         const same = pieces.length === 1 && pieces[0] === g;
         for(const p of pieces) {

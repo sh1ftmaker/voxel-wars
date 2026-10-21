@@ -54,6 +54,15 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
 - **Physics**: Rapier stays on the main thread (the character controller needs synchronous queries). Its wasm is
   warmed up at load (`Physics.warmup`), the solver runs 2 iterations, voxel bodies use few collider boxes
   (`islands.maxBoxesFor`), and new island bodies are created one per frame.
+- **Soft debris** (`src/softbody/`, `src/workers/softBody.js`; `bodies.soft`, `?softDebris=0` turns it off): Rapier
+  keeps each voxel body rigid; on top of it a body-local tet lattice (0.5 m cells, coarser for big bodies, 5 tets per
+  cell, shape matching at 60 Hz in one worker for all bodies) bends and jiggles from impacts and blast kicks, and the
+  body mesh is displaced in the vertex shader from a float texture atlas (WebGL2 and WebGPU). Hits between the break
+  threshold and 2.5x it crack the lattice instead of the Voronoi shatter: faces break where it bent most, cracks run
+  across lattice planes, and when the body comes apart `VoxelBodies.crack` splits the grid by lattice cell (the
+  terrain worker's `split` with `cells`); the pieces keep the parent's wobble. Lattices exist only while a body
+  wobbles (built at the first kick, asleep when calm). Tests: `tools/test/softbody.mjs` (node: wobble, crack, split),
+  `softdebris.mjs` (browser screenshots), `softcrash.mjs`, `softperf.mjs`, `softwgsl.mjs` (WGSL compiles).
 - **Profiling**: `node tools/profile.mjs "<url>" <seconds> --scenario idle|blasts|topple|dig|game [--cpu] [--under fn]`
   reports frame interval and main-thread CPU per frame (p50/p99/max) with a per-section breakdown. Headless Chromium
   uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its

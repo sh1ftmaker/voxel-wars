@@ -217,6 +217,7 @@ export class VoxelBody {
         // applied between the blast and the centre of mass: the side facing the blast is kicked hardest
         const k = Math.min(0.6, this.radius * 0.5 / Math.max(d, 0.5));
         b.applyImpulseAtPoint(J, { x: c.x - dx * k, y: c.y - dy * k, z: c.z - dz * k }, true);
+        this.mgr.soft?.blast(this, center, radius, dv); // and it jiggles: the near side is pushed harder
         const v = b.linvel(); this.prevV = [v.x, v.y, v.z]; // a kick is not an impact
         if(this.stats.volume < 4) {
             const a = b.angvel(), s = strength * fall * 0.4;
@@ -228,12 +229,14 @@ export class VoxelBody {
     dispose({ keepMesh = false } = {}) {
         if(this.dead) return;
         this.dead = true;
+        this.mgr.soft?.stop(this);
         const { physics } = this.mgr;
         physics.removeBody(this.prop);
         if(keepMesh) { this.mgr.scene.add(this.group); return; }
         this.disposeMesh();
     }
     disposeMesh() {
+        this.mgr.soft?.release(this);
         this.group.removeFromParent();
         if(this.mesh) { this.mesh.geometry.dispose(); this.mesh = null; }
     }
