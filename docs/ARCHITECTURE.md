@@ -58,11 +58,22 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   keeps each voxel body rigid; on top of it a body-local tet lattice (0.5 m cells, coarser for big bodies, 5 tets per
   cell, shape matching at 60 Hz in one worker for all bodies) bends and jiggles from impacts and blast kicks, and the
   body mesh is displaced in the vertex shader from a float texture atlas (WebGL2 and WebGPU). Hits between the break
-  threshold and 2.5x it crack the lattice instead of the Voronoi shatter: faces break where it bent most, cracks run
+  threshold and 8x it crack the lattice instead of the Voronoi shatter (a lattice that holds for 0.4 s after a hit
+  over 1.8x is cleaved into 2-3 Voronoi pieces; bodies without a lattice cleave the same way), so thrown lumps and
+  falling spans stay physics objects and break into a few pieces: faces break where it bent most, cracks run
   across lattice planes, and when the body comes apart `VoxelBodies.crack` splits the grid by lattice cell (the
   terrain worker's `split` with `cells`); the pieces keep the parent's wobble. Lattices exist only while a body
   wobbles (built at the first kick, asleep when calm). Tests: `tools/test/softbody.mjs` (node: wobble, crack, split),
   `softdebris.mjs` (browser screenshots), `softcrash.mjs`, `softperf.mjs`, `softwgsl.mjs` (WGSL compiles).
+- **Structural collapse** (`src/voxel/structure.js`, in the terrain worker after every carve's islands): matter
+  that is still attached but hangs (no solid column under it to the bedrock) is judged per hanging component:
+  matter within 1.5 m of its support counts as anchored, and each deeper part fails on bending (weight x lever from
+  where it meets the anchored band, over that root's section, against the material's strength), reach (further from
+  support than the material spans) or floating. A failing part is cut at the band with a jagged lip and comes back in
+  `reply.islands` with `collapse { root, dir, reason }`; `VoxelBodies._hinge` starts it turning about the broken root
+  with a sag in its soft layer. Only components under the edit's footprint are checked, within 18 m of it (~10 ms in
+  the worker). Blowing one end off the bridge drops the span; the untouched level never collapses.
+  Tests: `tools/test/structure.mjs` (node: level sweep, bridge, ledges), `collapse.mjs` (browser: bridge, throw).
 - **Profiling**: `node tools/profile.mjs "<url>" <seconds> --scenario idle|blasts|topple|dig|game [--cpu] [--under fn]`
   reports frame interval and main-thread CPU per frame (p50/p99/max) with a per-section breakdown. Headless Chromium
   uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its

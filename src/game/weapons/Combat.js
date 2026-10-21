@@ -283,36 +283,37 @@ export class Combat {
         for(let i = this.thrown.length - 1; i >= 0; i--) {
             const t = this.thrown[i];
             t.age += dt;
-            if(t.shatterAt) { this.thrown.splice(i, 1); this.shatter(t.prop, t.owner, t.shatterAt); continue; }
-            if(!this.ctx.physics.props.has(t.prop)) { this.thrown.splice(i, 1); continue; } // settled into the terrain or pulverized
+            if(t.smackAt) { const at = t.smackAt; t.smackAt = null; this.smack(t, at); }
+            if(!this.ctx.physics.props.has(t.prop)) { this.thrown.splice(i, 1); continue; } // settled into the terrain, or cracked into pieces
             const b = t.prop.body, p = b.translation(), v = b.linvel();
             const dv = Math.hypot(v.x - t.prevV[0], v.y - t.prevV[1], v.z - t.prevV[2]);
             const speed = Math.hypot(t.prevV[0], t.prevV[1], t.prevV[2]);
             t.prevV[0] = v.x; t.prevV[1] = v.y; t.prevV[2] = v.z;
-            let shatter = t.age > 0.06 && dv > def.shatterSpeed && speed > def.shatterSpeed;
-            // a direct hit on an enemy
-            if(!shatter && speed > 8) for(const a of this.game.actors) {
-                if(!a.alive || a === t.owner || a.team === t.owner?.team) continue;
+            if(t.age > 0.06 && dv > def.shatterSpeed && speed > def.shatterSpeed) this.smack(t, [p.x, p.y, p.z], speed);
+            // a direct hit on an enemy: damage and knockback by the lump's speed and size (once per actor)
+            if(speed > 8) for(const a of this.game.actors) {
+                if(!a.alive || a === t.owner || a.team === t.owner?.team || t.hit?.has(a)) continue;
                 const c = a.body.center;
-                if(Math.abs(c.x - p.x) < 1.2 && Math.abs(c.z - p.z) < 1.2 && Math.abs(c.y - p.y) < 1.6) { shatter = true; break; }
+                if(Math.abs(c.x - p.x) < 1.2 && Math.abs(c.z - p.z) < 1.2 && Math.abs(c.y - p.y) < 1.6) {
+                    if(!t.hit) t.hit = new Set();
+                    t.hit.add(a);
+                    const k = Math.min(1.5, speed / def.throwSpeed) * Math.min(1.5, 0.6 + Math.cbrt(t.prop.userData?.volume ?? 1) * 0.4);
+                    const s = Math.max(speed, 1e-3);
+                    let dmg = def.damage * k;
+                    if(t.owner && !t.owner.isPlayer && a.isPlayer) dmg *= BOT_DAMAGE_SCALE;
+                    this.game.damage(a, dmg, t.owner, [v.x / s * def.knock * k, (Math.max(0, v.y / s) + 0.4) * def.knock * k, v.z / s * def.knock * k], 'rock');
+                    this.smack(t, [p.x, p.y, p.z], speed);
+                }
             }
-            if(shatter) { this.thrown.splice(i, 1); this.shatter(t.prop, t.owner); continue; }
             if(t.age > 6 || (t.age > 0.5 && speed < 1.5)) this.thrown.splice(i, 1); // came to rest: plain rubble now
         }
     }
-    /** A thrown lump bursts: crater, damage and knockback around it. `at` overrides its position (it may already
-     *  have been fractured into pieces by the physics). */
-    shatter(prop, owner, at = null) {
-        const alive = this.ctx.physics.props.has(prop);
-        const t = alive ? prop.body.translation() : null;
-        const p = at ? { x: at[0], y: at[1], z: at[2] } : t;
-        if(!p) return;
-        const mat = prop.userData?.mat ?? 1;
-        const vol = prop.userData?.volume ?? 1;
-        if(alive) this.ctx.physics.removeBody(prop);
-        const def = WEAPONS.grab;
-        this.game.emit('shatter', { point: [p.x, p.y, p.z], mat, volume: vol });
-        this.explode([p.x, p.y, p.z], 'rock', owner, { radius: def.blast * Math.min(1.4, 0.8 + Math.cbrt(vol) * 0.3), damage: def.damage, knock: def.knock });
+    /** A thrown lump hits something hard: chips and a crack sound. It stays a physics body (VoxelBodies bends it and,
+     *  over its break threshold, cracks it into a few pieces); no crater. */
+    smack(t, at, speed = 20) {
+        if(t.smackT !== undefined && t.age - t.smackT < 0.15) return; // one per bounce
+        t.smackT = t.age;
+        this.game.emit('shatter', { point: at, mat: t.prop.userData?.mat ?? 1, volume: Math.min(0.6, speed / 60) });
     }
 
     update(dt) {
@@ -322,11 +323,11 @@ export class Combat {
     }
 }
 
-/** 'impact' from physics (once detached-chunk physics lands): a thrown prop that hits hard shatters. */
+/** 'impact' from physics: a thrown lump that hits hard smacks (chips, sound) where it hit. */
 function ctx_events(combat) {
     combat.ctx.events.addEventListener('impact', (e) => {
         const d = e.detail; if(!d?.prop) return;
         const t = combat.thrown.find(t => t.prop === d.prop);
-        if(t && t.age > 0.06 && d.speed > WEAPONS.grab.shatterSpeed * 0.7) t.shatterAt = d.point; // handled in update (not inside the physics step)
+        if(t && t.age > 0.06 && d.speed > WEAPONS.grab.shatterSpeed * 0.7) t.smackAt = d.point; // handled in update (not inside the physics step)
     });
 }

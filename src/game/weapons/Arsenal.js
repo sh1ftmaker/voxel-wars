@@ -3,7 +3,7 @@
  * with the fire button. Punch (F / middle mouse) and grab (E / right mouse) work whatever tool is selected.
  *
  *   punch   click: bite a rock out of the terrain ahead, knock bodies and enemies
- *   grab    hold: rip a lump of terrain (or a loose body) out and carry it overhead; release: throw (it shatters)
+ *   grab    hold: rip a lump of terrain (or a loose body) out and carry it overhead; release: throw (it stays a body: bends, and cracks into a few pieces on a hard hit)
  *   rocket  hold: fire rockets (rocket jump by aiming at your feet)
  *   grenade hold to charge, release to throw
  *   drill   hold: dig a walkable tunnel the way you look

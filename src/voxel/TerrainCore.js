@@ -10,7 +10,9 @@
  *   { type: 'brush', spec, op, mat, hardness, conn, erode, debris }
  *        applyBrush(brushFromSpec(spec)); with conn (carves) the regions that lost their support are cut out:
  *        reply.result { removed, added, changed, box }, reply.islands [{ grid, prep, dirty }] (become bodies),
- *        reply.dust [{ center, removed }] (islands too small for a body)
+ *        reply.dust [{ center, removed }] (islands too small for a body); then structural failure
+ *        (src/voxel/structure.js, unless collapse: false): overhangs too weak to hold, cut free at their root, also
+ *        in reply.islands with { collapse: { root (m), dir, reason } }; reply.collapseMs, collapseChecked
  *   { type: 'stamp', grid, t, q }                 union a body's grid into the world (islands.stampGrid)
  *   { type: 'samples', patch }                    VoxelWorld.writeSamples (soft-ground bakes)
  *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
@@ -31,6 +33,7 @@ import { voxelize } from './voxelize.js';
 import { brushFromSpec } from './brushes.js';
 import { findIslands, detachIsland, stampGrid, splitGrid, voronoiLabels, gridPrep, carveGrid } from './islands.js';
 import { cellSampleLabels } from '../softbody/lattice.js';
+import { findCollapses } from './structure.js';
 import { Level } from '../level/fortwar.js';
 
 export class TerrainCore {
@@ -72,6 +75,8 @@ export class TerrainCore {
         const t0 = performance.now();
         voxelize(this.world, new Level());
         this._listen();
+        // warm the structural check's JIT (read only): the first blast in play should not wait on a cold one
+        for(let k = 0; k < 3; k++) findCollapses(this.world, [-40 + k * 8, -8, -8], [-24 + k * 8, 8, 8]);
         const chunks = [];
         this.sent = new Map();
         for(const c of this.world.chunks.values()) { chunks.push(this._diff(c)); this.sent.set(c.key, c.version); }
@@ -95,6 +100,23 @@ export class TerrainCore {
                 reply.islands.push({ grid: g, dirty: [...d.dirty] });
             }
             reply.islandsMs = performance.now() - t0;
+            // structural failure: overhangs still attached but too weak to hold themselves (src/voxel/structure.js)
+            if(msg.collapse !== false) {
+                const t1 = performance.now();
+                const col = findCollapses(w, r.box[0], r.box[1]);
+                for(const isl of col.islands) {
+                    const small = isl.count < msg.debris;
+                    const d = detachIsland(w, isl, { keepGrid: !small });
+                    if(!d.count) continue;
+                    if(small || !d.grid.count) { reply.dust.push({ center: isl.min.map((v, a) => (v + isl.max[a]) * 0.5 * VOXEL), removed: d.removed }); continue; }
+                    const g = d.grid;
+                    g.prep = gridPrep(g, 0);
+                    transfer.push(g.sdf.buffer, g.mat.buffer);
+                    reply.islands.push({ grid: g, dirty: [...d.dirty], collapse: isl.collapse });
+                }
+                reply.collapseMs = performance.now() - t1;
+                reply.collapseChecked = col.checked;
+            }
         }
         return reply;
     }

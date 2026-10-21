@@ -26,9 +26,11 @@
  *     material hardness, falling with mass, rising with each generation of fracture) splits it into Voronoi pieces
  *     seeded densest around the hit. Pieces under DEBRIS samples are pulverized: 'destroyed' { kind: 'impact' }.
  *   - soft layer (bodies.soft): impacts and blasts also kick the body's tet lattice, so it bends and jiggles. A hit
- *     over the break threshold but under SHATTER times it cracks the lattice instead of the Voronoi split: faces break
- *     where it bent most and the body splits along them (crack()); if no crack forms within CRACK_WAIT s, a hit over
- *     CRACK_FALLBACK times the threshold shatters it after all.
+ *     over the break threshold but under SHATTER (8) times it cracks the lattice instead of the Voronoi split: faces
+ *     break where it bent most and the body splits along them (crack()); if no crack forms within CRACK_WAIT s, a hit
+ *     over CRACK_FALLBACK times the threshold cleaves it into 2-3 Voronoi pieces. Only harder hits shatter.
+ *   - structural collapse: pieces the terrain worker cut off a failing overhang (src/voxel/structure.js) start
+ *     turning about the broken root, their soft layer sagging (_hinge).
  *   - settling: a body asleep (or barely moving) for SETTLE seconds is stamped back into the VoxelWorld at its pose
  *     and removed once the terrain under it has been remeshed: rubble becomes diggable terrain again.
  *   - budget: over maxBodies (48), the stillest bodies are stamped early and small moving ones are pulverized; near
@@ -63,9 +65,12 @@ const SETTLE = 2;
 const WAIT = 'wait';
 /** Bodies smaller than this never fracture (≈ 1.9 m³). */
 const MIN_FRACTURE = 120;
-/** Hits up to this many times the break threshold crack the soft lattice; harder ones shatter (Voronoi). */
-const SHATTER = 2.5;
-const CRACK_WAIT = 0.4, CRACK_FALLBACK = 1.8;
+/** Hits up to this many times the break threshold crack the soft lattice (a few big pieces along where it bent);
+ *  only harder ones shatter (Voronoi). Thrown lumps and falling spans stay physics objects and break apart. */
+const SHATTER = 8;
+/** A crack attempt that formed no crack within CRACK_WAIT s: hits over CRACK_FALLBACK times the threshold cleave
+ *  the body into a few pieces anyway (Voronoi, CLEAVE pieces at most, a gentle push apart). */
+const CRACK_WAIT = 0.4, CRACK_FALLBACK = 1.8, CLEAVE = 3;
 /** Velocity changes (m/s) under this do not shake the soft layer. */
 const SOFT_DV = 1.5;
 
@@ -218,8 +223,25 @@ export class VoxelBodies {
         const vb = this.add(g, { origin: [g.offset[0] * VOXEL, g.offset[1] * VOXEL, g.offset[2] * VOXEL], waitKeys: [...d.dirty], prep: g.prep || null });
         vb.body.wakeUp();
         this.stats.detached++;
+        if(d.collapse) this._hinge(vb, d.collapse);
         for(const k of kicks) vb.explode(k.center, k.radius, k.strength);
-        this.events.dispatchEvent(new CustomEvent('detached', { detail: { prop: vb.prop, volume: vb.volume, mat: vb.mat } }));
+        this.events.dispatchEvent(new CustomEvent('detached', { detail: { prop: vb.prop, volume: vb.volume, mat: vb.mat, collapse: d.collapse?.reason ?? null } }));
+    }
+    /** A structural failure (src/voxel/structure.js) snapped this piece off at `root`: it starts turning about the
+     *  broken root (the free end drops first) and its soft layer sags (the far end lags the root's give). */
+    _hinge(vb, { root, dir }) {
+        this.stats.collapsed = (this.stats.collapsed || 0) + 1;
+        const b = vb.body, com = b.worldCom();
+        const h = Math.hypot(dir[0], dir[2]);
+        if(h > 0.1) {
+            const lever = Math.max(0.5, Math.hypot(com.x - root[0], com.z - root[2]));
+            const w = Math.min(1.2, 2.2 / Math.sqrt(lever)); // rad/s: a long span tips slower
+            const ax = dir[2] / h * w, az = -dir[0] / h * w;   // up x dir: the free end goes down
+            const rx = com.x - root[0], ry = com.y - root[1], rz = com.z - root[2];
+            b.setAngvel({ x: ax, y: 0, z: az }, true);
+            b.setLinvel({ x: -az * ry, y: az * rx - ax * rz, z: ax * ry }, true); // w x r: the root stays put
+        }
+        this.soft.impact(vb, root, [0, 3.5, 0], 1);
     }
 
     // ------------------------------------------------------------ per frame: budgeted jobs
@@ -230,11 +252,11 @@ export class VoxelBodies {
         this.lastFrame = t0;
         this.frameNo = (this.frameNo || 0) + 1;
         // fractures go first (staged jobs: pieces, then one disabled body per unit, then an atomic swap)
-        for(const [vb, [point, dv, cells]] of this.breaks) {
+        for(const [vb, [point, dv, cells, few]] of this.breaks) {
             this.breaks.delete(vb);
             if(vb.dead || vb.fracturing || vb.stamping || !this.list.has(vb) || !vb.body.isDynamic() || (cells && vb.prop.userData.held)) { if(cells) this.soft.gridChanged(vb); continue; }
             vb.fracturing = true;
-            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
+            this.jobs.unshift({ kind: 'frac', vb, point, dv, cells, few: few || 0, pieces: null, kids: [], i: 0, dust: new Float64Array(256) });
         }
         // jobs run in order; one waiting for the terrain worker (WAIT) lets the next ones run meanwhile
         let first = true, k = 0;
@@ -286,7 +308,7 @@ export class VoxelBodies {
             const g = vb.grid;
             const energy = Math.min(4, j.dv / this.breakDv(vb));
             const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
-            const n = Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
+            const n = j.few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
             const c = j.cells, cells = c ? { labels: c.labels, cellOf: c.cellOf, cs: c.cs, dims: c.dims } : null;
             remote.split(g, { point: vb.toLocal(j.point), n, cells, minCount: this.debrisMin(), generation: vb.generation + 1 }).then(rep => {
                 j.pieces = rep.same ? [g] : rep.pieces;
@@ -302,7 +324,7 @@ export class VoxelBodies {
             if(this.debug) console.log(`fracture n=${g.count} gen=${vb.generation} age=${vb.age.toFixed(2)} dv=${j.dv.toFixed(1)} break=${this.breakDv(vb).toFixed(1)} mass=${(vb.mass / 1000).toFixed(1)}t`);
             const energy = Math.min(4, j.dv / this.breakDv(vb));
             const crowd = Math.max(0.35, Math.min(1, 1.3 - this.pressure()));
-            const n = Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
+            const n = j.few || Math.max(2, Math.min(14, Math.round((1 + energy * 2 + Math.log2(1 + vb.volume)) * crowd)));
             const c = j.cells;
             j.pieces = splitGrid(g, c ? cellSampleLabels(g, c.labels, c.cellOf, c.cs, c.dims) : voronoiLabels(g, vb.toLocal(j.point), n), { minCount: this.debrisMin(), dust: j.dust });
             j.sibling = 1 << (2 + (this.siblingNext = ((this.siblingNext || 0) + 1) % 12));
@@ -321,7 +343,7 @@ export class VoxelBodies {
         // swap: the pieces take over the parent's motion where it is now, plus a spread away from the hit (a crack:
         // a nudge apart; the pieces keep the parent's wobble)
         const b = vb.body, v = b.linvel(), w = b.angvel(), com = b.worldCom(), rot = vb.rotation();
-        const spread = j.cells ? 0.8 : Math.min(8, 1.5 + j.dv * 0.15), point = j.cells ? [com.x, com.y, com.z] : j.point;
+        const spread = j.cells ? 0.8 : j.few ? 1.2 : Math.min(8, 1.5 + j.dv * 0.15), point = j.cells ? [com.x, com.y, com.z] : j.point;
         for(const { kid, p } of j.kids) this.soft.inherit(kid, vb, [p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
         for(const { kid, p } of j.kids) {
             const o = vb.toWorld([p.offset[0] * VOXEL, p.offset[1] * VOXEL, p.offset[2] * VOXEL]);
@@ -651,8 +673,9 @@ export class VoxelBodies {
                     const soft = this.soft.enabled && energy < SHATTER && vb.softRec?.state !== 'dead';
                     if(soft) { if(!vb.crackWait || vb.crackWait.dv < dv) vb.crackWait = { t: vb.age, point, dv, energy }; }
                     else {
+                        // no soft layer (off, or too big for one): cleave into a few pieces; only extreme hits shatter
                         const q = this.breaks.get(vb);
-                        if(!q || q[1] < dv) this.breaks.set(vb, [point, dv]);
+                        if(!q || q[1] < dv) this.breaks.set(vb, [point, dv, null, energy < SHATTER ? Math.min(CLEAVE, 2 + Math.floor(energy / 4)) : 0]);
                     }
                 }
             }
@@ -674,7 +697,8 @@ export class VoxelBodies {
             if(cw && vb.age - cw.t > CRACK_WAIT) {
                 vb.crackWait = null;
                 // the lattice held: a hit far over the threshold shatters it after all
-                if(cw.energy >= CRACK_FALLBACK && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb)) this.breaks.set(vb, [cw.point, cw.dv]);
+                if(cw.energy >= CRACK_FALLBACK && !vb.fracturing && vb.softRec?.state !== 'split' && !this.breaks.has(vb))
+                    this.breaks.set(vb, [cw.point, cw.dv, null, Math.min(CLEAVE, 2 + Math.floor(cw.energy / 4))]);
             }
             const b = vb.body;
             const lv = b.linvel(); vb.prevV[0] = lv.x; vb.prevV[1] = lv.y; vb.prevV[2] = lv.z;
