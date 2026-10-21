@@ -96,6 +96,9 @@ export class Physics {
         this.world = world;
         this.scene = scene;
         this.b3 = new B3World(M, { gravity: [0, -GRAVITY, 0], hitThreshold: HIT_THRESHOLD });
+        // overlaps are pushed apart at up to 1 m/s (box3d's default 3 m/s makes pieces jump when the surface under
+        // them changes, e.g. a body they rest on is stamped into the terrain)
+        M._bw_set_contact_tuning(30, 10, 1);
         this.BodyType = BodyType;
         this.terrainColliders = new Map(); // chunk key -> 8 octant slots { hash, collider } | null
         this.terrainBody = this.b3.createBody({ type: BodyType.Fixed });

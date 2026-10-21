@@ -52,7 +52,7 @@ export class VoxelBody {
         _v.set(this.frame[0], this.frame[1], this.frame[2]).applyQuaternion(_q);
         const body = physics.createBody({
             position: [origin[0] + _v.x, origin[1] + _v.y, origin[2] + _v.z], rotation: [...rotation],
-            linvel: [...linvel], angvel: [...angvel], linearDamping: 0.02, angularDamping: 0.35, enabled,
+            linvel: [...linvel], angvel: [...angvel], linearDamping: 0.02, angularDamping: 0.15, enabled,
         });
         this.group = new THREE.Group();
         this.group.position.set(origin[0] + _v.x, origin[1] + _v.y, origin[2] + _v.z);

@@ -533,9 +533,10 @@ export function gridBoxes(g, res = 2, shrink = 0.02) {
 }
 
 /** Most collider boxes for a body: every box is a box-mesh contact pair against the terrain, the bulk of a
- *  physics step with debris about (tools/test/fracturecost.mjs). Detached islands 12, fracture pieces 4 (2 when
- *  small, under ~6 m³). */
-export function maxBoxesFor(count, generation = 0) { return generation > 0 ? (count < 400 ? 2 : 4) : 12; }
+ *  physics step with debris about (tools/test/fracturecost.mjs). Detached islands 24, fracture pieces 8 (4 when
+ *  small, under ~6 m³): coarser boxes sit visibly off the surface, so pieces rest on each other at odd heights and
+ *  shift when one is stamped into the (exact) terrain. */
+export function maxBoxesFor(count, generation = 0) { return generation > 0 ? (count < 400 ? 4 : 8) : 24; }
 /** The collider boxes VoxelBody uses for a grid: the finest resolution (by size) that needs at most `maxBoxes`
  *  boxes (maxBoxesFor). Empty when the grid is too thin for boxes (VoxelBody falls back to a convex hull). */
 export function colliderBoxes(g, count, generation = 0, maxBoxes = maxBoxesFor(count, generation)) {

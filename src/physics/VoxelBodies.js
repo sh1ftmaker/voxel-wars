@@ -820,6 +820,15 @@ export class VoxelBodies {
         vb.body.setBodyType(BodyType.Fixed, false);
         vb.stamping = true;
         vb.stampKeys = null;
+        // settled pieces touching it are stamped with it: one resting on it would otherwise move from its collider
+        // boxes onto the exact terrain surface (or the other way round) and shift
+        const [mn, mx] = vb.worldBox();
+        for(const o of this.list) {
+            if(o === vb || o.stamping || o.dead || o.fracturing || !o.body.isDynamic() || o.prop.userData.held || !this.isOwner(o)) continue;
+            if(!(o.body.isSleeping() || o.still > 0.3)) continue;
+            const [a, b] = o.worldBox();
+            if(a[0] < mx[0] + 0.3 && b[0] > mn[0] - 0.3 && a[1] < mx[1] + 0.3 && b[1] > mn[1] - 0.3 && a[2] < mx[2] + 0.3 && b[2] > mn[2] - 0.3) this.stamp(o);
+        }
         const remote = this.world.remote;
         if(remote) {
             const g = vb.grid, t = vb.gridOrigin(), q = vb.rotation();
