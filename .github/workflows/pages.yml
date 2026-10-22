@@ -1,7 +1,7 @@
 name: Deploy to GitHub Pages
 on:
   push:
-    branches: [main, materials, sph, mpm]
+    branches: [main, materials, sph, mpm, rapier]
   workflow_dispatch:
 permissions:
   contents: read
@@ -31,11 +31,11 @@ jobs:
           assemble() {
             mkdir -p "$2"
             cp -r "$1"/index.html "$1"/dist "$1"/assets "$2"/
-            mkdir -p "$2"/vendor/box3d && cp "$1"/vendor/box3d/*.wasm "$2"/vendor/box3d/
+            if [ -d "$1"/vendor/box3d ]; then mkdir -p "$2"/vendor/box3d && cp "$1"/vendor/box3d/*.wasm "$2"/vendor/box3d/; fi
             rm -f "$2"/dist/*.map
           }
           build main && assemble main _site
-          for b in materials sph mpm; do
+          for b in materials sph mpm rapier; do
             git clone --depth 1 -b "$b" "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$b" || continue
             build "$b" && assemble "$b" _site/"$b"
           done
