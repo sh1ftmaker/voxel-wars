@@ -43,6 +43,7 @@ export class Fluid {
         this.label = 'off';
         const params = ctx.params;
         if(params.get('fluid') === '0') { this.label = 'off (?fluid=0)'; return; }
+        const t0 = performance.now();
         const gpu = ctx.renderer.backend?.isWebGPUBackend && params.get('fluidCpu') !== '1';
         const base = gpu ? GPU_SETTINGS : CPU_SETTINGS;
         this.settings = { ...base, iterations: +(params.get('fluidIters') || base.iterations), substeps: +(params.get('fluidSub') || base.substeps) };
@@ -73,7 +74,7 @@ export class Fluid {
 
         this.sources = FLUID_SOURCES.map(src => ({ ...src, count: this.fillSource(src) }));
         this.persistent = this.ring = this.sim.extent;
-        console.log(`fluid: ${this.label}, ${this.sim.extent} particles of ${this.settings.spacing} m (${this.sources.map(s => `${s.kind} ${s.count}`).join(', ')}; cap ${this.cap}), ${this.pages.capacity} SDF pages`);
+        console.log(`fluid: ${this.label}, ${this.sim.extent} particles of ${this.settings.spacing} m (${this.sources.map(s => `${s.kind} ${s.count}`).join(', ')}; cap ${this.cap}), ${this.pages.capacity - this.pages.free.length} of ${this.pages.capacity} SDF pages, ${(performance.now() - t0).toFixed(0)} ms`);
 
         world.onChange((r) => this._onWorldChange(r));
         ctx.destruction?.editHooks?.push((e) => this._onEdit(e));

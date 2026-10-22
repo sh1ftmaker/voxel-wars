@@ -101,6 +101,13 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   with a sag in its soft layer. Only components under the edit's footprint are checked, within 18 m of it (~10 ms in
   the worker). Blowing one end off the bridge drops the span; the untouched level never collapses.
   Tests: `tools/test/structure.mjs` (node: level sweep, bridge, ledges), `collapse.mjs` (browser: bridge, throw).
+- **SPH fluid** (`src/fluid`, `ctx.fluid`, `?fluid=0` off; docs/SPH.md): Position Based Fluids water in the water
+  towers' tanks and lava over the lava basins. WebGPU: compute shaders (32k particles of 0.2 m, ~0.6-1.6 ms GPU at
+  the cap on an RTX 4090), never read back; WebGL2 / `?fluidCpu=1`: the same solver in a worker (4k of 0.3 m).
+  Collides with the whole level's SDF held as pages (the dense chunks, updated from `world.onChange`), so a breached
+  tank spills; bodies and actors push it (proxies); blasts kick it (edit hooks). Sleeps when calm. Drawn as a
+  screen-space surface (`?fluidRender=sprites`: sphere impostors). Local and cosmetic. Tests: `tools/test/sph.mjs`
+  (node: dam breaks on the CPU solver), `sphgame.mjs` (browser: breach a tower, fps, GPU time, `--webgl`).
 - **Profiling**: `node tools/profile.mjs "<url>" <seconds> --scenario idle|blasts|topple|dig|game [--cpu] [--under fn]`
   reports frame interval and main-thread CPU per frame (p50/p99/max) with a per-section breakdown. Headless Chromium
   uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its
