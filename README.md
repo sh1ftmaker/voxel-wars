@@ -32,5 +32,6 @@ then point the game at it with `?server=wss://voxel-wars.<your subdomain>.worker
 `?room=test&local=1` makes a room of browser tabs without any server. Test: `node tools/test/mp.mjs` (three players,
 each in its own headless browser; `node tools/test/mp.mjs <page url> deployed` goes through the deployed server).
 
-See `docs/ARCHITECTURE.md`. The Twin Forts level, textures (Poly Haven, CC0) and game design come from
+See `docs/ARCHITECTURE.md`. `?mpm=1` turns on the granular ground (sand, snow and dirt that pour and slump when
+blasted or undercut; `docs/MPM.md`). The Twin Forts level, textures (Poly Haven, CC0) and game design come from
 [WorldParty](https://github.com/zalo/WorldParty) (MIT).

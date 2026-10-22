@@ -101,6 +101,13 @@ Target: 240 fps, so no frame may spend more than ~2-3 ms of main-thread CPU on g
   with a sag in its soft layer. Only components under the edit's footprint are checked, within 18 m of it (~10 ms in
   the worker). Blowing one end off the bridge drops the span; the untouched level never collapses.
   Tests: `tools/test/structure.mjs` (node: level sweep, bridge, ledges), `collapse.mjs` (browser: bridge, throw).
+- **Granular ground** (`src/mpm`, `?mpm=1`, docs/MPM.md): sand, snow, dirt and lava that pour and slump, simulated
+  with PB-MPM (Lewin 2024) in local zones (48 x 32 x 48 nodes at 0.25 m, 4 slots): WebGPU compute (`MpmGPU`) or a
+  worker on WebGL2 (`MpmCPU`), one instanced draw for every grain (`GrainRenderer`). A carve near granular matter
+  carries `grains` options; the terrain worker cuts the voxels that can no longer hold out of the terrain in the same
+  edit (deterministic, `reply.grains`), every client simulates them locally, and once they rest the host submits a
+  `'deposit'` edit (`TerrainCore 'deposit'`) that puts them back. Tests: `tools/test/mpm.mjs` (node),
+  `mpmgpu.mjs` (the GPU solver on Dawn), `mpmgame.mjs` (browser).
 - **Profiling**: `node tools/profile.mjs "<url>" <seconds> --scenario idle|blasts|topple|dig|game [--cpu] [--under fn]`
   reports frame interval and main-thread CPU per frame (p50/p99/max) with a per-section breakdown. Headless Chromium
   uses SwiftShader (no GPU), so frame intervals and render cost are not representative; main-thread CPU is. Its
@@ -118,7 +125,8 @@ checks repair drift. Steps 1-2 (this) make every terrain change an entry in one 
   it and sends it to everyone; every client applies edits strictly in seq order through its terrain worker. Kinds:
   `brush` (carve / blast / drill / build / rip with `lift`; islands and structural collapses follow from it
   deterministically in the worker), `stamp` (settled body: the owner's grid at the owner's pose), `samples`
-  (soft-ground bakes, host only), transient `bsplit` (a body's fracture, replayed seeded on other clients), `mark`
+  (soft-ground bakes, host only), `deposit` (settled grains back into the terrain, host only: src/mpm), transient
+  `bsplit` (a body's fracture, replayed seeded on other clients), `mark`
   (hash check / snapshot point) and `resync`.
 - Transports (`src/net/transports.js`, picked in `src/net/index.js`): `LocalTransport` (single player, synchronous:
   nothing changes), `?loopback=latency,jitter` (in-page fake server through the codec), `?room=name`

@@ -7,13 +7,15 @@
  *   - frame interval (median, p95) while the grains move, the mpm system's main-thread time per frame, the solver's
  *     time per step (worker), draw calls and triangles
  *   - busy: three slides at once (three zones) in the overview and the midfield: frame interval against idle
+ *   - --mp: two tabs in a room: both cut the same grains, only the host deposits, the terrain ends the same in both;
+ *     a host without the simulation puts a guest's grains straight back
  *   - no console errors
  * Screenshots before, during (0.25 s, 0.6 s, 1.2 s) and after -> <outDir>/mpm-<scenario>-*.png
  *
  * Backend: Chromium's WebGL2 on the real GPU (the flags of leveltour.mjs), so the CPU-worker solver runs here. Headless
  * Chromium's WebGPU is SwiftShader, whose device is lost within seconds even with MPM off; the GPU solver and its
  * draw path are tested on a real GPU by tools/test/mpmgpu.mjs (Dawn in Node).
- * node tools/test/mpmgame.mjs [outDir] [--url http://127.0.0.1:5180/] [--only dune,snow,avalanche,busy] [--uncapped]
+ * node tools/test/mpmgame.mjs [outDir] [--url http://127.0.0.1:5180/] [--only dune,snow,avalanche,busy] [--uncapped] [--mp]
  */
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
@@ -135,6 +137,46 @@ if(!only || only.includes('busy')) {
         check(res[name].pouring.p95 < 20, `busy ${name}: frames held with three zones (median ${res[name].pouring.med} ms, p95 ${res[name].pouring.p95} ms; idle ${res[name].idle.med} ms)`);
     }
     report.push({ name: 'busy', ...res });
+}
+// ---- multiplayer (--mp): two tabs in a room (BroadcastChannel, src/net). The guest blasts the dune: both tabs cut
+// the same grains and simulate them, only the host deposits, and the tabs end with the same terrain. Then a host
+// without the simulation (?mpm=0) and a guest with it: the host puts the grains straight back.
+if(args.includes('--mp')) {
+    for(const [hostMpm, label] of [['1', 'host and guest simulate'], ['0', 'host without the simulation']]) {
+        const room = `mpm${Date.now() % 100000}`;
+        const open = async (q, name) => {
+            const p = await browser.newPage();
+            await p.setViewport({ width: 640, height: 360 });
+            p.on('pageerror', e => errors.push(`${name}: ${e.message}`));
+            p.on('console', m => { if(m.type() === 'error') errors.push(`${name}: ${m.text()}`); });
+            await p.goto(`${base}?room=${room}&local=1&fly=1&bots=0&music=0${q}`);
+            await p.waitForFunction(() => window.ctx && document.getElementById('loading')?.style.display === 'none', { timeout: 300000 });
+            return p;
+        };
+        const host = await open(`&mpm=${hostMpm}`, 'host');
+        await new Promise(r => setTimeout(r, 1500));
+        const guest = await open('&mpm=1', 'guest');
+        await new Promise(r => setTimeout(r, 2500));
+        const roles = await Promise.all([host, guest].map(p => p.evaluate(() => ctx.net.isHost)));
+        await guest.evaluate(() => { ctx.camera.position.set(-8, 3.6, -11.5); ctx.camera.lookAt(-14.5, 0.2, -17.5); ctx.destruction.blast([-14.1, 1.0, -17.1], 1.4, { strength: 14 }); });
+        await host.bringToFront(); // a background tab gets no frames: the host must be the visible one to simulate
+        const st = (p) => p.evaluate(() => ({ zones: ctx.mpm.zones.filter(Boolean).length, spawned: ctx.mpm.stats.spawned, deposits: ctx.mpm.stats.deposits, applied: ctx.mpm.stats.depositsApplied, seq: ctx.net.applied, pending: ctx.world.remote.pending }));
+        let a, b;
+        for(let i = 0; i < 120; i++) {
+            await new Promise(r => setTimeout(r, 250));
+            [a, b] = await Promise.all([st(host), st(guest)]);
+            // (the guest, a background tab here, gets no frames: it drops its particles when it is shown again)
+            if(a.applied > 0 && b.applied > 0 && !a.zones && a.seq === b.seq && !a.pending && !b.pending) break;
+        }
+        const hs = await Promise.all([host, guest].map(p => p.evaluate(async () => [...(await ctx.net.hashNow())])));
+        const ref = new Map(hs[0]), differ = hs[1].filter(([k, v]) => ref.get(k) !== v).length;
+        console.log(`mp (${label}): host ${JSON.stringify(a)} guest ${JSON.stringify(b)}`);
+        check(roles[0] && !roles[1], `mp (${label}): the first tab hosts`);
+        check(b.spawned > 0 && (hostMpm === '0' || a.spawned > 0), `mp (${label}): grains on ${hostMpm === '0' ? 'the guest' : 'both tabs'} (host ${a.spawned}, guest ${b.spawned})`);
+        check(a.deposits === 1 && b.deposits === 0 && a.applied === 1 && b.applied === 1, `mp (${label}): only the host deposited, both applied it`);
+        check(differ === 0 && ref.size > 0, `mp (${label}): the same terrain in both tabs (${differ} of ${ref.size} chunk hashes differ)`);
+        await host.close(); await guest.close();
+    }
 }
 check(errors.length === 0, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
 fs.writeFileSync(`${out}/mpmgame.json`, JSON.stringify({ backend, report }, null, 1));

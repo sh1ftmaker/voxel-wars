@@ -269,7 +269,9 @@ export class Mpm {
             w[q] = packW(0, 3, g.mat[k]); // one particle per voxel
         }
         const patch = depositPatch(pos, w);
-        if(patch) this.ctx.net.submit({ k: 'deposit', patch: wire(patch), seqs });
+        if(!patch) return;
+        this.stats.deposits++;
+        this.ctx.net.submit({ k: 'deposit', patch: wire(patch), seqs });
     }
 
     /** Every client, in edit order: the terrain takes the deposit; the zones it came from go when remeshed. */
