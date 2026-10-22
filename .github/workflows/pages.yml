@@ -1,7 +1,7 @@
 name: Deploy to GitHub Pages
 on:
   push:
-    branches: [main, materials]
+    branches: [main, materials, sph, mpm, rapier]
   workflow_dispatch:
 permissions:
   contents: read
@@ -17,29 +17,28 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      # one site: main at the root, the experimental `materials` branch under /materials/
+      # one site: main at the root, each experimental branch that exists under /<branch>/
       - uses: actions/checkout@v4
         with:
           ref: main
           path: main
-      - uses: actions/checkout@v4
-        with:
-          ref: materials
-          path: materials
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Build both branches
+      - name: Build main and the experimental branches
         run: |
           build() { (cd "$1" && for i in 1 2 3; do npm ci && break; sleep 15; done && node tools/build.mjs --minify); }
           assemble() {
             mkdir -p "$2"
             cp -r "$1"/index.html "$1"/dist "$1"/assets "$2"/
-            mkdir -p "$2"/vendor/box3d && cp "$1"/vendor/box3d/*.wasm "$2"/vendor/box3d/
+            if [ -d "$1"/vendor/box3d ]; then mkdir -p "$2"/vendor/box3d && cp "$1"/vendor/box3d/*.wasm "$2"/vendor/box3d/; fi
             rm -f "$2"/dist/*.map
           }
           build main && assemble main _site
-          build materials && assemble materials _site/materials
+          for b in materials sph mpm rapier; do
+            git clone --depth 1 -b "$b" "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" "$b" || continue
+            build "$b" && assemble "$b" _site/"$b"
+          done
           touch _site/.nojekyll
       - uses: actions/upload-pages-artifact@v3
       - id: deployment
