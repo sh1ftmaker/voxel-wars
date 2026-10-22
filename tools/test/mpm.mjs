@@ -99,6 +99,21 @@ const dirt = columnCollapse(1, 'dirt column');
 check(dirt.sn.nan === 0 && dirt.sn.out === 0, 'dirt: no NaNs, inside');
 check(dirt.rep.angle >= sand.rep.angle - 2, `dirt stands at least as steep as sand (${dirt.rep.angle.toFixed(1)} vs ${sand.rep.angle.toFixed(1)} deg)`);
 
+// ---- 1b. the CPU fallback's cost at its cap (2 iterations, as the WebGL2 path runs it)
+{
+    const { CPU_CAP } = await import('../../src/mpm/params.js');
+    const s = new MpmSolverCPU({ cap: CPU_CAP });
+    s.knobs.iterations = 2;
+    flatZone(s, 4);
+    const side = Math.floor(Math.cbrt(CPU_CAP / 8));
+    const { pos, mats } = boxParticles([24 - side, 4, 24 - side], [24 + side, 4 + Math.floor(CPU_CAP / 8 / (4 * side * side)), 24 + side], 3);
+    s.spawn(0, pos, null, mats, 0);
+    let ms = 0;
+    for(let f = 0; f < 90; f++) { const t0 = performance.now(); s.step(1 / 60); if(f >= 30) ms += performance.now() - t0; }
+    console.log(`CPU fallback: ${s.n} particles (cap ${CPU_CAP}), 2 iterations: ${(ms / 60).toFixed(2)} ms/step`);
+    check(ms / 60 < 16, `the CPU fallback keeps up with 60 Hz in its worker at the cap (${(ms / 60).toFixed(1)} ms/step)`);
+}
+
 // ---- 2. snow block dropped from 1.5 m
 {
     const s = new MpmSolverCPU({ cap: 8192 });
@@ -180,7 +195,7 @@ if(!args.includes('--quick')) {
         const rd = s.read(0);
         const dropped = dropStranded(rd.pos, lo, w);
         if(dropped) console.log(`${name}: ${dropped} particles ran out of the zone and drop to the ground`);
-        const patch = depositPatch(rd.pos, rd.w);
+        const patch = depositPatch(rd.pos, rd.w, { solidAt: (x, y, z) => w.get(x, y, z) < 0 });
         core.handle({ type: 'deposit', patch });
         const after = solidVol(loM, hiZ);
         const lost = before - (after - afterCarve) - afterCarve;
@@ -188,6 +203,27 @@ if(!args.includes('--quick')) {
         const back = (after - afterCarve) / grainVol;
         check(back > 0.6 && back < 1.4, `${name}: the deposit restores the grains' volume (${(back * 100).toFixed(0)}%)`);
     }
+}
+
+// ---- 6. multiplayer: the grain carve and the deposit are deterministic (two cores, the same edits, the same chunks)
+if(!args.includes('--quick')) {
+    const { TerrainCore } = await import('../../src/voxel/TerrainCore.js');
+    const { rock } = await import('../../src/voxel/brushes.js');
+    const { depositPatch } = await import('../../src/mpm/grains.js');
+    const cores = [new TerrainCore(), new TerrainCore()];
+    for(const c of cores) c.handle({ type: 'init' });
+    const c = [-14.1, 0.6, -17.1], spec = rock(c, 1.4, 5).spec;
+    const reps = cores.map(core => core.handle({ type: 'brush', spec, op: 'carve', mat: 1, hardness: true, conn: true, erode: 0, debris: 16, grains: { c, r: 1.4, blast: true } }).reply);
+    const same = reps[0].grains.count === reps[1].grains.count && reps[0].grains.idx.every((v, i) => v === reps[1].grains.idx[i]);
+    check(same, `the same grains on two clients (${reps[0].grains.count})`);
+    // the host's deposit (any particle positions) applied on both
+    const g = reps[0].grains, pos = new Float32Array(g.count * 3), w = new Int32Array(g.count);
+    for(let n = 0; n < g.count; n++) { pos[n * 3] = g.idx[n * 3] * H + 0.3; pos[n * 3 + 1] = g.idx[n * 3 + 1] * H - 0.2; pos[n * 3 + 2] = g.idx[n * 3 + 2] * H; w[n] = (3 << 5) | g.mat[n]; }
+    const patch = depositPatch(pos, w);
+    for(const core of cores) core.handle({ type: 'deposit', patch });
+    const h = cores.map(core => new Map(core.hashes()));
+    let diff = 0; for(const [k, v] of h[0]) if(h[1].get(k) !== v) diff++;
+    check(diff === 0, `the same terrain on two clients after the grains and the deposit (${diff} chunks differ)`);
 }
 
 function components(s, r) {

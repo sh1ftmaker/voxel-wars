@@ -54,7 +54,7 @@ function column(side, height, seed = 7) {
     return { pos: Float32Array.from(pos), vel: null, mats: Uint8Array.from(mats), ppcLog: 0 };
 }
 const spawnOpts = { dt, gravity: P.GRAVITY, H: P.H, packW: P.packW, isSnow: () => false };
-const globals = (sim) => sim.setGlobals({ gstep: P.GRAVITY * dt * dt / P.H, restD: 0.12 * dt / P.H, relaxScale: 1, restFrames: 20, vscale: dt / P.H });
+const globals = (sim) => sim.setGlobals({ gstep: P.GRAVITY * dt * dt / P.H, restD: 0.12 * dt / P.H, relaxScale: 1, restFrames: 20, vscale: dt / P.H, maxStep: 1 });
 
 // ---- 1. timings
 const results = [];

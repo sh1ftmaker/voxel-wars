@@ -33,21 +33,27 @@ export const SAND = 0, SNOW = 1, VISCO = 2;
  *   thetaC/S  snow: critical compression / stretch (Stomakhin)    xi: hardening    yield: visco stretch limit
  *   wall      Coulomb friction against the terrain and the zone walls
  *   density   relative particle mass (kg/m³ / 1000)
+ *   minStretch  the smallest stretch F keeps (the reference's safety clamp is 0.1); sand forgets compression past
+ *             it (a hard landing compacts instead of storing a rebound)
+ *   flow      free-flowing (sand, snow): any carve (a dig too) releases what is steeper than its angle of repose or
+ *             undercut, and the failure runs up the slope. Cohesive ground (dirt, grass, lava; flow false) only lets
+ *             go of a blast's lip and the steepest of what that exposes: tunnels and dug walls in dirt hold
  */
 export const GRANULAR = {
-    3: { model: SAND, friction: 33, cohesion: 0,     relax: 0.9, visc: 0.02, alpha: 1,    wall: 0.6, density: 1.7 }, // sand
-    1: { model: SAND, friction: 40, cohesion: 0.01,  relax: 0.9, visc: 0.04, alpha: 1,    wall: 0.8, density: 1.6 }, // dirt
-    2: { model: SAND, friction: 40, cohesion: 0.01,  relax: 0.9, visc: 0.04, alpha: 1,    wall: 0.8, density: 1.6 }, // grass (its dirt)
-    4: { model: SNOW, friction: 38, relax: 0.8, visc: 0.02, alpha: 0.9, thetaC: 0.025, thetaS: 0.0075, xi: 10, wall: 0.7, density: 0.5 }, // snow
+    3: { model: SAND, friction: 33, cohesion: 0,     relax: 0.9, visc: 0.02, alpha: 1,    wall: 0.6, density: 1.7, minStretch: 0.8, flow: true }, // sand
+    1: { model: SAND, friction: 40, cohesion: 0.01,  relax: 0.9, visc: 0.04, alpha: 1,    wall: 0.8, density: 1.6, minStretch: 0.8 }, // dirt
+    2: { model: SAND, friction: 40, cohesion: 0.01,  relax: 0.9, visc: 0.04, alpha: 1,    wall: 0.8, density: 1.6, minStretch: 0.8 }, // grass (its dirt)
+    4: { model: SNOW, friction: 38, relax: 0.8, visc: 0.02, alpha: 0.9, thetaC: 0.025, thetaS: 0.0075, xi: 10, wall: 0.7, density: 0.5, flow: true }, // snow
     7: { model: VISCO, friction: 20, relax: 0.6, visc: 0.15, alpha: 0.5, yield: 0.06, wall: 0.4, density: 3.0 }, // lava
 };
 export const isGranular = (m) => GRANULAR[m] !== undefined;
+export const isFlowing = (m) => !!GRANULAR[m]?.flow;
 
 /** Per-material parameters as a flat table: 4 vec4 per material id (0..15), for the GPU and the CPU solver.
  *  row 0: (model, alphaDP (Drucker-Prager cone), cohesion, relax)
  *  row 1: (visc, alpha, thetaC, thetaS)
  *  row 2: (xi, yield (log), wall friction, density)
- *  row 3: (granular 0/1, -, -, -) */
+ *  row 3: (granular 0/1, minStretch, -, -) */
 export const MAT_ROWS = 4;
 export function materialTable() {
     const t = new Float32Array(16 * MAT_ROWS * 4);
@@ -59,7 +65,7 @@ export function materialTable() {
         t.set([g.model, alphaDP, g.cohesion || 0, g.relax], o);
         t.set([g.visc, g.alpha, g.thetaC || 0, g.thetaS || 0], o + 4);
         t.set([g.xi || 0, g.yield || 0, g.wall, g.density], o + 8);
-        t.set([GRANULAR[m] ? 1 : 0, 0, 0, 0], o + 12);
+        t.set([GRANULAR[m] ? 1 : 0, g.minStretch ?? 0.1, 0, 0], o + 12);
     }
     return t;
 }
@@ -71,6 +77,7 @@ export const DEFAULT_KNOBS = {
     relaxScale: 1,      // multiplies every material's relax
     restSpeed: 0.12,    // m/s: below this a particle counts as at rest
     restFrames: 20,     // substeps at rest before a particle counts as settled
+    maxStep: 1,         // cells a particle may move per substep (CFL clamp)
 };
 
 /** Particle position word: pos.w packs the slot, the particles-per-voxel level and the material (-1: dead). */

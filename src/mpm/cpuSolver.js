@@ -30,41 +30,63 @@ const SNOW_JMIN = 0.6; // snow packs to 60% of its volume at most
 
 /** SVD of a 3x3 row-major matrix through the Jacobi eigen-decomposition of F^T F (4 cyclic sweeps): F = U diag(S) V^T,
  *  U and V rotations (S[2] carries the sign of det F). */
-export function svd3(F, U, S, V, A = M3()) {
-    for(let r = 0; r < 3; r++) for(let c = 0; c < 3; c++) A[r * 3 + c] = F[r] * F[c] + F[3 + r] * F[3 + c] + F[6 + r] * F[6 + c];
-    V.fill(0); V[0] = V[4] = V[8] = 1;
-    for(let sweep = 0; sweep < 4; sweep++) for(let pq = 0; pq < 3; pq++) {
-        const p = pq === 2 ? 1 : 0, q = pq === 0 ? 1 : 2;
-        const apq = A[p * 3 + q];
-        if(Math.abs(apq) < 1e-20) continue;
-        const theta = (A[q * 3 + q] - A[p * 3 + p]) / (2 * apq);
-        const t = (theta >= 0 ? 1 : -1) / (Math.abs(theta) + Math.sqrt(theta * theta + 1));
-        const c = 1 / Math.sqrt(t * t + 1), s = t * c;
-        for(let k = 0; k < 3; k++) { const kp = A[k * 3 + p], kq = A[k * 3 + q]; A[k * 3 + p] = c * kp - s * kq; A[k * 3 + q] = s * kp + c * kq; }
-        for(let k = 0; k < 3; k++) { const pk = A[p * 3 + k], qk = A[q * 3 + k]; A[p * 3 + k] = c * pk - s * qk; A[q * 3 + k] = s * pk + c * qk; }
-        for(let k = 0; k < 3; k++) { const kp = V[k * 3 + p], kq = V[k * 3 + q]; V[k * 3 + p] = c * kp - s * kq; V[k * 3 + q] = s * kp + c * kq; }
+export function svd3(F, U, S, V) {
+    // A = F^T F (symmetric: 6 values), V = I; cyclic Jacobi rotations in scalars
+    let a00 = F[0] * F[0] + F[3] * F[3] + F[6] * F[6], a11 = F[1] * F[1] + F[4] * F[4] + F[7] * F[7], a22 = F[2] * F[2] + F[5] * F[5] + F[8] * F[8];
+    let a01 = F[0] * F[1] + F[3] * F[4] + F[6] * F[7], a02 = F[0] * F[2] + F[3] * F[5] + F[6] * F[8], a12 = F[1] * F[2] + F[4] * F[5] + F[7] * F[8];
+    let v00 = 1, v01 = 0, v02 = 0, v10 = 0, v11 = 1, v12 = 0, v20 = 0, v21 = 0, v22 = 1;
+    for(let sweep = 0; sweep < 4; sweep++) {
+        if(a01 > 1e-20 || a01 < -1e-20) {
+            const th = (a11 - a00) / (2 * a01), t = (th >= 0 ? 1 : -1) / ((th >= 0 ? th : -th) + Math.sqrt(th * th + 1));
+            const c = 1 / Math.sqrt(t * t + 1), s = t * c, rp = a02, rq = a12;
+            a00 -= t * a01; a11 += t * a01; a01 = 0; a02 = c * rp - s * rq; a12 = s * rp + c * rq;
+            { const vp = v00, vq = v01; v00 = c * vp - s * vq; v01 = s * vp + c * vq; }
+            { const vp = v10, vq = v11; v10 = c * vp - s * vq; v11 = s * vp + c * vq; }
+            { const vp = v20, vq = v21; v20 = c * vp - s * vq; v21 = s * vp + c * vq; }
+        }
+        if(a02 > 1e-20 || a02 < -1e-20) {
+            const th = (a22 - a00) / (2 * a02), t = (th >= 0 ? 1 : -1) / ((th >= 0 ? th : -th) + Math.sqrt(th * th + 1));
+            const c = 1 / Math.sqrt(t * t + 1), s = t * c, rp = a01, rq = a12;
+            a00 -= t * a02; a22 += t * a02; a02 = 0; a01 = c * rp - s * rq; a12 = s * rp + c * rq;
+            { const vp = v00, vq = v02; v00 = c * vp - s * vq; v02 = s * vp + c * vq; }
+            { const vp = v10, vq = v12; v10 = c * vp - s * vq; v12 = s * vp + c * vq; }
+            { const vp = v20, vq = v22; v20 = c * vp - s * vq; v22 = s * vp + c * vq; }
+        }
+        if(a12 > 1e-20 || a12 < -1e-20) {
+            const th = (a22 - a11) / (2 * a12), t = (th >= 0 ? 1 : -1) / ((th >= 0 ? th : -th) + Math.sqrt(th * th + 1));
+            const c = 1 / Math.sqrt(t * t + 1), s = t * c, rp = a01, rq = a02;
+            a11 -= t * a12; a22 += t * a12; a12 = 0; a01 = c * rp - s * rq; a02 = s * rp + c * rq;
+            { const vp = v01, vq = v02; v01 = c * vp - s * vq; v02 = s * vp + c * vq; }
+            { const vp = v11, vq = v12; v11 = c * vp - s * vq; v12 = s * vp + c * vq; }
+            { const vp = v21, vq = v22; v21 = c * vp - s * vq; v22 = s * vp + c * vq; }
+        }
     }
+    V[0] = v00; V[1] = v01; V[2] = v02; V[3] = v10; V[4] = v11; V[5] = v12; V[6] = v20; V[7] = v21; V[8] = v22;
     // U columns: u0 = F v0 / |F v0|, u1 = the part of F v1 orthogonal to u0, u2 = u0 x u1; sigma_i = u_i . F v_i
-    const fv = (i, o) => { for(let r = 0; r < 3; r++) o[r] = F[r * 3] * V[i] + F[r * 3 + 1] * V[3 + i] + F[r * 3 + 2] * V[6 + i]; };
-    const a = [0, 0, 0], b = [0, 0, 0], e = [0, 0, 0];
-    fv(0, a); fv(1, b); fv(2, e);
-    let l = Math.hypot(a[0], a[1], a[2]);
-    const u0 = l > 1e-12 ? [a[0] / l, a[1] / l, a[2] / l] : [V[0], V[3], V[6]];
+    const a0 = F[0] * V[0] + F[1] * V[3] + F[2] * V[6], a1 = F[3] * V[0] + F[4] * V[3] + F[5] * V[6], a2 = F[6] * V[0] + F[7] * V[3] + F[8] * V[6];
+    const b0 = F[0] * V[1] + F[1] * V[4] + F[2] * V[7], b1 = F[3] * V[1] + F[4] * V[4] + F[5] * V[7], b2 = F[6] * V[1] + F[7] * V[4] + F[8] * V[7];
+    const e0 = F[0] * V[2] + F[1] * V[5] + F[2] * V[8], e1 = F[3] * V[2] + F[4] * V[5] + F[5] * V[8], e2 = F[6] * V[2] + F[7] * V[5] + F[8] * V[8];
+    let l = Math.sqrt(a0 * a0 + a1 * a1 + a2 * a2);
+    let x0, x1, x2;
+    if(l > 1e-12) { x0 = a0 / l; x1 = a1 / l; x2 = a2 / l; } else { x0 = V[0]; x1 = V[3]; x2 = V[6]; }
     S[0] = l;
-    const pr = u0[0] * b[0] + u0[1] * b[1] + u0[2] * b[2];
-    let u1 = [b[0] - pr * u0[0], b[1] - pr * u0[1], b[2] - pr * u0[2]];
-    l = Math.hypot(u1[0], u1[1], u1[2]);
-    if(l > 1e-12) u1 = [u1[0] / l, u1[1] / l, u1[2] / l];
+    const pr = x0 * b0 + x1 * b1 + x2 * b2;
+    let y0 = b0 - pr * x0, y1 = b1 - pr * x1, y2 = b2 - pr * x2;
+    l = Math.sqrt(y0 * y0 + y1 * y1 + y2 * y2);
+    if(l > 1e-12) { y0 /= l; y1 /= l; y2 /= l; }
     else { // any unit vector orthogonal to u0
-        const k = Math.abs(u0[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0];
-        u1 = [u0[1] * k[2] - u0[2] * k[1], u0[2] * k[0] - u0[0] * k[2], u0[0] * k[1] - u0[1] * k[0]];
-        const m = Math.hypot(u1[0], u1[1], u1[2]); u1 = [u1[0] / m, u1[1] / m, u1[2] / m];
+        const k0 = Math.abs(x0) < 0.9 ? 1 : 0, k1 = 1 - k0;
+        y0 = x1 * 0 - x2 * k1; y1 = x2 * k0 - x0 * 0; y2 = x0 * k1 - x1 * k0;
+        const m = Math.sqrt(y0 * y0 + y1 * y1 + y2 * y2); y0 /= m; y1 /= m; y2 /= m;
     }
-    S[1] = u1[0] * b[0] + u1[1] * b[1] + u1[2] * b[2];
-    const u2 = [u0[1] * u1[2] - u0[2] * u1[1], u0[2] * u1[0] - u0[0] * u1[2], u0[0] * u1[1] - u0[1] * u1[0]];
-    S[2] = u2[0] * e[0] + u2[1] * e[1] + u2[2] * e[2];
-    for(let r = 0; r < 3; r++) { U[r * 3] = u0[r]; U[r * 3 + 1] = u1[r]; U[r * 3 + 2] = u2[r]; }
+    S[1] = y0 * b0 + y1 * b1 + y2 * b2;
+    const z0 = x1 * y2 - x2 * y1, z1 = x2 * y0 - x0 * y2, z2 = x0 * y1 - x1 * y0;
+    S[2] = z0 * e0 + z1 * e1 + z2 * e2;
+    U[0] = x0; U[1] = y0; U[2] = z0; U[3] = x1; U[4] = y1; U[5] = z1; U[6] = x2; U[7] = y2; U[8] = z2;
 }
+
+/** Quadratic B-spline weights of the 3 nodes from the base (f = position - base, in [0.5, 1.5)). */
+function weights(f, w) { const a = 1.5 - f, b = f - 1, c = f - 0.5; w[0] = 0.5 * a * a; w[1] = 0.75 - b * b; w[2] = 0.5 * c * c; }
 
 /** out = U diag(S) V^T */
 function usv(U, S, V, out) {
@@ -179,7 +201,7 @@ export class MpmSolverCPU {
 
     _constraintP2G() {
         const { x, d, F, D, w, pl, mt } = this, T = this.t, rs = this.knobs.relaxScale;
-        const Fp = M3(), Dp = M3();
+        const Fp = M3(), Dp = M3(), wx = new Float64Array(3), wy = new Float64Array(3), wz = new Float64Array(3);
         for(let p = 0; p < this.n; p++) {
             const z = this.zones[w[p] >> 7];
             if(!z) continue;
@@ -192,9 +214,7 @@ export class MpmSolverCPU {
             const px = x[p * 3], py = x[p * 3 + 1], pz = x[p * 3 + 2];
             const bx = Math.floor(px - 0.5), by = Math.floor(py - 0.5), bz = Math.floor(pz - 0.5);
             const fx = px - bx, fy = py - by, fz = pz - bz;
-            const wx = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2];
-            const wy = [0.5 * (1.5 - fy) ** 2, 0.75 - (fy - 1) ** 2, 0.5 * (fy - 0.5) ** 2];
-            const wz = [0.5 * (1.5 - fz) ** 2, 0.75 - (fz - 1) ** 2, 0.5 * (fz - 0.5) ** 2];
+            weights(fx, wx); weights(fy, wy); weights(fz, wz);
             const nx = z.dims[0], nxy = nx * z.dims[1];
             const dx = d[p * 3], dy = d[p * 3 + 1], dz = d[p * 3 + 2];
             for(let c = 0; c < 3; c++) for(let b = 0; b < 3; b++) for(let a = 0; a < 3; a++) {
@@ -215,7 +235,7 @@ export class MpmSolverCPU {
         const Fs = T.Fs, U = T.U, V = T.V, S = T.S, G = T.G, Fi = T.Fi;
         // F* = (I + D) F
         for(let r = 0; r < 3; r++) for(let c = 0; c < 3; c++) Fs[r * 3 + c] = Fp[r * 3 + c] + Dp[r * 3] * Fp[c] + Dp[r * 3 + 1] * Fp[3 + c] + Dp[r * 3 + 2] * Fp[6 + c];
-        svd3(Fs, U, S, V, T.A);
+        svd3(Fs, U, S, V);
         let relax = mt[mo + 3] * rs;
         const alpha = mt[mo + 5];
         if(model === SAND) {
@@ -253,6 +273,7 @@ export class MpmSolverCPU {
     }
 
     _grid(z, dt) {
+        const wallAxis = (idx, n, g) => (idx <= GUARD && g < 0) || (idx >= n - 1 - GUARD && g > 0);
         const [nx, ny, nz] = z.dims, nxy = nx * ny, mom = z.mom, mass = z.mass, phi = z.phi, nrm = z.nrm;
         const mu = z.wall;
         const k = dt / H;
@@ -284,7 +305,6 @@ export class MpmSolverCPU {
                 if(vn < pv) { gx += (pv - vn) * ex; gy += (pv - vn) * ey; gz += (pv - vn) * ez; }
             }
             // the zone's walls (the guardian of the reference): no motion out through them, friction along them
-            const wallAxis = (idx, n, g) => (idx <= GUARD && g < 0) || (idx >= n - 1 - GUARD && g > 0);
             if(wallAxis(i, nx, gx)) { gx = 0; gy *= 1 - mu; gz *= 1 - mu; }
             if(wallAxis(j, ny, gy)) { gy = 0; gx *= 1 - mu; gz *= 1 - mu; }
             if(wallAxis(kk, nz, gz)) { gz = 0; gx *= 1 - mu; gy *= 1 - mu; }
@@ -294,6 +314,7 @@ export class MpmSolverCPU {
 
     _g2p() {
         const { x, d, D, w } = this;
+        const wx = new Float64Array(3), wy = new Float64Array(3), wz = new Float64Array(3), B = new Float64Array(9);
         for(let p = 0; p < this.n; p++) {
             const z = this.zones[w[p] >> 7];
             if(!z) continue;
@@ -301,12 +322,10 @@ export class MpmSolverCPU {
             const px = x[p * 3], py = x[p * 3 + 1], pz = x[p * 3 + 2];
             const bx = Math.floor(px - 0.5), by = Math.floor(py - 0.5), bz = Math.floor(pz - 0.5);
             const fx = px - bx, fy = py - by, fz = pz - bz;
-            const wx = [0.5 * (1.5 - fx) ** 2, 0.75 - (fx - 1) ** 2, 0.5 * (fx - 0.5) ** 2];
-            const wy = [0.5 * (1.5 - fy) ** 2, 0.75 - (fy - 1) ** 2, 0.5 * (fy - 0.5) ** 2];
-            const wz = [0.5 * (1.5 - fz) ** 2, 0.75 - (fz - 1) ** 2, 0.5 * (fz - 0.5) ** 2];
+            weights(fx, wx); weights(fy, wy); weights(fz, wz);
             const nx = z.dims[0], nxy = nx * z.dims[1];
             let dx = 0, dy = 0, dz = 0;
-            const B = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+            B.fill(0);
             for(let c = 0; c < 3; c++) for(let b = 0; b < 3; b++) for(let a = 0; a < 3; a++) {
                 const wt = wx[a] * wy[b] * wz[c];
                 const o = ((bx + a) + (by + b) * nx + (bz + c) * nxy) * 3;
@@ -325,7 +344,7 @@ export class MpmSolverCPU {
     _integrate(dt) {
         const { x, d, F, D, w, pl, rest, mt } = this, T = this.t, kn = this.knobs;
         const U = T.U, V = T.V, S = T.S, Fn = T.Fs;
-        const restD = kn.restSpeed * dt / H, gstep = this.gravity * dt * dt / H;
+        const restD = kn.restSpeed * dt / H, gstep = this.gravity * dt * dt / H, maxStep = kn.maxStep;
         for(let p = 0; p < this.n; p++) {
             const z = this.zones[w[p] >> 7];
             if(!z) continue;
@@ -333,8 +352,11 @@ export class MpmSolverCPU {
             // F = (I + D) F
             const f = p * 9;
             for(let r = 0; r < 3; r++) for(let c = 0; c < 3; c++) Fn[r * 3 + c] = F[f + r * 3 + c] + D[f + r * 3] * F[f + c] + D[f + r * 3 + 1] * F[f + 3 + c] + D[f + r * 3 + 2] * F[f + 6 + c];
-            svd3(Fn, U, S, V, T.A);
-            for(let i = 0; i < 3; i++) S[i] = Math.min(1e4, Math.max(0.1, S[i]));
+            svd3(Fn, U, S, V);
+            // the safety clamp of the reference; sand also forgets compression past minStretch (a hard landing
+            // compacts it instead of storing a rebound)
+            const smin = mt[mo + 13];
+            for(let i = 0; i < 3; i++) S[i] = Math.min(1e4, Math.max(smin, S[i]));
             if(model === SAND) {
                 // Drucker-Prager return mapping in log strain (Klár et al. 2016), with logJp volume memory (PB-MPM)
                 const alphaDP = mt[mo + 1], coh = mt[mo + 2];
@@ -367,6 +389,9 @@ export class MpmSolverCPU {
             // position, rest, gravity for the next step
             const q = p * 3;
             let dx = d[q], dy = d[q + 1], dz = d[q + 2];
+            // CFL: at most maxStep cells per step (a grain faster than the grid can carry piles into the cell ahead)
+            const dl = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if(dl > maxStep) { const k = maxStep / dl; dx *= k; dy *= k; dz *= k; }
             x[q] += dx; x[q + 1] += dy; x[q + 2] += dz;
             rest[p] = dx * dx + dy * dy + dz * dz < restD * restD ? Math.min(65535, rest[p] + 1) : 0;
             // push out of the terrain (most of it is done at the nodes already)
@@ -386,14 +411,15 @@ export class MpmSolverCPU {
         const nx = z.dims[0], nxy = nx * z.dims[1];
         const ix = Math.floor(px), iy = Math.floor(py), iz = Math.floor(pz);
         const tx = px - ix, ty = py - iy, tz = pz - iz;
-        let v = 0; const n = [0, 0, 0];
+        let v = 0; const r = this._phiOut ||= { v: 0, n: [0, 0, 0] }, n = r.n; n[0] = n[1] = n[2] = 0;
         for(let c = 0; c < 2; c++) for(let b = 0; b < 2; b++) for(let a = 0; a < 2; a++) {
             const wt = (a ? tx : 1 - tx) * (b ? ty : 1 - ty) * (c ? tz : 1 - tz), o = (ix + a) + (iy + b) * nx + (iz + c) * nxy;
             v += z.phi[o] * wt; n[0] += z.nrm[o * 3] * wt; n[1] += z.nrm[o * 3 + 1] * wt; n[2] += z.nrm[o * 3 + 2] * wt;
         }
-        const l = Math.hypot(n[0], n[1], n[2]) || 1;
+        const l = Math.sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) || 1;
         n[0] /= l; n[1] /= l; n[2] /= l;
-        return { v, n };
+        r.v = v;
+        return r;
     }
 
     zoneStats(slot) {

@@ -23,7 +23,7 @@
  * Knobs: ctx.mpm.knobs (params.js DEFAULT_KNOBS): substeps, iterations, relaxScale, restSpeed, restFrames.
  */
 import * as THREE from 'three/webgpu';
-import { H, MAX_ZONES, PER_ZONE, CPU_CAP, GRAVITY, DEFAULT_KNOBS, MAX_PROXIES, GRANULAR, isGranular, packW, unpackW, SNOW } from './params.js';
+import { H, ZONE_DIMS, MAX_ZONES, PER_ZONE, CPU_CAP, GRAVITY, DEFAULT_KNOBS, MAX_PROXIES, GRANULAR, isGranular, isFlowing, packW, SNOW } from './params.js';
 import { zoneLo, zoneField, seed, inZone, dropStranded } from './zone.js';
 import { depositPatch } from './grains.js';
 import { readRegion } from '../soft/region.js';
@@ -33,6 +33,9 @@ import { GrainRenderer } from './GrainRenderer.js';
 import { sphere } from '../voxel/brushes.js';
 import { VOXEL } from '../config.js';
 
+const GRASS_AS = { 2: 1 };
+/** A deposit patch as the edit carries it (typed arrays travel raw through the codec). */
+const wire = (p) => ({ lo: p.lo, nx: p.nx, nz: p.nz, y0: p.y0, ny: p.ny, grid: p.grid, gmat: p.gmat, base: p.base, vol: p.vol, mat: p.mat });
 const STATS_EVERY = 12;   // frames between stats readbacks
 const SETTLE = 0.03;      // a zone is at rest when fewer than this share of its particles move
 const MAX_LIFE = 14;      // s: a zone deposits then whatever it holds
@@ -64,8 +67,10 @@ export class Mpm {
                 this.renderer = new GrainRenderer(ctx.scene, { gpu: this.sim });
                 this.sim.warmup();
             } else {
+                // the CPU fallback: 2 iterations (about 9 ms a step at its 6k cap, in its worker)
+                if(!p.get('mpmIters')) this.knobs.iterations = 2;
                 this.sim = new MpmCPU({ cap: CPU_CAP, knobs: this.knobs });
-                this.renderer = new GrainRenderer(ctx.scene, { cap: CPU_CAP });
+                this.renderer = new GrainRenderer(ctx.scene, { cap: CPU_CAP, divisor: !ctx.renderer.backend?.isWebGPUBackend });
                 this.sim.onFrame = ({ buf, n }) => this.renderer.setCPU(buf, n);
             }
         } catch(e) { console.error('mpm: disabled', e); this.enabled = false; return; }
@@ -88,12 +93,13 @@ export class Mpm {
         const r = Math.max(...brush.max.map((v, i) => v - brush.min[i])) / 2;
         if(this._force) { const f = this._force; this._force = null; return { c, r: f.r, force: true }; }
         if(r < 0.3) return null;
-        // any granular matter within reach? a coarse look at the replica
-        const w = this.ctx.world, R = r + 1.5;
+        // granular matter within reach? a coarse look at the replica (a blast: any; a dig: free-flowing only, since
+        // cohesive ground only lets go of a blast's lip)
+        const w = this.ctx.world, R = r + 1.5, blast = kind === 'blast';
         let found = false;
         for(let k = -2; k <= 2 && !found; k++) for(let j = -2; j <= 2 && !found; j++) for(let i = -2; i <= 2 && !found; i++) {
             const x = c[0] + i * R / 2, y = c[1] + j * R / 2, z = c[2] + k * R / 2;
-            if(w.sample(x, y, z) < 0.3 && isGranular(w.materialAt(x, y, z))) found = true;
+            if(w.sample(x, y, z) < 0.3) { const m = w.materialAt(x, y, z); if(blast ? isGranular(m) : isFlowing(m)) found = true; }
         }
         if(!found) return null;
         return { c, r, blast: kind === 'blast', kick: kind === 'blast' ? Math.min(9, 3 + impulse * 0.4) : 0 };
@@ -140,7 +146,8 @@ export class Mpm {
         const room = this.sim.cpu ? this.sim.cap - this.sim.n : PER_ZONE - this.sim.counts[z.slot];
         let ppcLog = 0;
         while(ppcLog < 3 && g.count * (8 >> ppcLog) > room) ppcLog++;
-        const sd = seed(g, z.lo, { ppcLog, c, kick: e.kind === 'blast' ? Math.min(9, 3 + (e.impulse || 0) * 0.4) : 0, rim: e.size + 1.5 });
+        // grass lets go as the dirt under it (turf does not pour)
+        const sd = seed({ ...g, mat: g.mat.map(m => GRASS_AS[m] ?? m) }, z.lo, { ppcLog, c, kick: e.kind === 'blast' ? Math.min(9, 3 + (e.impulse || 0) * 0.4) : 0, rim: e.size + 1.5 });
         const n = this.sim.spawn(z.slot, sd, { dt: 1 / 60, gravity: GRAVITY, H, packW, isSnow: (m) => GRANULAR[m]?.model === SNOW });
         z.count += n; z.quiet = 0; z.born = performance.now();
         this.stats.spawned += n;
@@ -158,7 +165,7 @@ export class Mpm {
         if(!this.enabled) return;
         this.frame++;
         const live = this.zones.some(z => z);
-        if(!live) { if(!this.sim.cpu) this.renderer.setSlots(-1); return; }
+        if(!live) { if(this.sim.cpu) { if(this.renderer.mesh.visible) this.renderer.setCPU(new Float32Array(0), 0); } else this.renderer.setSlots(-1); return; }
         const kn = this.knobs, step = 1 / 60;
         if(this.sim.cpu) {
             const k = JSON.stringify(kn);
@@ -166,7 +173,7 @@ export class Mpm {
             this.sim.setProxies(this._proxies());
             this.stats.stepDispatches = this.sim.step({ dt: step });
         } else {
-            this.sim.setGlobals({ gstep: GRAVITY * (step / kn.substeps) ** 2 / H, restD: kn.restSpeed * (step / kn.substeps) / H, relaxScale: kn.relaxScale, restFrames: kn.restFrames, vscale: step / kn.substeps / H });
+            this.sim.setGlobals({ gstep: GRAVITY * (step / kn.substeps) ** 2 / H, restD: kn.restSpeed * (step / kn.substeps) / H, relaxScale: kn.relaxScale, restFrames: kn.restFrames, vscale: step / kn.substeps / H, maxStep: kn.maxStep });
             this.sim.setProxies(this._proxies());
             this.stats.stepDispatches = this.sim.step({ substeps: kn.substeps, iterations: kn.iterations });
             this.renderer.setSlots(this.sim.maxSlot);
@@ -241,11 +248,14 @@ export class Mpm {
             pos = pos.subarray(0, k * 3); w = w.subarray(0, k);
         }
         const dropped = dropStranded(pos, z.lo, this.ctx.world);
-        const patch = depositPatch(pos, w);
+        // the terrain's solid samples: the zone's field (read once), the world's beyond it
+        const world = this.ctx.world, f = zoneField(world, z.lo, readRegion), [nx, ny, nz] = ZONE_DIMS;
+        const solidAt = (x, y, zz) => { const i = x - z.lo[0], j = y - z.lo[1], k = zz - z.lo[2]; return i >= 0 && j >= 0 && k >= 0 && i < nx && j < ny && k < nz ? f[i + j * nx + k * nx * ny] < 0 : world.get(x, y, zz) < 0; };
+        const patch = depositPatch(pos, w, { solidAt });
         this.stats.lastDeposit = { particles: w.length, dropped, volume: patch?.volume ?? 0, ms: performance.now() - t0 };
         if(!patch) { this._free(z); return; }
         this.stats.deposits++;
-        this.ctx.net.submit({ k: 'deposit', patch: { lo: patch.lo, nx: patch.nx, nz: patch.nz, base: patch.base, vol: patch.vol, mat: patch.mat }, seqs: z.seqs });
+        this.ctx.net.submit({ k: 'deposit', patch: wire(patch), seqs: z.seqs });
     }
 
     /** Host without a zone for them (or the simulation off): the grains go straight back where they were. */
@@ -259,7 +269,7 @@ export class Mpm {
             w[q] = packW(0, 3, g.mat[k]); // one particle per voxel
         }
         const patch = depositPatch(pos, w);
-        if(patch) this.ctx.net.submit({ k: 'deposit', patch: { lo: patch.lo, nx: patch.nx, nz: patch.nz, base: patch.base, vol: patch.vol, mat: patch.mat }, seqs });
+        if(patch) this.ctx.net.submit({ k: 'deposit', patch: wire(patch), seqs });
     }
 
     /** Every client, in edit order: the terrain takes the deposit; the zones it came from go when remeshed. */

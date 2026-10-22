@@ -11,7 +11,7 @@
  *   field vec4 per node: the terrain's outward normal (xyz), distance in grid units (w): uploaded once per zone
  *   params (CPU mirror P): slotA[s] = (lattice origin xyz, active), slotB[s] = (wall friction, -, -, -),
  *          proxA[k] = (centre m, radius m), proxB[k] = (velocity m/s, active), glob = (gravity step (cells), rest
- *          step (cells), relax scale, rest frames), glob2 = (dt / H: m/s to cells per step, -, -, -)
+ *          step (cells), relax scale, rest frames), glob2 = (dt / H: m/s to cells per step, max cells per step (CFL), -, -)
  *   stats u32 atomics, 2 per slot: (particles, moving) when counted (statsPass)
  *
  * Kernels per substep (iterations K): p2gFirst, grid, (g2pP2g, grid) x (K - 1), g2pIntegrate. P2G uses global
@@ -106,7 +106,7 @@ export class MpmGPU {
 
     // ---------------------------------------------------------------- parameters (CPU mirror)
     _set(row, x, y, z, w) { const o = row * 4, a = this.P; a[o] = x; a[o + 1] = y; a[o + 2] = z; a[o + 3] = w; this.dirty = true; }
-    setGlobals({ gstep, restD, relaxScale, restFrames, vscale }) { this._set(P_GLOB, gstep, restD, relaxScale, restFrames); this._set(P_GLOB2, vscale, 0, 0, 0); }
+    setGlobals({ gstep, restD, relaxScale, restFrames, vscale, maxStep = 1 }) { this._set(P_GLOB, gstep, restD, relaxScale, restFrames); this._set(P_GLOB2, vscale, maxStep, 0, 0); }
     setProxies(list) {
         for(let k = 0; k < MAX_PROXIES; k++) {
             const p = list[k];
@@ -317,8 +317,9 @@ export class MpmGPU {
             const F3 = Fr.map(x => x.xyz);
             const Fn = F3.map((f, i) => v(f.add(F3[0].mul(D[i].x)).add(F3[1].mul(D[i].y)).add(F3[2].mul(D[i].z))));
             const sv = svd3(Fn);
-            const S = v(clamp(sv.S, vec3(0.1), vec3(1e4)));
-            const r0 = v(matRow(L.m, 0)), r1 = v(matRow(L.m, 1)), r2 = v(matRow(L.m, 2));
+            const r0 = v(matRow(L.m, 0)), r1 = v(matRow(L.m, 1)), r2 = v(matRow(L.m, 2)), r3 = v(matRow(L.m, 3));
+            // the reference's safety clamp; sand also forgets compression past minStretch (no stored rebound)
+            const S = v(clamp(sv.S, vec3(r3.y), vec3(1e4)));
             const model = v(int(r0.x));
             If(model.equal(SAND), () => {
                 // Drucker-Prager return mapping (Klár et al. 2016) with logJp (PB-MPM)
@@ -348,10 +349,12 @@ export class MpmGPU {
             for(let r = 0; r < 3; r++) Dm.element(L.i.mul(3).add(r)).assign(vec4(D[r], 0));
             // position, rest counter
             const G = v(prm(P_GLOB));
-            const x = v(L.P.xyz.add(d));
-            const dd = v(d);
+            // CFL: at most maxStep cells per step
+            const dl = v(length(d)), maxStep = prm(P_GLOB2).y;
+            const dd = v(d.mul(min(float(1), maxStep.div(max(dl, 1e-9)))));
+            const x = v(L.P.xyz.add(dd));
             const restPrev = disp.element(L.i).w;
-            const rest = select(dot(d, d).lessThan(G.y.mul(G.y)), min(restPrev.add(1), 65535), float(0));
+            const rest = select(dot(dd, dd).lessThan(G.y.mul(G.y)), min(restPrev.add(1), 65535), float(0));
             // push out of the terrain (trilinear distance and normal from the field)
             const i0 = v(ivec3(floor(x))), t = v(x.sub(floor(x)));
             const fb = v(L.slot.mul(NODES).add(i0.x).add(i0.y.mul(NX)).add(i0.z.mul(NXY)));
