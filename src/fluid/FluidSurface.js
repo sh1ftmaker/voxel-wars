@@ -46,7 +46,8 @@ export class FluidSurface {
         dm.positionNode = P.xyz;
         dm.scaleNode = size;
         const vLava = varying(select(phase.greaterThan(1.5), float(1), float(0)));
-        const vFoam = varying(smoothstep(9, 16, nodes.speed).mul(0.5).add(smoothstep(0.4, 0.15, dens).mul(0.35)).clamp(0, 0.7));
+        // foam: fast water, and spray (isolated and moving; a thin film at rest is just shallow water)
+        const vFoam = varying(smoothstep(8, 15, nodes.speed).mul(0.5).add(smoothstep(0.3, 0.1, dens).mul(smoothstep(1.5, 5, nodes.speed)).mul(0.4)).clamp(0, 0.7));
         const vSize = varying(size);
         const nz = Fn(() => {
             const c = uv().mul(2).sub(1).toVar();
@@ -116,19 +117,24 @@ export class FluidSurface {
             // normal from the neighbouring pixels: the smaller difference on each axis (keeps silhouettes from smearing)
             const px1 = vec2(this.texel.x.mul(SCALE), 0), py1 = vec2(0, this.texel.y.mul(SCALE));
             const p0 = viewPos(screenUV, d).toVar();
-            const px = viewPos(screenUV.add(px1), dist(screenUV.add(px1), d)).sub(p0).toVar();
-            const nx = p0.sub(viewPos(screenUV.sub(px1), dist(screenUV.sub(px1), d))).toVar();
-            const py = viewPos(screenUV.add(py1), dist(screenUV.add(py1), d)).sub(p0).toVar();
-            const ny = p0.sub(viewPos(screenUV.sub(py1), dist(screenUV.sub(py1), d))).toVar();
-            const ddx = select(abs(px.z).lessThan(abs(nx.z)), px, nx);
-            const ddy = select(abs(py.z).lessThan(abs(ny.z)), py, ny);
+            // (a side with no fluid does not count: at a silhouette the other side's difference is used)
+            const dxp = dist(screenUV.add(px1), float(0)).toVar(), dxn = dist(screenUV.sub(px1), float(0)).toVar();
+            const dyp = dist(screenUV.add(py1), float(0)).toVar(), dyn = dist(screenUV.sub(py1), float(0)).toVar();
+            const px = viewPos(screenUV.add(px1), select(dxp.greaterThan(0), dxp, d)).sub(p0).toVar();
+            const nx = p0.sub(viewPos(screenUV.sub(px1), select(dxn.greaterThan(0), dxn, d))).toVar();
+            const py = viewPos(screenUV.add(py1), select(dyp.greaterThan(0), dyp, d)).sub(p0).toVar();
+            const ny = p0.sub(viewPos(screenUV.sub(py1), select(dyn.greaterThan(0), dyn, d))).toVar();
+            const pick = (a, b, va, vb) => select(va.and(vb.not().or(abs(a.z).lessThan(abs(b.z)))), a, b);
+            const ddx = pick(px, nx, dxp.greaterThan(0), dxn.greaterThan(0));
+            const ddy = pick(py, ny, dyp.greaterThan(0), dyn.greaterThan(0));
             const n = normalize(cross(ddx, ddy)).toVar();
-            If(n.z.lessThan(0), () => { n.assign(n.negate()); });
             const v = normalize(p0.negate()).toVar();
+            If(dot(n, v).lessThan(0), () => { n.assign(n.negate()); }); // toward the eye
             const sunView = normalize(cameraViewMatrix.mul(vec4(this.sunDir, 0)).xyz).toVar();
             const r = reflect(v.negate(), n).toVar();
             const ndl = max(dot(n, sunView), 0);
-            const fres = float(0.06).add(pow(float(1).sub(max(dot(n, v), 0)), 5).mul(0.85));
+            // (|n.v|: a wave face turned a little away from the eye, as reconstructed, is not a mirror)
+            const fres = float(0.05).add(pow(float(1).sub(abs(dot(n, v))), 5).mul(0.6));
             const rs = max(dot(r, sunView), 0);
             const spec = pow(rs, 400).mul(1.2).add(pow(rs, 40).mul(0.12));
             const lava = c.g, foam = c.b;
@@ -139,7 +145,7 @@ export class FluidSurface {
                 .add(sin(wpos.x.mul(6.1).add(wpos.z.mul(3.7)).add(time.mul(1.3))).mul(sin(wpos.z.mul(5.3).sub(wpos.x.mul(2.2)).sub(time))).mul(0.08).add(0.08));
             // water: a deep blue-green body, the sky reflected by Fresnel, a sun glint, foam
             const rWorld = cameraWorldMatrix.mul(vec4(r, 0)).xyz;
-            const sky = mix(vec3(0.62, 0.78, 0.9), vec3(0.16, 0.42, 0.82), smoothstep(0.0, 0.7, rWorld.y));
+            const sky = mix(vec3(0.5, 0.66, 0.8), vec3(0.16, 0.42, 0.82), smoothstep(0.0, 0.7, rWorld.y));
             const body = mix(vec3(0.01, 0.06, 0.1), vec3(0.04, 0.2, 0.27), ndl.mul(0.5).add(noise.mul(0.3)).clamp(0, 1));
             const water = mix(mix(body, sky, fres), vec3(0.85, 0.92, 0.97), foam).add(spec);
             // lava: emissive orange under a darker crust that drifts
