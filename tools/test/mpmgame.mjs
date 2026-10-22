@@ -6,13 +6,14 @@
  *     around it holds the grains' matter again (solid volume in a box after the deposit vs once the grains were cut)
  *   - frame interval (median, p95) while the grains move, the mpm system's main-thread time per frame, the solver's
  *     time per step (worker), draw calls and triangles
+ *   - busy: three slides at once (three zones) in the overview and the midfield: frame interval against idle
  *   - no console errors
  * Screenshots before, during (0.25 s, 0.6 s, 1.2 s) and after -> <outDir>/mpm-<scenario>-*.png
  *
  * Backend: Chromium's WebGL2 on the real GPU (the flags of leveltour.mjs), so the CPU-worker solver runs here. Headless
  * Chromium's WebGPU is SwiftShader, whose device is lost within seconds even with MPM off; the GPU solver and its
  * draw path are tested on a real GPU by tools/test/mpmgpu.mjs (Dawn in Node).
- * node tools/test/mpmgame.mjs [outDir] [--url http://127.0.0.1:5180/] [--only dune,snow,avalanche]
+ * node tools/test/mpmgame.mjs [outDir] [--url http://127.0.0.1:5180/] [--only dune,snow,avalanche,busy] [--uncapped]
  */
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
@@ -30,7 +31,8 @@ const SCENARIOS = [
     { name: 'avalanche', cam: [-25.0, 3.0, -12.0], at: [-30.0, 0.2, -17.5], act: 'keyV', aim: [-28.6, 0.5, -16.4], box: [[-36, -2, -24], [-24, 4, -11]] },
 ];
 
-const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new', args: ['--ignore-gpu-blocklist', '--use-angle=vulkan', '--window-size=1280,720'], protocolTimeout: 600000 });
+const uncapped = args.includes('--uncapped'); // vsync off: frame intervals show the frame's cost, not 16.7 ms
+const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new', args: ['--ignore-gpu-blocklist', '--use-angle=vulkan', '--window-size=1280,720', ...(uncapped ? ['--disable-gpu-vsync', '--disable-frame-rate-limit'] : [])], protocolTimeout: 600000 });
 const page = await browser.newPage();
 await page.setViewport({ width: 1280, height: 720 });
 const errors = [];
@@ -102,6 +104,37 @@ for(const sc of SCENARIOS) {
     check(st.last && st.last.volume > 0.5, `${sc.name}: the deposit carried ${st.last?.volume.toFixed(2)} m³ (${st.last?.particles} particles)`);
     check(cut !== null && after - cut > 0.8 * (st.last?.volume ?? 0), `${sc.name}: the terrain took the deposit back (${cut?.toFixed(2)} -> ${after.toFixed(2)} m³ in the box)`);
     check(perf.p95 < 20, `${sc.name}: frames held while the grains moved (median ${perf.med?.toFixed(1)} ms, p95 ${perf.p95?.toFixed(1)} ms)`);
+}
+// ---- busy: three slides at once (dune, berm, snow cap: three zones), the overview and the midfield, frame cost
+// uncapped (vsync off) against the same views idle
+if(!only || only.includes('busy')) {
+    const views = [['overview', [0, 45, 62], [0, 0, 0]], ['midfield', [-6, 6, -4], [-16, 0, -12]]];
+    const measure = () => page.evaluate(async () => {
+        const ts = []; let last = performance.now();
+        for(let i = 0; i < 90; i++) { await new Promise(r => requestAnimationFrame(r)); const n = performance.now(); ts.push(n - last); last = n; }
+        ts.sort((a, b) => a - b);
+        const info = ctx.renderer.info.render;
+        return { med: +ts[45].toFixed(2), p95: +ts[85].toFixed(2), calls: info.drawCalls ?? info.calls, tris: info.triangles, grains: ctx.mpm.zones.filter(Boolean).reduce((a, z) => a + z.count, 0) };
+    });
+    const res = {};
+    for(const [name, pos, at] of views) {
+        await page.evaluate((pos, at) => { ctx.camera.position.set(...pos); ctx.camera.lookAt(...at); }, pos, at);
+        await new Promise(r => setTimeout(r, 600));
+        res[name] = { idle: await measure() };
+        await page.evaluate(() => {
+            ctx.destruction.blast([-30.0, 0.9, -17.5], 1.4, { strength: 14 });
+            ctx.destruction.blast([-14.0, 0.7, 9.3], 1.3, { strength: 14 });
+            ctx.destruction.blast([-56.0, 8.6, 27.0], 1.4, { strength: 14 });
+        });
+        await new Promise(r => setTimeout(r, 300));
+        res[name].pouring = await measure();
+        await page.screenshot({ path: `${out}/mpm-busy-${name}.png` });
+        for(let i = 0; i < 60 && await page.evaluate(() => ctx.mpm.zones.some(Boolean)); i++) await new Promise(r => setTimeout(r, 250));
+        console.log(`busy ${name}: idle ${JSON.stringify(res[name].idle)} | three slides ${JSON.stringify(res[name].pouring)}`);
+        check(res[name].pouring.grains > 0, `busy ${name}: grains were moving while measured (${res[name].pouring.grains})`);
+        check(res[name].pouring.p95 < 20, `busy ${name}: frames held with three zones (median ${res[name].pouring.med} ms, p95 ${res[name].pouring.p95} ms; idle ${res[name].idle.med} ms)`);
+    }
+    report.push({ name: 'busy', ...res });
 }
 check(errors.length === 0, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
 fs.writeFileSync(`${out}/mpmgame.json`, JSON.stringify({ backend, report }, null, 1));

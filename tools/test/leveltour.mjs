@@ -1,6 +1,6 @@
 /** Screenshot tour of the level from fixed viewpoints, plus load and render stats (load time, chunks, triangles,
  *  draw calls, frame time at each view).
- *  node tools/test/leveltour.mjs [outDir] [--url http://127.0.0.1:5180/] [--only name,name]   (dev server running) */
+ *  node tools/test/leveltour.mjs [outDir] [--url http://127.0.0.1:5180/] [--only name,name] [--query mpm=1]   (dev server running) */
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 const args = process.argv.slice(2);
@@ -8,6 +8,7 @@ const val = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] :
 const out = args[0] && !args[0].startsWith('--') ? args[0] : 'shots/tour';
 const base = val('--url', 'http://127.0.0.1:5180/');
 const only = val('--only', null)?.split(',');
+const query = val('--query', ''); // extra URL parameters, e.g. mpm=1
 fs.mkdirSync(out, { recursive: true });
 
 // [name, camera position, look-at]
@@ -36,7 +37,7 @@ const errors = [];
 page.on('pageerror', e => errors.push(e.message));
 page.on('console', m => { if(m.type() === 'error') errors.push(m.text()); });
 const t0 = Date.now();
-await page.goto(`${base}?fly=1&bots=0&music=0`);
+await page.goto(`${base}?fly=1&bots=0&music=0${query ? '&' + query : ''}`);
 await page.waitForFunction(() => window.ctx && document.getElementById('loading')?.style.display === 'none', { timeout: 180000 });
 const loadMs = Date.now() - t0;
 await new Promise(r => setTimeout(r, 1500));
