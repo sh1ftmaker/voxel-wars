@@ -12,6 +12,7 @@
  *   sync.brush(brush, { op, mat, hardness, conn, erode, debris }) -> Promise<reply>   (TerrainCore 'brush')
  *   sync.stamp(grid, t, q) -> Promise<reply>                  union a grid into the world (copied, not transferred)
  *   sync.samples(patch) -> Promise<reply>                     write a sample patch (soft-ground bakes)
+ *   sync.deposit(patch) -> Promise<reply>                     union a sample patch (settled grains, src/mpm)
  *   world.applySamples(patch)                                 the same, the documented entry for src/soft
  *   sync.split(grid, { point, n, cells, minCount, generation }) -> Promise<reply>   fracture / component split (grid copied)
  *   sync.carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness }) -> Promise<reply>   carve a body's grid
@@ -86,14 +87,15 @@ export class TerrainSync {
         console.log(`terrain worker: voxelized in ${rep.ms.toFixed(0)} ms${this.worker ? ' (off the main thread)' : ''}`);
         return rep;
     }
-    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16, lift = false } = {}) {
-        return this._send({ type: 'brush', spec: brush.type ? brush : specOf(brush), op, mat, hardness, conn, erode, debris, lift });
+    brush(brush, { op = 'carve', mat = 1, hardness = true, conn = false, erode = 0, debris = 16, lift = false, grains = null } = {}) {
+        return this._send({ type: 'brush', spec: brush.type ? brush : specOf(brush), op, mat, hardness, conn, erode, debris, lift, grains });
     }
     hash(keys = null) { return this._send({ type: 'hash', keys }).then(r => r.hashes); }
     chunkData({ keys = null, modified = false } = {}) { return this._send({ type: 'chunks', keys, modified }).then(r => r.data); }
     setChunks(data) { return this._send({ type: 'setChunks', data }); }
     stamp(grid, t, q) { return this._send({ type: 'stamp', grid: copyGrid(grid), t, q }); }
     samples(patch) { return this._send({ type: 'samples', patch }); }
+    deposit(patch) { return this._send({ type: 'deposit', patch }); }
     carveGrid(grid, spec, { lmin, lmax, t, m, f, hardness = true }) {
         return this._send({ type: 'carveGrid', grid: copyGrid(grid), spec, lmin, lmax, t, m, f, hardness });
     }

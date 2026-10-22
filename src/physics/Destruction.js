@@ -29,8 +29,12 @@
  * Net (src/net): with ctx.net every terrain edit is submitted to the room's edit log and applied when it comes back in
  *   sequence order (single player: LocalTransport answers synchronously, so nothing changes). The submitter carves
  *   voxel bodies and pushes physics bodies at once; other clients do that when the edit arrives. Edit kinds handled
- *   here: 'brush' { spec, op, mat, hardness, conn, erode, debris, lift, kind, impulse, dir, author } and 'samples'
- *   { patch } (soft-ground bakes, world.applySamples); VoxelBodies handles 'stamp' and 'bsplit'.
+ *   here: 'brush' { spec, op, mat, hardness, conn, erode, debris, lift, kind, impulse, dir, author, grains } and
+ *   'samples' { patch } (soft-ground bakes, world.applySamples); VoxelBodies handles 'stamp' and 'bsplit'.
+ *
+ * Granular ground (src/mpm): `destruction.grainsFor(brush, opts)` (set by the Mpm system) may return grain options
+ *   { c, r, blast, force } for a carve; they travel with the edit, the terrain worker cuts the granular voxels that
+ *   can no longer hold out with it, and the edit hooks get them as `grains` (with the edit's `seq`).
  *
  * Events on ctx.events (CustomEvent, data in e.detail):
  *   'destroyed' { center: [x,y,z], box: [min, max] (metres), removed: Float64Array, volume, author, kind: 'carve'|'blast'|'impact' }
@@ -74,19 +78,19 @@ export class Destruction {
         const brush = brushFromSpec(e.spec);
         const center = brush.min.map((v, i) => (v + brush.max[i]) / 2);
         const kick = e.impulse ? { center, radius: Math.max(...brush.max.map((v, i) => v - brush.min[i])) * 0.9, strength: e.impulse } : null;
-        if(history) return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris });
+        if(history) return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, grains: e.grains || null });
         if(!local && !e.lift) {
             if(e.op === 'carve') this.bodies.carve(brush, { hardness: e.hardness });
             if(kick) physics.explode(kick.center, kick.radius, kick.strength);
         }
-        return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, lift: e.lift }).then(rep => {
+        return world.remote.brush(e.spec, { op: e.op, mat: e.mat, hardness: e.hardness, conn: e.conn, erode: e.erode, debris: e.debris, lift: e.lift, grains: e.grains || null }).then(rep => {
             rep.seq = seq;
             this.bodies.fromWorker(rep, kick, { seq, from, local, lift: e.lift });
             const r = rep.result;
             const box = [r.box[0].map(x => x * VOXEL), r.box[1].map(x => x * VOXEL)];
             if(this.editHooks.length && !e.lift) {
                 const size = Math.max(...brush.max.map((x, i) => x - brush.min[i])) / 2;
-                for(const fn of this.editHooks) try { fn({ op: e.op, center, size, impulse: e.impulse || 0, kind: e.kind, changed: r.changed, box, dir: e.dir || null }); } catch(err) { console.error(err); }
+                for(const fn of this.editHooks) try { fn({ op: e.op, center, size, impulse: e.impulse || 0, kind: e.kind, changed: r.changed, box, dir: e.dir || null, grains: rep.grains || null, seq }); } catch(err) { console.error(err); }
             }
             if(!local) {
                 let v = 0;
@@ -145,7 +149,8 @@ export class Destruction {
         if(kick) physics.explode(kick.center, kick.radius, kick.strength);
         const result = { removed, volume, added: 0, center, box: [brush.min.map(v => v - 4 * VOXEL), brush.max.map(v => v + 4 * VOXEL)], changed: 0, detached: [], pending: true };
         const bodies = this.bodies;
-        const terrainDone = this.submit({ k: 'brush', spec: specOf(brush), op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS, kind, impulse, dir, author });
+        const grains = op === 'carve' ? this.grainsFor?.(brush, { kind, impulse }) || null : null;
+        const terrainDone = this.submit({ k: 'brush', spec: specOf(brush), op, mat, hardness, conn: op === 'carve', erode: Math.max(0, bodies.erode), debris: DEBRIS, kind, impulse, dir, author, ...(grains ? { grains } : {}) });
         result.done = Promise.all([terrainDone, bodyDone]).then(([rep, b]) => {
             if(b) for(let i = 0; i < 256; i++) removed[i] += b.removed[i]; // the bodies' share (carved in the worker too)
             const r = rep.result;

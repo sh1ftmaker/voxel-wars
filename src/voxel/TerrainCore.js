@@ -15,6 +15,11 @@
  *        in reply.islands with { collapse: { root (m), dir, reason } }; reply.collapseMs, collapseChecked
  *   { type: 'stamp', grid, t, q }                 union a body's grid into the world (islands.stampGrid)
  *   { type: 'samples', patch }                    VoxelWorld.writeSamples (soft-ground bakes)
+ *   brush with grains: { c, r, blast, force }    granular ground (src/mpm): after the carve, the granular voxels that
+ *        can no longer hold are cut out too (src/mpm/grains.js selectGrains, deterministic) and returned as
+ *        reply.grains { idx (lattice xyz), mat, frac, count }: every client turns them into the same particles
+ *   { type: 'deposit', patch }                   settled grains back into the terrain: union of a sample patch
+ *        (src/mpm/grains.js applyDeposit; the host's 'deposit' edit)
  *   { type: 'split', grid, point?, n?, cells?, minCount, generation }   (cells: { labels, cellOf, cs, dims } of a soft body's crack)
  *        point/n: Voronoi fracture (voronoiLabels) else connected components; reply.pieces [grid with .prep],
  *        reply.same (the grid is one piece: nothing to split), reply.dust (Float64Array m³ per material)
@@ -47,6 +52,8 @@ import { Level } from '../level/fortwar.js';
 import { liftGrid } from './islands.js';
 import { rng } from './brushes.js';
 import { fnv1a } from '../net/codec.js';
+import { selectGrains, applyDeposit } from '../mpm/grains.js';
+import { readRegion } from '../soft/region.js';
 
 export class TerrainCore {
     constructor(world = null) {
@@ -73,6 +80,7 @@ export class TerrainCore {
             case 'brush': reply = this.brush(msg, transfer); break;
             case 'stamp': { const r = stampGrid(this.world, msg.grid, msg.t, msg.q); reply = { result: { added: r.added, changed: r.changed, box: r.box } }; break; }
             case 'samples': { const r = this.world.writeSamples(msg.patch); reply = { result: { changed: r.changed, box: r.box } }; break; }
+            case 'deposit': { const r = applyDeposit(this.world, msg.patch, readRegion); reply = { result: { changed: r.changed, box: r.box } }; break; }
             case 'split': reply = this.split(msg, transfer); break;
             case 'carveGrid': reply = this.carveGrid(msg, transfer); break;
             case 'hash': reply = { hashes: this.hashes(msg.keys) }; break;
@@ -104,6 +112,17 @@ export class TerrainCore {
         if(msg.lift) { lift = liftGrid(w, brush); lift.prep = gridPrep(lift, 0); transfer.push(lift.sdf.buffer, lift.mat.buffer); }
         const r = w.applyBrush(brush, { op: msg.op, mat: msg.mat, hardness: msg.hardness });
         const reply = { result: { removed: r.removed, added: r.added, changed: r.changed, box: r.box }, islands: [], dust: [], lift };
+        // granular ground (src/mpm): the voxels that can no longer hold come out as grains (before connectivity)
+        if(msg.grains && msg.op === 'carve') {
+            const t0 = performance.now();
+            const g = selectGrains(w, readRegion, msg.grains);
+            if(g.count) {
+                w.applyBrush(brushFromSpec(g.brush), { op: 'carve', hardness: false });
+                reply.grains = { idx: g.idx, mat: g.mat, frac: g.frac, count: g.count };
+                transfer.push(g.idx.buffer, g.mat.buffer, g.frac.buffer);
+            }
+            reply.grainsMs = performance.now() - t0;
+        }
         const detach = (list) => {
             for(const isl of list) {
                 const small = isl.count < (msg.debris ?? 16);
