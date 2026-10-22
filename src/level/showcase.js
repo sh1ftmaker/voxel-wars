@@ -16,6 +16,17 @@ import { box, wbox, cyl, cylX, ellipsoid, dome, diff, inter, prismX,
 
 const PILE_Y = -15.95; // bottom of the world's bedrock band: a pile reaching it anchors its structure
 
+// the water towers' tanks (red's side; blue's is mirrored in x) and the lava basins (x for sx = 1): their shapes below,
+// and where the fluid (src/fluid/Fluid.js) fills them
+const TANK = { x: -71, z: -13, y0: 6.0, y1: 10.2, r: 2.6, wall: 0.35 };
+const BASIN = { x: 24, z: -33.5, floor: 4.75, rim: 5.02, r: 3.0 };
+/** Fluid sources: water filling each tank's cavity (`fill`: fraction of its height), lava over each basin's floor. */
+export const FLUID_SOURCES = [
+    ...[-1, 1].map(s => ({ kind: 'water', shape: 'cylinder', x: -s * TANK.x, z: TANK.z, r: TANK.r - TANK.wall,
+        y0: TANK.y0 + TANK.wall, y1: TANK.y1 - TANK.wall, fill: 0.8 })),
+    ...[-1, 1].map(sx => ({ kind: 'lava', shape: 'cylinder', x: sx * BASIN.x, z: BASIN.z, r: BASIN.r, y0: BASIN.floor, y1: BASIN.rim, layers: 1 })),
+];
+
 export function showcase({ late, lateCuts, last }, { TOWER_H, GORGE_W }) {
     /** A pile under (cx, cz) up to `top`: the wide column ends `neck` below the top, a 0.4 m neck joins the structure. */
     const pile = (cx, cz, top, mat = WOOD_Y, neck = 0.35) => {
@@ -90,7 +101,7 @@ export function showcase({ late, lateCuts, last }, { TOWER_H, GORGE_W }) {
 
         // ---- water tower behind the fort: a hollow metal tank on four girder legs
         {
-            const cx = -71, cz = -13, Y0 = 6.0, Y1 = 10.2, R = 2.6;
+            const cx = TANK.x, cz = TANK.z, Y0 = TANK.y0, Y1 = TANK.y1, R = TANK.r, T = TANK.wall;
             for(const [dx, dz] of [[-1.8, -1.8], [1.8, -1.8], [-1.8, 1.8], [1.8, 1.8]]) {
                 last.push(box(X(cx + dx - 0.25), X(cx + dx + 0.25), -1.0, Y0, cz + dz - 0.25, cz + dz + 0.25, METAL));
                 pile(X(cx + dx), cz + dz, -1.0, METAL);
@@ -99,7 +110,7 @@ export function showcase({ late, lateCuts, last }, { TOWER_H, GORGE_W }) {
             last.push(box(X(cx - 2.05), X(cx + 2.05), 2.8, 3.2, cz + 1.55, cz + 2.05, METAL));
             last.push(box(X(cx - 2.05), X(cx - 1.55), 2.8, 3.2, cz - 2.05, cz + 2.05, METAL));
             last.push(box(X(cx + 1.55), X(cx + 2.05), 2.8, 3.2, cz - 2.05, cz + 2.05, METAL));
-            last.push(diff(cyl(X(cx), cz, Y0, Y1, R, METAL), cyl(X(cx), cz, Y0 + 0.35, Y1 - 0.35, R - 0.35, METAL)));
+            last.push(diff(cyl(X(cx), cz, Y0, Y1, R, METAL), cyl(X(cx), cz, Y0 + T, Y1 - T, R - T, METAL)));
             last.push(cyl(X(cx), cz, Y1, Y1 + 0.35, 1.0, METAL));
         }
 
@@ -175,9 +186,10 @@ export function showcase({ late, lateCuts, last }, { TOWER_H, GORGE_W }) {
     // lava basins on the south ridge (decorative: lava does no damage), on solid ground: not on the rock roof over the
     // gorge (lava cannot span) and clear of the tunnel below (z -29..-26)
     for(const sx of [-1, 1]) {
-        lateCuts.push(cyl(sx * 24, -33.5, 5.01, 11, 5.5, LAVA)); // a terrace cleared in the crags
-        lateCuts.push(cyl(sx * 24, -33.5, 4.4, 5.02, 3.0, LAVA));
-        last.push(cyl(sx * 24, -33.5, 4.4, 4.75, 3.0, LAVA));
+        const bx = sx * BASIN.x, bz = BASIN.z;
+        lateCuts.push(cyl(bx, bz, 5.01, 11, 5.5, LAVA)); // a terrace cleared in the crags
+        lateCuts.push(cyl(bx, bz, 4.4, BASIN.rim, BASIN.r, LAVA));
+        last.push(cyl(bx, bz, 4.4, BASIN.floor, BASIN.r, LAVA));
     }
     // a snowy crest on the ridge's back wall
     for(const sx of [-1, 1]) late.push(box(sx * 9, sx * 80, 9, 9.35, 37, 40, SNOW)); // not over the gorge: snow cannot span it

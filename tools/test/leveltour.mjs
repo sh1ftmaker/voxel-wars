@@ -1,6 +1,8 @@
 /** Screenshot tour of the level from fixed viewpoints, plus load and render stats (load time, chunks, triangles,
  *  draw calls, frame time at each view).
- *  node tools/test/leveltour.mjs [outDir] [--url http://127.0.0.1:5180/] [--only name,name]   (dev server running) */
+ *  node tools/test/leveltour.mjs [outDir] [--url http://127.0.0.1:5180/] [--only name,name] [--webgpu] [--query '&fluid=0']
+ *  (dev server running). Default: Chromium's WebGL2 backend. --webgpu: WebGPU on the real GPU (Vulkan); the canvas is
+ *  then captured with toDataURL right after a frame (page screenshots of a WebGPU canvas come out blank headless). */
 import puppeteer from 'puppeteer-core';
 import fs from 'node:fs';
 const args = process.argv.slice(2);
@@ -8,6 +10,8 @@ const val = (k, d) => { const i = args.indexOf(k); return i >= 0 ? args[i + 1] :
 const out = args[0] && !args[0].startsWith('--') ? args[0] : 'shots/tour';
 const base = val('--url', 'http://127.0.0.1:5180/');
 const only = val('--only', null)?.split(',');
+const webgpu = args.includes('--webgpu');
+const query = val('--query', '');
 fs.mkdirSync(out, { recursive: true });
 
 // [name, camera position, look-at]
@@ -29,14 +33,20 @@ const VIEWS = [
     ['scaffold', [-55, 5, 20], [-47, 3, 13]],
 ];
 
-const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new', args: ['--ignore-gpu-blocklist', '--use-angle=vulkan', '--window-size=1280,720'] });
+const browser = await puppeteer.launch({ executablePath: '/usr/bin/chromium', headless: 'new',
+    args: ['--ignore-gpu-blocklist', '--use-angle=vulkan', '--window-size=1280,720', ...(webgpu ? ['--enable-unsafe-webgpu', '--enable-features=Vulkan'] : [])] });
 const page = await browser.newPage();
+if(webgpu) {
+    // the first adapter request of a fresh browser can come back empty: wait until the GPU process has one
+    await page.goto(new URL('docs/', base).href).catch(() => {});
+    for(let i = 0; i < 40 && !(await page.evaluate(async () => !!(await navigator.gpu?.requestAdapter()))); i++) await new Promise(r => setTimeout(r, 250));
+}
 await page.setViewport({ width: 1280, height: 720 });
 const errors = [];
 page.on('pageerror', e => errors.push(e.message));
 page.on('console', m => { if(m.type() === 'error') errors.push(m.text()); });
 const t0 = Date.now();
-await page.goto(`${base}?fly=1&bots=0&music=0`);
+await page.goto(`${base}?fly=1&bots=0&music=0${query}`);
 await page.waitForFunction(() => window.ctx && document.getElementById('loading')?.style.display === 'none', { timeout: 180000 });
 const loadMs = Date.now() - t0;
 await new Promise(r => setTimeout(r, 1500));
@@ -56,10 +66,13 @@ for(const [name, pos, at] of VIEWS) {
         const info = ctx.renderer.info.render;
         return { calls: info.drawCalls ?? info.calls, tris: info.triangles, frameMed: +ts[30].toFixed(1) };
     }, pos, at);
-    await page.screenshot({ path: `${out}/${name}.png` });
+    if(webgpu) {
+        const d = await page.evaluate(() => new Promise(res => requestAnimationFrame(() => res(ctx.renderer.domElement.toDataURL('image/png')))));
+        fs.writeFileSync(`${out}/${name}.png`, Buffer.from(d.split(',')[1], 'base64'));
+    } else await page.screenshot({ path: `${out}/${name}.png` });
     stats.push({ name, ...s });
 }
-const world = await page.evaluate(() => ({ chunks: ctx.terrain.meshes?.size ?? null, bodies: ctx.physics.props.size }));
+const world = await page.evaluate(() => ({ chunks: ctx.terrain.meshes?.size ?? null, bodies: ctx.physics.props.size, webgpu: !!ctx.renderer.backend.isWebGPUBackend, fluid: ctx.fluid?.label ?? null }));
 console.log(JSON.stringify({ loadMs, world, stats }));
 console.log(errors.length ? errors.slice(0, 5) : 'no errors');
 await browser.close();

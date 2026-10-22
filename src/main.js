@@ -19,6 +19,7 @@ import { FlyCamera } from './dev/FlyCamera.js';
 import { FortWar } from './game/FortWar.js';
 import { Profiler } from './dev/Profiler.js';
 import { SoftGround } from './soft/SoftGround.js';
+import { Fluid } from './fluid/Fluid.js';
 import { createNet } from './net/index.js';
 
 const $ = (id) => document.getElementById(id);
@@ -71,6 +72,7 @@ window.ctx = ctx; // for debugging and headless tests
 // ---- game systems are added here (one line each) ----
 ctx.addSystem(params.get('fly') === '1' ? new FlyCamera(ctx) : new FortWar(ctx), 'game');
 ctx.addSystem(new SoftGround(ctx), 'soft'); // soft ground wake zones (src/soft), ctx.soft
+ctx.addSystem(new Fluid(ctx), 'fluid'); // SPH water and lava (src/fluid), ctx.fluid
 net?.ready(); // the edit handlers are in: apply the log (a late joiner catches up here)
 
 status('Meshing...');
@@ -99,6 +101,6 @@ renderer.setAnimationLoop((now) => {
     prof.mark('render');
     frames++; fpsT += dt;
     if(fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
-    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size} · soft ground: ${ctx.soft?.label ?? 'off'}`;
+    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size} · soft ground: ${ctx.soft?.label ?? 'off'} · fluid: ${ctx.fluid?.label ?? 'off'}`;
     prof.frameEnd();
 });
