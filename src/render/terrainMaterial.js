@@ -8,7 +8,8 @@
  *  createTerrainMaterial({ local: true }) detached bodies: triplanar in object space, so the texture rides along
  *                                         with a moving, rotating piece (build its geometry with geometryFromMesh). */
 import * as THREE from 'three/webgpu';
-import { attribute, uniformArray, texture, positionWorld, positionLocal, normalWorld, normalLocal, float, vec3, mix, clamp, dot, select, uniform, varying, Fn } from 'three/tsl';
+import { attribute, uniformArray, texture, positionWorld, positionLocal, normalWorld, normalLocal, normalView, positionViewDirection, float, vec3, mix, clamp, dot, select, uniform, varying, Fn, abs, pow } from 'three/tsl';
+import { MATERIALS, GLASS } from '../voxel/materials.js';
 import { terrainTextures } from './TerrainTextures.js';
 
 const LUMA = vec3(0.2126, 0.7152, 0.0722);
@@ -79,7 +80,26 @@ function buildTerrainNodes(mat, { local, deform = null }) {
     mat.emissiveNode = albedo.mul(glow.mul(2.5));
     mat.userData.terrainSpace = local ? 'local' : 'world';
     mat.userData.textures = tt;
+    if(mat.userData.glass) { mat.userData.glass.positionNode = mat.positionNode; mat.userData.glass.needsUpdate = true; }
 }
+
+/** The glass material paired with a terrain material (same vertex stage: soft-ground or soft-debris deformation). */
+export function glassMaterialFor(base) {
+    let g = base.userData.glass;
+    if(g) { if(g.positionNode !== base.positionNode) { g.positionNode = base.positionNode; g.needsUpdate = true; } return g; }
+    g = base.userData.glass = new THREE.MeshStandardNodeMaterial({ roughness: 0.04, metalness: 0, transparent: true, depthWrite: false });
+    const tint = new THREE.Color(MATERIALS[GLASS].color);
+    const facing = abs(dot(normalView, positionViewDirection));
+    const rim = pow(float(1).sub(facing), 3);
+    g.colorNode = vec3(tint.r, tint.g, tint.b).mul(0.6);
+    g.opacityNode = mix(float(0.22), float(0.85), rim);
+    g.emissiveNode = vec3(0.55, 0.68, 0.8).mul(rim.mul(0.6)); // the sky in the rim, a cheap reflection
+    g.positionNode = base.positionNode;
+    g.shadowSide = THREE.FrontSide;
+    return g;
+}
+/** The material (or [terrain, glass] for meshes with a glass draw group) for a mesh with terrain geometry. */
+export function meshMaterial(base, geometry) { return geometry.groups.length ? [base, glassMaterialFor(base)] : base; }
 
 /** Resolves when the terrain textures have loaded (the material shows flat material colours until then). */
 export function terrainTexturesReady() { return terrainTextures().ready; }

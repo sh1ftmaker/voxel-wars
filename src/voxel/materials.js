@@ -20,7 +20,9 @@ def(10, { name: 'Wood',       color: 0x8b5a2b, texture: T + 'weathered_brown_pla
 def(11, { name: 'Cobble',     color: 0x7d7d78, texture: T + 'cobblestone_floor_08.jpg',   scale: 3, hardness: 2,   density: 2300, smooth: false });
 def(12, { name: 'Dark Rock',  color: 0x5a5550, texture: T + 'dark_rock.jpg',              scale: 6, hardness: 5,   density: 2600, smooth: true });
 def(13, { name: 'Bedrock',    color: 0x2a2826, texture: T + 'dark_rock.jpg',              scale: 6, hardness: Infinity, density: 3000, smooth: true });
+def(16, { name: 'Glass',      color: 0xa9d4e0, texture: null,                             scale: 4, hardness: 0.4, density: 2500, smooth: false });
 export const BEDROCK = 13;
+export const GLASS = 16;
 for(let i = 0; i < MATERIALS.length; i++) if(!MATERIALS[i]) def(i, { ...MATERIALS[1], name: `unused ${i}` });
 
 /** Carving reach multiplier per material id (1/sqrt(hardness)), as a typed array for hot loops. */
@@ -49,6 +51,7 @@ const SOFT = {
     10: { stiffness: 0.05, softness: 1.6,  plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 1.1 },   // wood
     11: { stiffness: 0.08, softness: 1.6, plasticity: 0,    yield: 0.02, toughness: 0.08, damping: 1.5 },   // cobble
     12: { stiffness: 0.1,  softness: 1.4, plasticity: 0,    yield: 0.02, toughness: 0.14, damping: 1.3 }, // dark rock
+    16: { stiffness: 0.12, softness: 0.9,  plasticity: 0,    yield: 0.02, toughness: 0.03, damping: 2.0 }, // glass
     13: { stiffness: 1.0,  softness: 0,    plasticity: 0,    yield: 1,    toughness: 1e9,  damping: 10 },  // bedrock
 };
 for(const m of MATERIALS) Object.assign(m, SOFT[m.id] || SOFT[1]);
