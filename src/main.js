@@ -20,6 +20,7 @@ import { FortWar } from './game/FortWar.js';
 import { Profiler } from './dev/Profiler.js';
 import { SoftGround } from './soft/SoftGround.js';
 import { createNet } from './net/index.js';
+import { Mpm } from './mpm/Mpm.js';
 
 const $ = (id) => document.getElementById(id);
 const status = (s) => { $('loading').textContent = s; };
@@ -71,6 +72,7 @@ window.ctx = ctx; // for debugging and headless tests
 // ---- game systems are added here (one line each) ----
 ctx.addSystem(params.get('fly') === '1' ? new FlyCamera(ctx) : new FortWar(ctx), 'game');
 ctx.addSystem(new SoftGround(ctx), 'soft'); // soft ground wake zones (src/soft), ctx.soft
+ctx.addSystem(new Mpm(ctx), 'mpm'); // granular ground: PB-MPM sand, dirt, snow, lava (src/mpm, ?mpm=1), ctx.mpm
 net?.ready(); // the edit handlers are in: apply the log (a late joiner catches up here)
 
 status('Meshing...');
@@ -99,6 +101,6 @@ renderer.setAnimationLoop((now) => {
     prof.mark('render');
     frames++; fpsT += dt;
     if(fpsT > 0.5) { fps = frames / fpsT; frames = 0; fpsT = 0; }
-    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size} · soft ground: ${ctx.soft?.label ?? 'off'}`;
+    $('stats').textContent = `${fps.toFixed(0)} fps · chunks ${terrain.meshes.size} · pending ${terrain.pending} · bodies ${physics.props.size} · soft ground: ${ctx.soft?.label ?? 'off'}${ctx.mpm?.enabled ? ` · grains ${ctx.mpm.stats.particles} (${ctx.mpm.label})` : ''}`;
     prof.frameEnd();
 });

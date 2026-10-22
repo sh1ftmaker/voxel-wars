@@ -55,7 +55,6 @@ export function selectGrains(world, readRegion, { c, r = 1, blast = false, force
         const near = air && s > -2.5 * SDF_SCALE && l > SDF_SCALE * 0.75;
         const take = (force && air) || (d2 < rim2 && s > -2 * SDF_SCALE) || (near && ny_ < cosRepose[mat[o]]);
         const under = near && ny_ < 0.1;
-        if(globalThis.MPM_DEBUG && take) { const D = globalThis.MPM_DBG ||= {}; const k = (d2 < rim2 && s > -64 ? 'rim' : 'steep') + (under ? '-under' : '') + '-m' + mat[o]; D[k] = (D[k] || 0) + 1; }
         if(take) { pick[o] = 1; cand.push(o); if(under) hang.push(o); }
     }
     // what an undercut or a blast leaves hanging above a chosen voxel goes with it (no floating caps)
@@ -65,8 +64,6 @@ export function selectGrains(world, readRegion, { c, r = 1, blast = false, force
             if(!pick[q]) { pick[q] = 1; cand.push(q); }
         }
     }
-    if(globalThis.MPM_DEBUG) { console.log(JSON.stringify(globalThis.MPM_DBG)); globalThis.MPM_DBG = {}; }
-    if(globalThis.MPM_DEBUG) console.log("grains: candidates", cand.length, "hanging", hang.length, "rim", rim.toFixed(2), "reach", reach.toFixed(2));
     // the nearest `max` (deterministic order: distance, then index)
     const list = cand.map(o => {
         const i = o % nx, j = Math.floor(o / nx) % ny, k = Math.floor(o / nxy);
