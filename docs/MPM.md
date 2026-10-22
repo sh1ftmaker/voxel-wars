@@ -177,10 +177,10 @@ the 4090, with timestamp queries):
 
 | Particles | GPU ms per frame (median, max) |
 |---|---|
-| 8k | 0.105 (0.131) |
-| 16k | 0.18–0.20 (0.22) |
+| 8k | 0.105–0.131 (0.131) |
+| 16k | 0.18–0.22 (0.24) |
 | 32k (2 zones) | 0.30–0.32 (0.38–0.50) |
-| 64k (4 zones) | 0.59 (0.70–0.89) |
+| 64k (4 zones) | 0.55–0.59 (0.66–0.89) |
 
 - P2G atomics are about 85–90% of that at 64k.
 - Workgroup-tiled accumulation (EA's "bukkits") is the next optimisation if this budget ever tightens. At 32k the
@@ -203,11 +203,15 @@ grains):
 
 | View | Idle (median, p95) | Three slides (median, p95) | Calls | Triangles |
 |---|---|---|---|---|
-| Overview | 6.6 ms, 7.9 ms | 7.5 ms, 8.4 ms | +9 | +0.4M |
-| Midfield | 3.9 ms | 4.2 ms, 5.3 ms | | |
+| Overview | 6.1–6.6 ms, 6.8–7.9 ms | 6.6–7.5 ms, 7.6–8.4 ms | +9 | +0.4M |
+| Midfield | 3.9–4.0 ms, 4.2–4.9 ms | 4.1–4.2 ms, 4.8–5.3 ms | +1 | +0.4M |
 
-**Volume:** blast, simulate and deposit return 96–100% of the grains' volume to the terrain (dune, berm, snow cap
-in `mpm.mjs`; dune, snow, avalanche in `mpmgame.mjs`).
+**Volume:** blast, simulate and deposit return the grains' volume to the terrain:
+
+- `mpm.mjs`: dune 99%, berm 107%, snow cap 88%;
+- `mpmgame.mjs` (game, measured in a box): dune 98%, snow 90%, avalanche 99%.
+
+Snow that spreads thin or leaves the box accounts for its loss.
 
 **PB-MPM against explicit MLS-MPM:** I did not build an explicit solver before switching, so there are no measured
 numbers to compare. For reference: an explicit solver with a sand stiffness that keeps a pile's shape needs a
@@ -222,7 +226,7 @@ converged, as the paper says.
   - snow compresses (mean Jp 0.62) and holds in one clump; lava slumps;
   - no NaNs, and particles stay inside the zone and above the ground;
   - the CPU cost at the cap;
-  - blast, simulate and deposit round trips on the level's dune, berm and a snow cap (96–100% of the volume back);
+  - blast, simulate and deposit round trips on the level's dune, berm and a snow cap (88–107% of the volume back);
   - two terrain cores stay identical through the grains and the deposit.
 - **`node tools/test/mpmgpu.mjs [outDir]`** (GPU solver on a real GPU through Dawn):
   - needs the `webgpu` package: `npm i --no-save webgpu`, or `MPM_WEBGPU=<dir>`; skips cleanly without it;
@@ -251,5 +255,7 @@ converged, as the paper says.
 - **Dirt is cohesive by design** (tunnels must hold). Only sand and snow follow slope rules on every dig.
 - **Showcase scale.** The level's dunes are small (1.4 m tall), so the biggest slides are dune collapses into a
   crater and snow pouring off a crag. Larger dunes would show more (a level-design call; the level is unchanged).
+- **Protocol change.** The `grains` option of brush edits and the `deposit` edit are new, so a room must run one
+  build. An older client would ignore the grains and diverge until a hash check resyncs it.
 - **Water** is out of scope here (SPH is on the `sph` branch). The material table has no liquid model, though PB-MPM
   supports one.
