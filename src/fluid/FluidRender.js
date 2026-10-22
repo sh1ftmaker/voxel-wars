@@ -7,7 +7,7 @@
  */
 import * as THREE from 'three/webgpu';
 import {
-    Fn, If, Discard, uv, vec2, vec3, vec4, float, uniform, varying, select, mix, smoothstep, max, pow, dot, sqrt, normalize, reflect,
+    Fn, If, Discard, uv, vec3, vec4, float, uniform, varying, select, mix, smoothstep, max, pow, dot, sqrt, normalize, reflect, length,
     positionView, cameraNear, cameraFar, viewZToPerspectiveDepth, cameraViewMatrix, cameraWorldMatrix, sin, time,
 } from 'three/tsl';
 
@@ -20,11 +20,15 @@ export class FluidRender {
         const P = nodes.pos;
         const phase = P.w;
         const diameter = spacing * 2.6;
-        const size = select(phase.equal(0), float(0), float(diameter).mul(select(nodes.dens.lessThan(0.45), float(0.7), float(1))));
+        const dens = nodes.surf.w;
+        const size = select(phase.equal(0), float(0), float(diameter).mul(select(dens.lessThan(0.45), float(0.7), float(1))));
         m.positionNode = P.xyz;
         m.scaleNode = size;
         const vLava = varying(select(phase.greaterThan(1.5), float(1), float(0)));
-        const vSpeed = varying(nodes.speed), vDens = varying(nodes.dens), vSize = varying(size);
+        const vSpeed = varying(nodes.speed), vDens = varying(dens), vSize = varying(size);
+        // the fluid's surface normal at the particle (from the solver's density gradient): ~unit length at a free
+        // surface, ~0 inside; in view space
+        const vSurf = varying(cameraViewMatrix.mul(vec4(nodes.surf.xyz, 0)).xyz);
         // smooth variation over the world (not per particle: that speckles)
         const wp = P.xyz;
         const vNoise = varying(sin(wp.x.mul(2.3).add(time.mul(0.9))).mul(sin(wp.z.mul(2.9).sub(time.mul(0.7)))).mul(0.5).add(0.5)
@@ -35,16 +39,18 @@ export class FluidRender {
             If(r2.greaterThan(1), () => { Discard(); });
             return vec3(c.x, c.y, sqrt(float(1).sub(r2)));
         })().toVar();
-        // much flatter than a ball: the particles of a pool read as one sheet
+        // shade with the fluid's surface normal (up where it is unclear), a little of the ball's: the particles of a
+        // pool read as one rippled sheet, a stream as a rope of water
         const upView = normalize(cameraViewMatrix.mul(vec4(0, 1, 0, 0)).xyz);
-        const n = normalize(mix(nView, upView, mix(0.45, 0.75, vLava))).toVar();
+        const sl = length(vSurf);
+        const nFluid = normalize(mix(upView, vSurf.div(max(sl, 1e-4)), smoothstep(0.15, 0.6, sl)));
+        const n = normalize(mix(nView, nFluid, mix(0.75, 0.85, vLava))).toVar();
         const v = normalize(positionView.negate()).toVar();
         const sunView = normalize(cameraViewMatrix.mul(vec4(this.sunDir, 0)).xyz).toVar();
         const ndl = max(dot(n, sunView), 0);
         const fres = float(0.06).add(pow(float(1).sub(max(dot(n, v), 0)), 5).mul(0.85));
         const r = reflect(v.negate(), n).toVar();
-        // the glint off a flatter normal still: one per particle would sparkle like confetti
-        const spec = pow(max(dot(reflect(v.negate(), normalize(mix(nView, upView, 0.85))), sunView), 0), 80).mul(1.4);
+        const spec = pow(max(dot(r, sunView), 0), 90).mul(1.6);
         // water: a deep blue-green body, the sky reflected by Fresnel, foam where it runs fast or sprays thin
         const rWorld = cameraWorldMatrix.mul(vec4(r, 0)).xyz;
         const sky = mix(vec3(0.62, 0.78, 0.9), vec3(0.16, 0.42, 0.82), smoothstep(0.0, 0.7, rWorld.y));
@@ -57,7 +63,7 @@ export class FluidRender {
         const lava = mix(vec3(0.16, 0.025, 0.01), vec3(1.35, 0.26, 0.02), heat).add(vec3(0.35, 0.14, 0.0).mul(heat.mul(heat).mul(heat))).add(spec.mul(0.1));
         m.colorNode = vec4(mix(water, lava, vLava), 1);
         // the sphere's depth
-        m.depthNode = viewZToPerspectiveDepth(positionView.z.add(nView.z.mul(vSize.mul(0.5))), cameraNear, cameraFar);
+        m.depthNode = viewZToPerspectiveDepth(positionView.z.add(nView.z.mul(vSize.mul(0.35))), cameraNear, cameraFar);
         const s = this.sprite = new THREE.Sprite(m);
         s.count = Math.max(1, count);
         s.frustumCulled = false;

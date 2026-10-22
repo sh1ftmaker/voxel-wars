@@ -1,6 +1,7 @@
 // node tools/test/sph.mjs [--spacing 0.3] [--seconds 6]: the CPU fluid solver (src/fluid/cpuSolver.js, the WebGL2
-// fallback's solver) on a dam break in a closed stone box carved into a VoxelWorld. Checks that it settles with a small
-// density error, without NaNs, without particles leaving the box (SDF walls) or being lost, and reports ms per step.
+// fallback's solver) on dam breaks in closed stone boxes carved into a VoxelWorld. Checks that it settles with a small
+// density error, without NaNs, without particles leaving the box (SDF walls) or being lost, and reports ms per step:
+// at the CPU fallback's settings, at the GPU solver's (finer, on the CPU here) and at the CPU fallback's full load.
 import { VoxelWorld } from '../../src/voxel/VoxelWorld.js';
 import { box } from '../../src/voxel/brushes.js';
 import { PageSDF } from '../../src/fluid/sdfPages.js';
@@ -12,20 +13,23 @@ const val = (k, d) => { const i = args.indexOf(k); return i >= 0 ? +args[i + 1] 
 let fails = 0;
 const check = (ok, msg) => { console.log(ok ? '  ok  ' : '  FAIL', msg); if(!ok) fails++; };
 
-// a stone box with a 6 x 4 x 3 m cavity (inner floor at y = 0), closed on every side
+// stone boxes with a 6 x 4 x 3 m and a 10 x 4 x 6 m cavity (inner floor at y = 0), closed on every side
 const world = new VoxelWorld();
-const IN = [[0, 0, 0], [6, 4, 3]];
-world.applyBrush(box([-1, -1, -1], [7, 5, 4]), { op: 'add', mat: 0, hardness: false });
-world.applyBrush(box(IN[0], IN[1]), { op: 'carve', hardness: false });
+const SMALL = [[0, 0, 0], [6, 4, 3]], BIG = [[20, 0, 0], [30, 4, 6]];
+for(const IN of [SMALL, BIG]) {
+    world.applyBrush(box(IN[0].map(v => v - 1), IN[1].map(v => v + 1)), { op: 'add', mat: 0, hardness: false });
+    world.applyBrush(box(IN[0], IN[1]), { op: 'carve', hardness: false });
+}
 
-function run(settings, label, column, seconds) {
+/** A column of water `column` (x extent from the cavity's -x wall, height) across the cavity's depth, released. */
+function run(settings, label, column, seconds, IN = SMALL) {
     const sdf = new PageSDF(64).fromWorld(world);
     const s = new FluidSolver({ ...settings, sdf });
     const d = settings.spacing;
     let n = 0;
-    for(let x = d * 0.6; x < column[0]; x += d) for(let y = d * 0.6; y < column[1]; y += d) for(let z = d * 0.6; z < IN[1][2] - d * 0.5; z += d) {
+    for(let x = d * 0.6; x < column[0]; x += d) for(let y = d * 0.6; y < column[1]; y += d) for(let z = d * 0.6; z < IN[1][2] - IN[0][2] - d * 0.5; z += d) {
         if(n >= settings.cap) break;
-        s.write(n++, x, y, z, WATER);
+        s.write(n++, IN[0][0] + x, IN[0][1] + y, IN[0][2] + z, WATER);
     }
     console.log(`${label}: spacing ${d} m, ${n} particles, ${settings.iterations} iterations x ${settings.substeps} substeps at 60 Hz`);
     const steps = Math.round(seconds / STEP);
@@ -60,5 +64,7 @@ function run(settings, label, column, seconds) {
 const seconds = val('--seconds', 6);
 run({ ...CPU_SETTINGS, spacing: val('--spacing', CPU_SETTINGS.spacing) }, 'CPU fallback settings', [2.4, 3.0], seconds);
 run({ ...GPU_SETTINGS, cap: 4096 }, 'GPU settings (on the CPU)', [1.6, 2.4], seconds);
+const load = run(CPU_SETTINGS, 'CPU fallback at full load', [5, 3.2], seconds * 2, BIG); // a 10 m box sloshes longer
+check(load.ms < 12, `CPU fallback: ${load.n} particles step in ${load.ms.toFixed(1)} ms (a worker at 60 Hz has 16)`);
 console.log(fails ? `${fails} FAILED` : 'all ok');
 process.exit(fails ? 1 : 0);

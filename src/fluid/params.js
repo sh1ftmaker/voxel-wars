@@ -63,7 +63,13 @@ export function kernel(spacing) {
     // (d = s / 2) has exactly the rest density.
     let half = 0;
     for(let z = -R; z <= R; z++) for(let y = 0; y <= R; y++) for(let x = -R; x <= R; x++) half += W((x * x + y * y + z * z) * spacing * spacing);
-    const k = { spacing, h, h2, poly6, spiky, rho0, eps: RELAX * sumGrad2, wdq: W(dq * dq), radius: spacing * 0.5, wallScale: 1 };
+    // |sum grad W| / rho0 of a particle at a flat free surface: scales the surface normal the renderer gets to ~1
+    let surfG = 0;
+    for(let z = -R; z <= R; z++) for(let y = -R; y <= 0; y++) for(let x = -R; x <= R; x++) {
+        const r = Math.sqrt(x * x + y * y + z * z) * spacing;
+        if(r > 0 && r < h) surfG += -y * spacing * spiky * (h - r) ** 2 / r / rho0;
+    }
+    const k = { spacing, h, h2, poly6, spiky, rho0, eps: RELAX * sumGrad2, wdq: W(dq * dq), radius: spacing * 0.5, wallScale: 1, surfG: Math.abs(surfG) };
     k.wallScale = (rho0 - half) / (wall(k, spacing * 0.5)[0] * rho0);
     return k;
 }

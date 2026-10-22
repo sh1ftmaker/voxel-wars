@@ -13,7 +13,8 @@
  *   velocity  v = (x* - x) / dt, tangential friction on terrain contact
  *   xsph      XSPH viscosity, x = x*, idle timer, recycling (out of the world, evaporated films), stats
  *
- * Buffers: pos (xyz, phase), vel (xyz, idle s), pred (xyz, phase), aux (lambda, terrain gradient xyz), dens, dp (dx, or
+ * Buffers: pos (xyz, phase), vel (xyz, idle s), pred (xyz, phase), aux (lambda, terrain gradient xyz), surf (surface
+ * normal for the renderer, density), dp (dx, or
  * the velocity before XSPH), nbr / nbrN (neighbour lists), bins, the SDF pages (src/fluid/sdfPages.js), params
  * (proxies and kicks, mirrored on the CPU) and stats (atomics read back asynchronously every few frames).
  */
@@ -46,7 +47,8 @@ export class FluidGPU {
         this.vel = instancedArray(new Float32Array(cap * 4), 'vec4');
         this.pred = instancedArray(cap, 'vec4');
         this.aux = instancedArray(cap, 'vec4');
-        this.dens = instancedArray(new Float32Array(cap).fill(1), 'float');
+        // surface normal (outward, ~unit length at a free surface, ~0 inside) and density rho / rho0, for the renderer
+        this.surf = instancedArray(new Float32Array(cap * 4), 'vec4');
         this.dp = instancedArray(cap, 'vec4');
         this.nbr = instancedArray(new Uint32Array(cap * MAX_NEIGHBOURS), 'uint');
         this.nbrN = instancedArray(new Uint32Array(cap), 'uint');
@@ -75,7 +77,7 @@ export class FluidGPU {
 
     _kernels() {
         const u = this.u, k = this.k;
-        const { pos, vel, pred, aux, dens, dp, nbr, nbrN, slots, table, pageData, params, stats } = this;
+        const { pos, vel, pred, aux, surf, dp, nbr, nbrN, slots, table, pageData, params, stats } = this;
         const binAtomic = this.binAtomic, binRead = this.binRead;
         const K = (fn, n) => Fn(fn)().compute(n, [WG]);
         const H = k.h, H2 = k.h2, R = k.radius, MAXN = MAX_NEIGHBOURS;
@@ -269,6 +271,7 @@ export class FluidGPU {
                 });
             });
             const d = rho.div(RHO0).toVar();
+            const gn = g.toVar(); // the fluid's own gradient: minus the surface normal
             const wg = vec3(0).toVar();
             const s = sdf(P.xyz).toVar();
             If(s.x.lessThan(H), () => {
@@ -285,7 +288,7 @@ export class FluidGPU {
                 wg.assign(s.yzw.div(max(length(s.yzw), 1e-6)).mul(dphi.mul(WALLC)));
                 g.addAssign(wg);
             });
-            dens.element(i).assign(d);
+            surf.element(i).assign(vec4(gn.mul(-1 / k.surfG), d));
             const C = d.sub(1);
             const lam = select(C.greaterThan(0), C.negate().div(g2.add(dot(g, g)).add(EPS)), float(0));
             aux.element(i).assign(vec4(lam, wg));
@@ -354,7 +357,7 @@ export class FluidGPU {
             const p = P.xyz;
             const out = p.x.lessThan(WORLD_LO[0]).or(p.y.lessThan(WORLD_LO[1])).or(p.z.lessThan(WORLD_LO[2]))
                 .or(p.x.greaterThan(WORLD_HI[0])).or(p.y.greaterThan(WORLD_HI[1])).or(p.z.greaterThan(WORLD_HI[2]));
-            const evap = M.evaporate.and(idle.greaterThan(EVAPORATE_TIME)).and(dens.element(i).lessThan(EVAPORATE_DENSITY));
+            const evap = M.evaporate.and(idle.greaterThan(EVAPORATE_TIME)).and(surf.element(i).w.lessThan(EVAPORATE_DENSITY));
             const dead = out.or(evap).toVar();
             pos.element(i).assign(vec4(p, select(dead, float(0), P.w)));
             If(u.stats.equal(1).and(dead.not()), () => {
@@ -383,16 +386,16 @@ export class FluidGPU {
 
     /** Write particles into slots [start, start + n): data Float32Array of 8 per particle (x, y, z, phase, vx, vy, vz, 0). */
     write(start, n, data) {
-        const pa = this.pos.value, va = this.vel.value, da = this.dens.value;
+        const pa = this.pos.value, va = this.vel.value, sa = this.surf.value;
         for(let i = 0; i < n; i++) {
             const o = (start + i) * 4, s = i * 8;
             pa.array[o] = data[s]; pa.array[o + 1] = data[s + 1]; pa.array[o + 2] = data[s + 2]; pa.array[o + 3] = data[s + 3];
             va.array[o] = data[s + 4]; va.array[o + 1] = data[s + 5]; va.array[o + 2] = data[s + 6]; va.array[o + 3] = 0;
-            da.array[start + i] = 1;
+            sa.array.set([0, 0, 0, 1], (start + i) * 4);
         }
         pa.addUpdateRange(start * 4, n * 4); pa.needsUpdate = true;
         va.addUpdateRange(start * 4, n * 4); va.needsUpdate = true;
-        da.addUpdateRange(start, n); da.needsUpdate = true;
+        sa.addUpdateRange(start * 4, n * 4); sa.needsUpdate = true;
         if(start + n > this.extent) this.extent = start + n;
     }
 
@@ -462,9 +465,9 @@ export class FluidGPU {
         this.extent = e;
     }
 
-    /** Nodes for the renderer: per-instance position (xyz, phase), speed, density. */
+    /** Nodes for the renderer: per-instance position (xyz, phase), surface (normal xyz, density), speed. */
     renderNodes() {
-        return { pos: this.pos.toAttribute(), speed: length(this.vel.toAttribute().xyz), dens: this.dens.toAttribute() };
+        return { pos: this.pos.toAttribute(), surf: this.surf.toAttribute(), speed: length(this.vel.toAttribute().xyz) };
     }
 }
 

@@ -57,6 +57,7 @@ export class FluidSolver {
         this.vt = new Float32Array(cap * 3);
         this.lam = new Float32Array(cap);
         this.dens = new Float32Array(cap);
+        this.nrm = new Float32Array(cap * 3); // surface normal for the renderer (see FluidGPU surf)
         this.nbr = new Int32Array(cap * MAX_NEIGHBOURS);
         this.nn = new Uint8Array(cap);
         let T = 1; while(T < cap * 2) T <<= 1;
@@ -229,7 +230,8 @@ export class FluidSolver {
                 }
                 // the terrain's share of the density (src/fluid/params.js wall)
                 const sd = this.sdf.sample(px, py, pz, ss);
-                const q3 = i * 3;
+                const q3 = i * 3, ns = -1 / kk.surfG;
+                this.nrm[q3] = gx * ns; this.nrm[q3 + 1] = gy * ns; this.nrm[q3 + 2] = gz * ns;
                 wg[q3] = wg[q3 + 1] = wg[q3 + 2] = 0;
                 let d = rho / rho0;
                 if(sd < h) {

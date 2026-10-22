@@ -16,9 +16,10 @@ export class FluidCPU {
         this.extent = 0;
         this.pages = settings.pages;
         this.posAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.cap * 4), 4);
-        this.infoAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.cap * 2), 2);
-        this.posAttr.setUsage(THREE.DynamicDrawUsage); this.infoAttr.setUsage(THREE.DynamicDrawUsage);
-        this.spare = { pos: new Float32Array(this.cap * 4), info: new Float32Array(this.cap * 2) };
+        this.infoAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.cap * 4), 4); // surface normal, density
+        this.spdAttr = new THREE.InstancedBufferAttribute(new Float32Array(this.cap), 1);
+        for(const a of [this.posAttr, this.infoAttr, this.spdAttr]) a.setUsage(THREE.DynamicDrawUsage);
+        this.spare = { pos: new Float32Array(this.cap * 4), info: new Float32Array(this.cap * 4), spd: new Float32Array(this.cap) };
         this.inflight = false;
         this.backlog = 0;
         this.lastStats = null;
@@ -36,17 +37,17 @@ export class FluidCPU {
         const st = this.stats;
         st.workerMs = st.workerMs * 0.9 + m.ms * 0.1; st.workerMax = Math.max(st.workerMax * 0.995, m.ms);
         const n = m.n;
-        this.posAttr.array.set(m.pos.subarray(0, n * 4));
-        this.infoAttr.array.set(m.info.subarray(0, n * 2));
-        this.posAttr.clearUpdateRanges(); this.posAttr.addUpdateRange(0, n * 4); this.posAttr.needsUpdate = true;
-        this.infoAttr.clearUpdateRanges(); this.infoAttr.addUpdateRange(0, n * 2); this.infoAttr.needsUpdate = true;
-        this.spare = { pos: m.pos, info: m.info };
+        for(const [a, src, k] of [[this.posAttr, m.pos, 4], [this.infoAttr, m.info, 4], [this.spdAttr, m.spd, 1]]) {
+            a.array.set(src.subarray(0, n * k));
+            a.clearUpdateRanges(); a.addUpdateRange(0, n * k); a.needsUpdate = true;
+        }
+        this.spare = { pos: m.pos, info: m.info, spd: m.spd };
         this.lastStats = m.stats;
     }
     write(start, n, data) {
         this.worker.postMessage({ op: 'write', start, n, data: data.slice(0, n * 8) });
         // show them at once (the worker's next frame replaces this)
-        for(let i = 0; i < n; i++) { const o = (start + i) * 4, s = i * 8; this.posAttr.array.set(data.subarray(s, s + 4), o); this.infoAttr.array[(start + i) * 2 + 1] = 1; }
+        for(let i = 0; i < n; i++) { const o = (start + i) * 4, s = i * 8; this.posAttr.array.set(data.subarray(s, s + 4), o); this.infoAttr.array.set([0, 0, 0, 1], o); }
         this.posAttr.needsUpdate = true; this.infoAttr.needsUpdate = true;
         if(start + n > this.extent) this.extent = start + n;
     }
@@ -66,8 +67,9 @@ export class FluidCPU {
         this.stats.dropped += steps + this.backlog - n;
         this.backlog = 0;
         this.inflight = true;
-        const { pos, info } = this.spare;
-        this.worker.postMessage({ op: 'step', steps: n, dt, proxies: this.proxies.slice(0, this.nProxies * 12), nProxies: this.nProxies, kicks: this.kicks.slice(), pos, info }, [pos.buffer, info.buffer]);
+        const { pos, info, spd } = this.spare;
+        this.worker.postMessage({ op: 'step', steps: n, dt, proxies: this.proxies.slice(0, this.nProxies * 12), nProxies: this.nProxies, kicks: this.kicks.slice(), pos, info, spd },
+            [pos.buffer, info.buffer, spd.buffer]);
         this.kicks.fill(0);
         return n;
     }
@@ -83,7 +85,6 @@ export class FluidCPU {
     }
     warmup() {}
     renderNodes() {
-        const p = instancedBufferAttribute(this.posAttr), info = instancedBufferAttribute(this.infoAttr);
-        return { pos: p, speed: info.x, dens: info.y };
+        return { pos: instancedBufferAttribute(this.posAttr), surf: instancedBufferAttribute(this.infoAttr), speed: instancedBufferAttribute(this.spdAttr) };
     }
 }

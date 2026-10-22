@@ -4,8 +4,9 @@
  *   in:  { op: 'init', settings, table, data }            the SDF pages (src/fluid/sdfPages.js)
  *        { op: 'page', ci, entry, bytes }                  one chunk's table entry and page (bytes: Int8Array or null)
  *        { op: 'write', start, n, data }                   particles (8 floats each: x y z phase vx vy vz -)
- *        { op: 'step', steps, dt, proxies, nProxies, kicks, pos, info }   pos / info: buffers to fill (transferred)
- *   out: { op: 'frame', pos, info, n, stats, ms }          pos: x y z phase per particle, info: speed, density
+ *        { op: 'step', steps, dt, proxies, nProxies, kicks, pos, info, spd }   buffers to fill (transferred)
+ *   out: { op: 'frame', pos, info, spd, n, stats, ms }     per particle: pos x y z phase, info: surface normal xyz,
+ *                                                          density, spd: speed
  */
 import { FluidSolver } from '../fluid/cpuSolver.js';
 import { PageSDF, PAGE } from '../fluid/sdfPages.js';
@@ -35,12 +36,16 @@ self.onmessage = (e) => {
                 solver.step(m.dt);
                 solver.kicks.fill(0); // kicks act once
             }
-            const n = solver.extent, pos = m.pos, info = m.info, P = solver.pos, V = solver.vel, D = solver.dens;
+            const n = solver.extent, pos = m.pos, info = m.info, spd = m.spd, P = solver.pos, V = solver.vel, D = solver.dens, N = solver.nrm;
             pos.set(P.subarray(0, n * 4));
-            for(let i = 0; i < n; i++) { const o = i * 4; info[i * 2] = Math.hypot(V[o], V[o + 1], V[o + 2]); info[i * 2 + 1] = D[i]; }
+            for(let i = 0; i < n; i++) {
+                const o = i * 4;
+                info[o] = N[i * 3]; info[o + 1] = N[i * 3 + 1]; info[o + 2] = N[i * 3 + 2]; info[o + 3] = D[i];
+                spd[i] = Math.hypot(V[o], V[o + 1], V[o + 2]);
+            }
             const st = solver.stats;
-            self.postMessage({ op: 'frame', pos, info, n, ms: performance.now() - t0,
-                stats: { alive: st.alive, moving: st.moving, maxSpeed: st.maxSpeed, occ: st.occ.slice() } }, [pos.buffer, info.buffer]);
+            self.postMessage({ op: 'frame', pos, info, spd, n, ms: performance.now() - t0,
+                stats: { alive: st.alive, moving: st.moving, maxSpeed: st.maxSpeed, occ: st.occ.slice() } }, [pos.buffer, info.buffer, spd.buffer]);
         }
     } catch(err) { self.postMessage({ op: 'error', error: String(err?.stack || err) }); }
 };

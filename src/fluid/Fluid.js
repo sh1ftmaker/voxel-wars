@@ -28,6 +28,7 @@ import { packProxy, packKick, occIndex } from './cpuSolver.js';
 import { FluidGPU } from './FluidGPU.js';
 import { FluidCPU } from './FluidCPU.js';
 import { FluidRender } from './FluidRender.js';
+import { FluidSurface } from './FluidSurface.js';
 import { FLUID_SOURCES } from '../level/showcase.js';
 
 const STATS_EVERY = 6;   // frames between stats reads
@@ -53,7 +54,9 @@ export class Fluid {
             const opts = { ...this.settings, pages: this.pages };
             this.sim = gpu ? new FluidGPU(ctx.renderer, opts) : new FluidCPU(ctx.renderer, opts);
             this.sim.warmup();
-            this.render = new FluidRender(ctx.scene, this.sim.renderNodes(), { spacing: this.settings.spacing, count: 0 });
+            // a screen-space surface (default) or the particles as shaded spheres (?fluidRender=sprites)
+            this.render = params.get('fluidRender') === 'sprites' ? new FluidRender(ctx.scene, this.sim.renderNodes(), { spacing: this.settings.spacing, count: 0 })
+                : new FluidSurface(ctx, this.sim.renderNodes(), { spacing: this.settings.spacing });
         } catch(e) { this.label = 'off (error)'; console.error('fluid: disabled', e); return; }
         this.enabled = true;
         this.label = `${gpu ? 'GPU' : 'CPU worker'}`;
@@ -245,6 +248,26 @@ export class Fluid {
         }
         this.render.count = sim.extent;
         this.render.sunDir.value.copy(this.ctx.env?.sunDir ?? this.render.sunDir.value);
+        this.render.render?.(this._inView());
+    }
+    /** Is a chunk the fluid occupies in the camera's frustum? */
+    _inView() {
+        const cam = this.ctx.camera;
+        cam.updateMatrixWorld();
+        _frustum.setFromProjectionMatrix(_m.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse));
+        const occ = this.occ;
+        for(let w = 0; w < occ.length; w++) {
+            if(!occ[w]) continue;
+            for(let b = 0; b < 32; b++) {
+                if(!(occ[w] & (1 << b))) continue;
+                const ci = w * 32 + b, cx = ci % NCX, cy = Math.floor(ci / NCX) % NCY, cz = Math.floor(ci / (NCX * NCY));
+                const x = (cx + WORLD_CHUNKS.min[0]) * CHUNK_M, y = (cy + WORLD_CHUNKS.min[1]) * CHUNK_M, z = (cz + WORLD_CHUNKS.min[2]) * CHUNK_M;
+                // grown by a metre: a particle sits in the chunk of its centre
+                _box.min.set(x - 1, y - 1, z - 1); _box.max.set(x + CHUNK_M + 1, y + CHUNK_M + 1, z + CHUNK_M + 1);
+                if(_frustum.intersectsBox(_box)) return true;
+            }
+        }
+        return false;
     }
     _readStats() {
         const p = this.sim.readStats();
@@ -264,6 +287,7 @@ export class Fluid {
     }
 }
 
+const _frustum = new THREE.Frustum(), _m = new THREE.Matrix4(), _box = new THREE.Box3();
 /** A mesh's (or group's) bounding box in its own frame, cached per set of geometries. */
 function localBox(obj) {
     const geos = [];
